@@ -18,6 +18,9 @@ test('real SDK keeps 31 and 32 source records inside one owned export generation
   t.after(() => store.close());
   assert.equal(records.length, 32);
   assert.equal(rawEventCount, 32);
+  const sourceEventsBefore = store.readEventPage({ afterSequence: 0, limit: 32 }).events;
+  const outboxBefore = store.readOutbox();
+  const projectedRecordsBefore = JSON.stringify(records);
   const recordsPath = writeRecords(temporary.directory, records);
   const child = spawnNodeFixture('max-batch-controls-child.mjs', [recordsPath], { timeoutMs: 25_000 });
   const execution = await child.done;
@@ -91,4 +94,38 @@ test('real SDK keeps 31 and 32 source records inside one owned export generation
   assert.equal(close.diagnostics.active, false);
   assert.equal(close.diagnostics.exporter.pendingCallbacks, 0);
   assert.deepEqual(close.afterSettle, close.diagnostics);
+
+  const causeCases = [
+    [result.barriers.causeOrdering.abortThenClose, 'CAPTURE_ABORTED'],
+    [result.barriers.causeOrdering.timeoutThenClose, 'CAPTURE_TIMEOUT'],
+    [result.barriers.causeOrdering.closeFirst, 'CAPTURE_CLOSED']
+  ];
+  for (const [causeCase, expectedReason] of causeCases) {
+    assert.equal(causeCase.pendingAtBarrier.active, true, causeCase.kind);
+    assert.equal(causeCase.pendingAtBarrier.closed, false, causeCase.kind);
+    assert.equal(causeCase.pendingAtBarrier.exporter.pendingCallbacks, 1, causeCase.kind);
+    assert.equal(causeCase.pendingAtClose.active, true, causeCase.kind);
+    assert.equal(causeCase.pendingAtClose.closed, false, causeCase.kind);
+    assert.equal(causeCase.pendingAtClose.exporter.pendingCallbacks, 1, causeCase.kind);
+    assert.equal(causeCase.busyReason, 'CAPTURE_BUSY', causeCase.kind);
+    assert.equal(causeCase.result.status, 'failed', causeCase.kind);
+    assert.equal(causeCase.result.reasonCode, expectedReason, causeCase.kind);
+    assert.equal(causeCase.result.generation, 1, causeCase.kind);
+    assert.equal(causeCase.result.hasEnvelope, false, causeCase.kind);
+    assert.equal(causeCase.close.status, 'closed', causeCase.kind);
+    assert.equal(causeCase.close.sdkShutdownCompleted, true, causeCase.kind);
+    assert.equal(causeCase.sameClosePromise, true, causeCase.kind);
+    assert.equal(causeCase.diagnostics.active, false, causeCase.kind);
+    assert.equal(causeCase.diagnostics.closed, true, causeCase.kind);
+    assert.equal(causeCase.diagnostics.exporter.pendingCallbacks, 0, causeCase.kind);
+    assert.equal(causeCase.diagnostics.exporter.callbacks, 1, causeCase.kind);
+    assert.equal(causeCase.diagnostics.exporter.capturedSpans, 64, causeCase.kind);
+    assert.equal(causeCase.postCloseReason, 'CAPTURE_CLOSED', causeCase.kind);
+    assert.deepEqual(causeCase.afterEventLoopTurn, causeCase.diagnostics, causeCase.kind);
+  }
+
+  assert.deepEqual(store.readEventPage({ afterSequence: 0, limit: 32 }).events, sourceEventsBefore);
+  assert.deepEqual(store.readOutbox(), outboxBefore);
+  assert.equal(store.getTelemetryCursor(), 0);
+  assert.equal(JSON.stringify(records), projectedRecordsBefore);
 });

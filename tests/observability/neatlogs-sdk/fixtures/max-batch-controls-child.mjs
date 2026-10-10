@@ -11,6 +11,54 @@ async function waitForCallback(capture) {
   }
 }
 
+async function waitUntil(deadline) {
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, Math.max(1, deadline - Date.now())));
+  }
+}
+
+async function closeCauseCase(kind) {
+  const timeoutMs = kind === 'timeout-then-close' ? 30 : 500;
+  const capture = createNeatlogsSdkCapture({ timeoutMs, exporterDelayMs: 150 });
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const preparePromise = capture.prepare(records, { signal: controller.signal });
+  await waitForCallback(capture);
+  const pendingAtBarrier = capture.diagnostics();
+  const busy = await capture.prepare(records);
+
+  if (kind === 'abort-then-close') controller.abort();
+  if (kind === 'timeout-then-close') await waitUntil(startedAt + timeoutMs + 20);
+
+  const pendingAtClose = capture.diagnostics();
+  const closePromise = capture.close();
+  const sameClosePromise = closePromise === capture.close();
+  if (kind === 'close-first') controller.abort();
+  const [prepared, closed] = await Promise.all([preparePromise, closePromise]);
+  const diagnostics = capture.diagnostics();
+  const postClose = await capture.prepare(records);
+  await new Promise(resolve => setImmediate(resolve));
+  const afterEventLoopTurn = capture.diagnostics();
+
+  return {
+    kind,
+    pendingAtBarrier,
+    pendingAtClose,
+    busyReason: busy.reasonCode,
+    result: {
+      status: prepared.status,
+      reasonCode: prepared.reasonCode,
+      generation: prepared.generation,
+      hasEnvelope: Object.hasOwn(prepared, 'envelope')
+    },
+    close: closed,
+    sameClosePromise,
+    diagnostics,
+    postCloseReason: postClose.reasonCode,
+    afterEventLoopTurn
+  };
+}
+
 const matrix = [];
 for (const count of [31, 32]) {
   for (const delay of [0, 150]) {
@@ -101,6 +149,12 @@ const closeDiagnostics = closeCapture.diagnostics();
 await pause(180);
 const closeAfterSettle = closeCapture.diagnostics();
 
+const causeOrdering = {
+  abortThenClose: await closeCauseCase('abort-then-close'),
+  timeoutThenClose: await closeCauseCase('timeout-then-close'),
+  closeFirst: await closeCauseCase('close-first')
+};
+
 console.log(JSON.stringify({
   testMode: 'offline-synthetic-real-sdk',
   matrix,
@@ -145,6 +199,7 @@ console.log(JSON.stringify({
       close: closeResult,
       diagnostics: closeDiagnostics,
       afterSettle: closeAfterSettle
-    }
+    },
+    causeOrdering
   }
 }));

@@ -627,8 +627,10 @@ export function createNeatlogsSdkCapture(factoryOptions) {
     closePromise = (async () => {
       const pending = activeRequest;
       if (pending !== null) {
-        pending.aborted = true;
-        pending.abortReason = 'CAPTURE_CLOSED';
+        if (!pending.aborted) {
+          pending.aborted = true;
+          pending.abortReason = 'CAPTURE_CLOSED';
+        }
         await pending.done;
       }
       if (client !== null) {
