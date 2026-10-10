@@ -1,0 +1,52 @@
+{
+  "format": "agent-creative.contract-readiness/v1",
+  "status": "pending",
+  "owner_actions": [
+    {
+      "owner": "shared-contracts",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/shared-contracts/issues/1",
+      "action": "Publish the reviewed dependency-light canonical schemas, DecisionPort and approval contract, deterministic serialization rule, validator adapter, and valid, invalid, older-version, additive-field, and semantic reference fixtures."
+    },
+    {
+      "owner": "cost-intelligence",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/cost-intelligence/issues/1",
+      "action": "Publish the reviewed attempt-bound reservation, usage, unknown-outcome, duplicate-observation, precision, billing-mode, and conservative-hold protocol and fixtures."
+    },
+    {
+      "owner": "getticketstub.com",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/getticketstub.com/issues/1",
+      "action": "Publish the trusted server identity and exact approval-verification interface and fixtures; the harness consumes the authority and does not implement it."
+    },
+    {
+      "owner": "event-intelligence",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/event-intelligence/issues/3",
+      "action": "Review and publish the research, trusted-scope, package, correction, and DecisionPort contract handoff identified by EI-X01."
+    },
+    {
+      "owner": "event-intelligence",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/event-intelligence/issues/4",
+      "action": "Review and publish the attempt, reservation, metering, and trace-correlation contract handoff identified by EI-X02."
+    },
+    {
+      "owner": "creative-engine",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/creative-engine/issues/3",
+      "action": "Review and publish the research-package alias, trusted scope, brief, control, and version contract handoff identified by CE-C01."
+    },
+    {
+      "owner": "creative-engine",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/creative-engine/issues/4",
+      "action": "Review and publish the neutral DecisionPort and actual Choice, Score, and Noul fixtures identified by CE-C02."
+    },
+    {
+      "owner": "creative-engine",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/creative-engine/issues/5",
+      "action": "Review and publish the external budget, attempt, usage, and unknown-outcome contract handoff identified by CE-C03."
+    },
+    {
+      "owner": "creative-engine",
+      "reference": "https://github.com/Jevelopers-neatHack-2026/creative-engine/issues/6",
+      "action": "Review and publish the exact facts, artwork, composition, approval, and handoff contract identified by CE-C04."
+    }
+  ],
+  "note": "This is a pending readiness inventory, not a schema, port, contract release, owner decision, or fixture. Canonical bytes and executable validation remain externally owned."
+}
