@@ -42,6 +42,7 @@ UBUNTU_ARCHIVE_KEYRING = Path("/usr/share/keyrings/ubuntu-archive-keyring.gpg")
 UBUNTU_KEYRING_PACKAGE_VERSION = "2023.11.28.1"
 UBUNTU_ARCHIVE_KEYRING_SHA256 = "80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31"
 UBUNTU_ARCHIVE_KEYRING_SIZE = 3607
+WRITABLE_KEYRING_PARENT_COMPONENTS = frozenset({"share", "keyrings"})
 UBUNTU_KEYRING_SOURCE_TARBALL_SHA256 = "aecd455ae15561371d6e454f121f079f0641d5e1b579a5563a2bc363fc74aa2e"
 UBUNTU_KEYRING_SOURCE_SIGNER_FINGERPRINT = "EE240A052A231AD8925841D79B8EC849D5EF70ED"
 PRIVATE_APT_ROOT = Path("/run")
@@ -812,10 +813,11 @@ def _read_pinned_keyring_bytes(path: Path = UBUNTU_ARCHIVE_KEYRING, *,
                                owner_gid: int = 0) -> tuple[bytes, dict[str, Any]]:
     """Capture the one official keyring by descriptor, then trust its fixed digest.
 
-    The hosted runner's /usr/share parent can be writable. It is never used as
-    APT's keyring path: this reader accepts that one parent only because the
-    exact captured bytes must match the independently pinned Ubuntu package
-    member before they are copied into a private root-owned snapshot.
+    The hosted runner's /usr/share/keyrings hierarchy can contain writable
+    parents. They are never used as APT's keyring path: this reader accepts
+    only the two observed fixed components because the exact captured bytes
+    must match the independently pinned Ubuntu package member before they are
+    copied into a private root-owned snapshot.
     """
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise SetupFailure("ubuntu_archive_keyring_nofollow_unavailable")
@@ -881,7 +883,7 @@ def _read_pinned_keyring_bytes(path: Path = UBUNTU_ARCHIVE_KEYRING, *,
             if before.st_uid != owner_uid or before.st_gid != owner_gid:
                 raise failure("parent_lstat", component, "non_root_owner", observed)
             writable = bool(before.st_mode & 0o022)
-            if writable and component != "share":
+            if writable and component not in WRITABLE_KEYRING_PARENT_COMPONENTS:
                 raise failure("parent_lstat", component, "writable_parent", observed)
             if writable:
                 writable_parent = component
@@ -897,7 +899,8 @@ def _read_pinned_keyring_bytes(path: Path = UBUNTU_ARCHIVE_KEYRING, *,
                 os.close(next_fd)
                 raise failure("parent_recheck", component, "path_replaced_before_open",
                               _keyring_stat_summary(opened_dir, directory=True))
-            if opened_dir.st_mode & 0o022 and component != "share":
+            if (opened_dir.st_mode & 0o022
+                    and component not in WRITABLE_KEYRING_PARENT_COMPONENTS):
                 os.close(next_fd)
                 raise failure("parent_recheck", component, "writable_parent",
                               _keyring_stat_summary(opened_dir, directory=True))

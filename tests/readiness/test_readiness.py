@@ -20,6 +20,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -593,6 +594,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 "items": {
                     "type": "array",
                     "prefixItems": [{"$ref": "#/$defs/payload"}],
+                    "items": {"$ref": "#/$defs/payload"},
                     "contains": {"$ref": "#/$defs/payload"},
                 },
             },
@@ -624,6 +626,127 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             with self.subTest(candidate=sorted(candidate)):
                 with self.assertRaises(contracts.UnsupportedSchema):
                     contracts._schema_field_paths(candidate)
+
+    def test_schema_enumeration_rejects_implicit_open_containers_directly_and_in_cli(self) -> None:
+        def root_schema(value_schema: Any, *, definitions: dict[str, Any] | None = None) -> dict[str, Any]:
+            result: dict[str, Any] = {
+                "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+                "type": "object",
+                "required": ["decision", "value"],
+                "properties": {"decision": {"type": "string"}, "value": value_schema},
+                "additionalProperties": False,
+            }
+            if definitions is not None:
+                result["$defs"] = definitions
+            return result
+
+        candidates = [
+            ("empty_schema", root_schema({})),
+            ("boolean_true", root_schema(True)),
+            ("unclosed_object", root_schema({"type": "object"})),
+            ("array_without_items", root_schema({"type": "array"})),
+            ("empty_items", root_schema({"type": "array", "items": {}})),
+            ("prefix_items_open_tail", root_schema({
+                "type": "array", "prefixItems": [{"type": "string"}],
+            })),
+            ("reference_to_unclosed_object", root_schema(
+                {"$ref": "#/$defs/open_object"},
+                definitions={"open_object": {"type": "object"}},
+            )),
+            ("composition_with_unclosed_object", root_schema({
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "object"},
+                ],
+            })),
+            ("all_of_with_unclosed_object_branch", root_schema({
+                "allOf": [
+                    {"type": "object", "additionalProperties": False},
+                    {"type": "object"},
+                ],
+            })),
+            ("empty_all_of", root_schema({"allOf": []})),
+        ]
+
+        for name, schema in candidates:
+            with self.subTest(schema=name, path="direct"):
+                with self.assertRaises(contracts.UnsupportedSchema):
+                    contracts._schema_field_paths(schema)
+
+            with self.subTest(schema=name, path="assembled_cli"), \
+                    tempfile.TemporaryDirectory(prefix="acv1-open-schema-cli-") as temporary:
+                manifest_path, evidence_path, evidence_sha = write_complete_synthetic_contract(
+                    Path(temporary), schema_overrides={"none": schema},
+                    adapter_source=b"raise SystemExit(77)  # TEST ONLY: rejected schema must not execute\n",
+                )
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "tools/verify_contract_release.py"),
+                     "--manifest", str(manifest_path), "--offline", "--test-only-synthetic",
+                     "--owner-evidence-index", str(evidence_path), "--owner-evidence-sha256", evidence_sha],
+                    cwd=ROOT,
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONDONTWRITEBYTECODE": "1",
+                         "LC_ALL": "C.UTF-8", "PYTHONHASHSEED": "0"},
+                    text=True, capture_output=True, check=False, timeout=10,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout[:2000])
+                report = json.loads(result.stdout)
+                codes = {item["code"] for item in report["errors"]}
+                self.assertEqual(report["status"], "blocked")
+                self.assertFalse(report["ready"])
+                self.assertIsNot(report.get("owner_evidence_verified"), True)
+                self.assertIn("canonical_schema_unsupported", codes)
+                self.assertIn("schema_inventory_source_unavailable", codes)
+                self.assertNotIn("execution_sandbox_unavailable", codes)
+                self.assertNotIn("adapter_nonzero_exit", codes)
+
+    def test_schema_enumeration_keeps_closed_object_array_reference_and_composition_controls(self) -> None:
+        schema = {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+            "$defs": {
+                "record": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            "type": "object",
+            "properties": {
+                "reference": {"$ref": "#/$defs/record"},
+                "array": {"type": "array", "prefixItems": [{"type": "integer"}], "items": False},
+                "composition": {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "properties": {"left": {"type": "string"}, "right": {"type": "integer"}},
+                            "additionalProperties": False,
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"left": {"type": "string"}, "right": {"type": "integer"}},
+                            "additionalProperties": False,
+                        },
+                    ],
+                },
+                "choice": {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/record"}]},
+                "closed_by_unevaluated": {
+                    "type": "object",
+                    "properties": {"key": {"type": "boolean"}},
+                    "unevaluatedProperties": False,
+                },
+                "closed_tuple": {
+                    "type": "array",
+                    "prefixItems": [{"type": "integer"}],
+                    "unevaluatedItems": False,
+                },
+            },
+            "additionalProperties": False,
+        }
+        self.assertEqual(contracts._schema_field_paths(schema), {
+            "/reference", "/reference/id", "/array",
+            "/composition", "/composition/left", "/composition/right",
+            "/choice", "/choice/id", "/closed_by_unevaluated", "/closed_by_unevaluated/key",
+            "/closed_tuple",
+        })
 
     def test_schema_walker_bounds_fields_and_reference_expansion(self) -> None:
         definitions = {"n0": {"type": "object", "properties": {"leaf": {"type": "integer"}},
@@ -1571,47 +1694,51 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertNotIn("ubuntu-archive-keyring.gpg", rendered)
         self.assertNotIn("key bytes", rendered)
 
-    def test_pinned_keyring_capture_accepts_world_writable_share_only_for_exact_pinned_bytes(self) -> None:
+    def test_pinned_keyring_capture_accepts_only_observed_writable_parents_for_pinned_bytes(self) -> None:
         approved = b"synthetic approved archive keyring"
         uid, gid = os.geteuid(), os.getegid()
-        with tempfile.TemporaryDirectory(prefix="acv1-pinned-keyring-") as temporary:
-            root = Path(temporary)
-            path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
-            path.parent.mkdir(parents=True)
-            os.chmod(root / "usr", 0o755)
-            os.chmod(root / "usr" / "share", 0o777)
-            os.chmod(path.parent, 0o755)
-            path.write_bytes(approved)
-            os.chmod(path, 0o644)
-            with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
-                    mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
-                captured, evidence = profile_setup._read_pinned_keyring_bytes(
-                    path, trusted_root=root, owner_uid=uid, owner_gid=gid)
-            self.assertEqual(captured, approved)
-            self.assertEqual(evidence["sha256"], sha(approved))
-            self.assertEqual(evidence["writable_parent_component"], "share")
-            self.assertFalse(evidence["source_parent_reopened_by_apt"])
+        for writable_component in ("share", "keyrings"):
+            with self.subTest(writable_component=writable_component), \
+                    tempfile.TemporaryDirectory(prefix="acv1-pinned-keyring-") as temporary:
+                root = Path(temporary)
+                path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
+                path.parent.mkdir(parents=True)
+                os.chmod(root / "usr", 0o755)
+                os.chmod(root / "usr" / "share", 0o777 if writable_component == "share" else 0o755)
+                os.chmod(path.parent, 0o777 if writable_component == "keyrings" else 0o755)
+                path.write_bytes(approved)
+                os.chmod(path, 0o644)
+                with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
+                        mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
+                    captured, evidence = profile_setup._read_pinned_keyring_bytes(
+                        path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+                self.assertEqual(captured, approved)
+                self.assertEqual(evidence["sha256"], sha(approved))
+                self.assertEqual(evidence["writable_parent_component"], writable_component)
+                self.assertFalse(evidence["source_parent_reopened_by_apt"])
 
-            attacker = root / "attacker-keyring.gpg"
-            attacker.write_bytes(b"x" * len(approved))
-            path.unlink()
-            path.symlink_to(attacker)
-            private_root = Path("/run") / ("acv1-contract-apt-" + "a" * 32)
-            sources = profile_setup._private_source_bytes(
-                profile_setup._parse_deb822_records(
-                    SYNTHETIC_UBUNTU_SOURCES,
-                    failure_code="synthetic_source_invalid", max_bytes=64 * 1024),
-                private_root / "ubuntu-archive-keyring.gpg",
-                private_root / "apt-mirrors.txt",
-            )
-            self.assertIn(("Signed-By: " + str(private_root
-                                               / "ubuntu-archive-keyring.gpg")).encode(), sources)
-            self.assertIn(("URIs: mirror+file:" + str(private_root
-                                                       / "apt-mirrors.txt")).encode(), sources)
-            self.assertNotIn(str(path).encode(), sources)
-            self.assertEqual(captured, approved)
+                # Replacing the writable source entry after capture cannot alter
+                # the captured bytes or redirect APT away from the private copy.
+                attacker = root / "attacker-keyring.gpg"
+                attacker.write_bytes(b"x" * len(approved))
+                path.unlink()
+                path.symlink_to(attacker)
+                private_root = Path("/run") / ("acv1-contract-apt-" + "a" * 32)
+                sources = profile_setup._private_source_bytes(
+                    profile_setup._parse_deb822_records(
+                        SYNTHETIC_UBUNTU_SOURCES,
+                        failure_code="synthetic_source_invalid", max_bytes=64 * 1024),
+                    private_root / "ubuntu-archive-keyring.gpg",
+                    private_root / "apt-mirrors.txt",
+                )
+                self.assertIn(("Signed-By: " + str(private_root
+                                                   / "ubuntu-archive-keyring.gpg")).encode(), sources)
+                self.assertIn(("URIs: mirror+file:" + str(private_root
+                                                           / "apt-mirrors.txt")).encode(), sources)
+                self.assertNotIn(str(path).encode(), sources)
+                self.assertEqual(captured, approved)
 
-    def test_pinned_keyring_capture_rejects_digest_changes_and_symlink_parents(self) -> None:
+    def test_pinned_keyring_capture_rejects_digest_changes(self) -> None:
         approved = b"synthetic approved archive keyring"
         uid, gid = os.geteuid(), os.getegid()
         with tempfile.TemporaryDirectory(prefix="acv1-keyring-negative-") as temporary:
@@ -1630,15 +1757,94 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                                              "ubuntu_archive_keyring_digest_mismatch"):
                     profile_setup._read_pinned_keyring_bytes(
                         path, trusted_root=root, owner_uid=uid, owner_gid=gid)
-                target = root / "real-keyrings"
-                target.mkdir()
-                link_root = root / "usr" / "share"
-                parent.rename(target)
-                parent.symlink_to(target, target_is_directory=True)
-                with self.assertRaisesRegex(profile_setup.SetupFailure,
-                                             "ubuntu_archive_keyring_capture_failed"):
+
+    def test_pinned_keyring_capture_still_rejects_unreviewed_writable_parent_and_keyrings_symlink(self) -> None:
+        approved = b"synthetic approved archive keyring"
+        uid, gid = os.geteuid(), os.getegid()
+        with tempfile.TemporaryDirectory(prefix="acv1-keyring-parent-boundary-") as temporary:
+            root = Path(temporary)
+            path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(approved)
+            os.chmod(path, 0o644)
+            os.chmod(root / "usr", 0o777)
+            with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
+                    mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
+                with self.assertRaises(profile_setup.SetupFailure) as raised:
                     profile_setup._read_pinned_keyring_bytes(
                         path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+                diagnostics = raised.exception.details["trust_file_diagnostics"]
+                self.assertEqual(diagnostics["phase"], "parent_lstat")
+                self.assertEqual(diagnostics["component"], "usr")
+                self.assertEqual(diagnostics["failure_class"], "writable_parent")
+
+                os.chmod(root / "usr", 0o755)
+                target = root / "real-keyrings"
+                path.parent.rename(target)
+                path.parent.symlink_to(target, target_is_directory=True)
+                with self.assertRaises(profile_setup.SetupFailure) as raised:
+                    profile_setup._read_pinned_keyring_bytes(
+                        path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+                diagnostics = raised.exception.details["trust_file_diagnostics"]
+                self.assertEqual(diagnostics["phase"], "parent_lstat")
+                self.assertEqual(diagnostics["component"], "keyrings")
+                self.assertEqual(diagnostics["failure_class"], "symlink_disallowed")
+
+    def test_pinned_keyring_capture_rejects_writable_parent_and_leaf_replacement_races(self) -> None:
+        approved = b"synthetic approved archive keyring"
+        uid, gid = os.geteuid(), os.getegid()
+
+        for replacement in ("keyrings_parent", "leaf_before_open", "leaf_during_read"):
+            with self.subTest(replacement=replacement), \
+                    tempfile.TemporaryDirectory(prefix="acv1-keyring-race-") as temporary:
+                root = Path(temporary)
+                path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
+                path.parent.mkdir(parents=True)
+                path.write_bytes(approved)
+                os.chmod(path, 0o644)
+                os.chmod(path.parent, 0o777)
+                original_open = profile_setup.os.open
+                original_read = profile_setup.os.read
+                changed = False
+
+                def replace_before_open(file: Any, flags: int, mode: int = 0o777, *,
+                                        dir_fd: int | None = None) -> int:
+                    nonlocal changed
+                    if replacement == "keyrings_parent" and file == "keyrings" and not changed:
+                        destination = root / "captured-keyrings"
+                        path.parent.rename(destination)
+                        path.parent.symlink_to(destination, target_is_directory=True)
+                        changed = True
+                    elif replacement == "leaf_before_open" and file == path.name and dir_fd is not None and not changed:
+                        target = root / "attacker-keyring.gpg"
+                        target.write_bytes(b"attacker-controlled-keyring")
+                        path.unlink()
+                        path.symlink_to(target)
+                        changed = True
+                    return original_open(file, flags, mode, dir_fd=dir_fd)
+
+                def replace_during_read(fd: int, count: int) -> bytes:
+                    nonlocal changed
+                    if replacement == "leaf_during_read" and not changed:
+                        path.write_bytes(b"replacement bytes with a different size")
+                        changed = True
+                    return original_read(fd, count)
+
+                with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
+                        mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)), \
+                        mock.patch.object(profile_setup.os, "open", side_effect=replace_before_open), \
+                        mock.patch.object(profile_setup.os, "read", side_effect=replace_during_read):
+                    with self.assertRaises(profile_setup.SetupFailure) as raised:
+                        profile_setup._read_pinned_keyring_bytes(
+                            path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+                self.assertTrue(changed)
+                diagnostics = raised.exception.details["trust_file_diagnostics"]
+                if replacement == "leaf_during_read":
+                    self.assertEqual(diagnostics["phase"], "descriptor_recheck")
+                    self.assertEqual(diagnostics["failure_class"], "file_changed_during_read")
+                else:
+                    self.assertIn(diagnostics["phase"], {"parent_open", "file_open"})
+                    self.assertIn(diagnostics["failure_class"], {"symlink_disallowed", "not_directory"})
 
     def test_private_apt_snapshot_uses_preloaded_config_and_captured_sources(self) -> None:
         root = Path("/run") / ("acv1-contract-apt-" + "b" * 32)

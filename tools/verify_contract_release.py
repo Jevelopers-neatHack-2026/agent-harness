@@ -851,6 +851,8 @@ def _schema_field_paths(document: Any) -> set[str]:
         node, prefix, prefix_bytes, collect_fields = stack.pop()
         charge_step()
         if isinstance(node, bool):
+            if node:
+                raise UnsupportedSchema("unconstrained boolean schemas are not enumerable")
             continue
         if not isinstance(node, dict):
             raise UnsupportedSchema("schema node is not an object or boolean")
@@ -864,6 +866,90 @@ def _schema_field_paths(document: Any) -> set[str]:
                 raise UnsupportedSchema("schema keyword is outside the supported Draft 2020-12 subset")
         if "$schema" in node and node is not document:
             raise UnsupportedSchema("nested schema dialect changes are unsupported")
+
+        schema_types: set[str] | None = None
+        if "type" in node:
+            raw_types = node["type"]
+            if isinstance(raw_types, str):
+                schema_types = {raw_types}
+            elif (isinstance(raw_types, list) and 0 < len(raw_types) <= 7
+                  and all(isinstance(item, str) for item in raw_types)
+                  and len(set(raw_types)) == len(raw_types)):
+                charge_step(len(raw_types))
+                schema_types = set(raw_types)
+            else:
+                raise UnsupportedSchema("schema type declaration is malformed")
+            if not schema_types.issubset({"array", "boolean", "integer", "null", "number", "object", "string"}):
+                raise UnsupportedSchema("schema type declaration is unsupported")
+
+        object_keywords = {
+            "properties", "patternProperties", "additionalProperties", "unevaluatedProperties",
+            "required", "dependentRequired", "dependentSchemas", "minProperties", "maxProperties",
+        }
+        array_keywords = {
+            "items", "prefixItems", "contains", "unevaluatedItems", "minItems", "maxItems",
+            "uniqueItems", "minContains", "maxContains",
+        }
+        object_scope = (schema_types is None or "object" in schema_types
+                        or any(keyword in node for keyword in object_keywords))
+        array_scope = (schema_types is None or "array" in schema_types
+                       or any(keyword in node for keyword in array_keywords))
+        container_composition = any(keyword in node for keyword in ("$ref", "allOf", "anyOf", "oneOf"))
+
+        scalar_constant = False
+        if "const" in node:
+            value = node["const"]
+            if isinstance(value, (dict, list)):
+                raise UnsupportedSchema("container const values are not enumerable")
+            scalar_constant = True
+        if "enum" in node:
+            values = node["enum"]
+            if not isinstance(values, list):
+                raise UnsupportedSchema("schema enum is malformed")
+            if len(values) > MAX_SCHEMA_WALK_STEPS:
+                raise SchemaTraversalLimit("schema enum member limit exceeded")
+            for value in values:
+                charge_step()
+                if isinstance(value, (dict, list)):
+                    raise UnsupportedSchema("container enum values are not enumerable")
+            scalar_constant = True
+
+        has_closed_object_boundary = (
+            node.get("additionalProperties") is False
+            or node.get("unevaluatedProperties") is False
+        )
+        has_closed_array_boundary = (
+            ("items" in node and node["items"] is not True)
+            or ("unevaluatedItems" in node and node["unevaluatedItems"] is not True)
+        )
+        if object_scope:
+            if ("additionalProperties" in node
+                    and node["additionalProperties"] is not False):
+                raise UnsupportedSchema("schema allows dynamically named additional properties")
+            # Object/array constraints in a positive reference or composition
+            # are checked at their target/branch. Local property keywords still
+            # need their own closure so an open sibling cannot hide a field.
+            has_local_object_shape = any(keyword in node for keyword in object_keywords)
+            if (has_local_object_shape or schema_types is not None and "object" in schema_types):
+                if not has_closed_object_boundary:
+                    raise UnsupportedSchema("object schemas require an explicit closed property boundary")
+
+        if array_scope and (schema_types is None or "array" in schema_types):
+            has_local_array_shape = any(keyword in node for keyword in array_keywords)
+            if has_local_array_shape or schema_types is not None and "array" in schema_types:
+                if not has_closed_array_boundary:
+                    raise UnsupportedSchema("array schemas require explicit item coverage")
+
+        # An untyped, non-composed schema otherwise admits arbitrary objects
+        # and arrays by default (including an empty schema or annotation-only
+        # schema). Scalar const/enum declarations are the only type-less
+        # primitive form accepted without container boundaries.
+        if (schema_types is None and not container_composition and not scalar_constant):
+            if not has_closed_object_boundary:
+                raise UnsupportedSchema("schema admits implicit open object fields")
+            if not has_closed_array_boundary:
+                raise UnsupportedSchema("schema admits implicit open array items")
+
         if "$defs" in node:
             definitions = node["$defs"]
             if not isinstance(definitions, dict):
@@ -905,10 +991,9 @@ def _schema_field_paths(document: Any) -> set[str]:
             raise UnsupportedSchema("schema patternProperties is malformed")
         if pattern_properties:
             raise UnsupportedSchema("patternProperties cannot be inventoried as exact field paths")
-        if "additionalProperties" in node and node["additionalProperties"] is not False:
-            raise UnsupportedSchema("schema allows dynamically named additional properties")
-        if properties and "additionalProperties" not in node:
-            raise UnsupportedSchema("object properties require explicit additionalProperties false")
+        if (properties and "additionalProperties" not in node
+                and node.get("unevaluatedProperties") is not False):
+            raise UnsupportedSchema("object properties require an explicit closed property boundary")
         if "unevaluatedProperties" in node and node["unevaluatedProperties"] is not False:
             raise UnsupportedSchema("schema unevaluatedProperties is dynamic and unsupported")
 
@@ -949,6 +1034,8 @@ def _schema_field_paths(document: Any) -> set[str]:
             branches = node[keyword]
             if not isinstance(branches, list):
                 raise UnsupportedSchema("schema composition is malformed")
+            if keyword == "allOf" and not branches:
+                raise UnsupportedSchema("empty allOf schemas are unconstrained")
             for branch in branches:
                 charge_step()
                 enqueue(branch, prefix, prefix_bytes, collect_fields)
