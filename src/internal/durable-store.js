@@ -4,18 +4,33 @@ import { types as utilTypes } from 'node:util';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { RuntimeError, runtimeError } from './errors.js';
+import { LOCAL_CONTROLLER_STORAGE_CAPABILITY } from './private-local-store-capability.js';
+import {
+  MAX_CHECKPOINT_DEPTH,
+  MAX_CHECKPOINT_NODES,
+  MAX_CHECKPOINT_SERIALIZED_BYTES,
+  MAX_CHECKPOINT_SOURCE_UNITS
+} from './checkpoint-bounds.js';
+import {
+  createLimitSet,
+  validateBudgetSnapshot
+} from '../orchestrator/internal/limits.js';
+import {
+  compilePlan,
+  getNextReadyStep,
+  validatePrivateCheckpointResults
+} from '../orchestrator/internal/plan.js';
+import { parseBoundedJson } from '../orchestrator/internal/json.js';
 
 export const INTERNAL_SCHEMA_VERSION = 5;
 const CHECKPOINT_SCHEMA_VERSION = 2;
-const MAX_CHECKPOINT_DEPTH = 128;
-const MAX_CHECKPOINT_NODES = 10_000;
-const MAX_CHECKPOINT_SOURCE_UNITS = 256 * 1024;
-const MAX_CHECKPOINT_SERIALIZED_BYTES = 1024 * 1024;
 const MAX_JEV_OBSERVATION_PAGE_SIZE = 100;
 const JEV_MODEL_ID = 'jev-1.13.0';
 const SAFE_OPAQUE_REF = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const SAFE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const SAFE_PROVIDER_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const LOCAL_CHECKPOINT_KIND = 'agent-harness.private-bounded-local-checkpoint';
+const LOCAL_STEP_ID = /^[a-z][a-z0-9_-]{0,47}$/u;
 const JEV_UNKNOWN_REASONS = new Set([
   'not_dispatched',
   'possible_dispatch',
@@ -150,18 +165,269 @@ function canonicalValue(value, context, depth = 0) {
   }
 }
 
+function checkpointMetrics(data) {
+  if (!isRecord(data)) throw INVALID_CHECKPOINT_INPUT;
+  const context = { nodes: 0, sourceUnits: 0, seen: new Set() };
+  const normalized = canonicalValue(data, context);
+  const encoded = JSON.stringify(normalized);
+  const payload = '{"schemaVersion":' + CHECKPOINT_SCHEMA_VERSION + ',"data":' + encoded + '}';
+  return {
+    serializedBytes: Buffer.byteLength(payload, 'utf8'),
+    sourceUnits: context.sourceUnits,
+    nodes: context.nodes,
+    payload
+  };
+}
+
+function boundedCheckpointMetrics(data) {
+  const measured = checkpointMetrics(data);
+  if (measured.serializedBytes > MAX_CHECKPOINT_SERIALIZED_BYTES) throw INVALID_CHECKPOINT_INPUT;
+  return measured;
+}
+
 function serializeCheckpoint(data, operation) {
   try {
-    if (!isRecord(data)) throw INVALID_CHECKPOINT_INPUT;
-    const normalized = canonicalValue(data, { nodes: 0, sourceUnits: 0, seen: new Set() });
-    const encoded = JSON.stringify(normalized);
-    const payload = '{"schemaVersion":' + CHECKPOINT_SCHEMA_VERSION + ',"data":' + encoded + '}';
-    if (Buffer.byteLength(payload, 'utf8') > MAX_CHECKPOINT_SERIALIZED_BYTES) {
-      throw INVALID_CHECKPOINT_INPUT;
-    }
-    return payload;
+    return boundedCheckpointMetrics(data).payload;
   } catch {
     fail(operation, 'INVALID_INPUT', 'Checkpoint data is invalid or exceeds the supported size and structure limits.');
+  }
+}
+
+/** @internal Returns the exact schema-5/envelope-2 bytes used by checkpoint writes. */
+export function checkpointPayloadForIntegrity(data) {
+  try {
+    return boundedCheckpointMetrics(data).payload;
+  } catch {
+    fail('checkpointIntegrity', 'CHECKPOINT_CORRUPT', 'The checkpoint failed its integrity check.');
+  }
+}
+
+/** @internal Measures the exact schema-5 payload without writing to SQLite. */
+export function measureCheckpointPayload(data) {
+  try {
+    const measured = checkpointMetrics(data);
+    return Object.freeze({
+      serializedBytes: measured.serializedBytes,
+      sourceUnits: measured.sourceUnits,
+      nodes: measured.nodes
+    });
+  } catch {
+    return null;
+  }
+}
+
+function readLocalControllerState(value, operation) {
+  const allowed = [
+    'kind', 'version', 'workflowId', 'planJson', 'planHash', 'registryVersion',
+    'runIdentity', 'limitsJson', 'limitsHash', 'budget', 'completedResultsJson',
+    'pendingStepId', 'lastAdmissionKind', 'lastAdmissionStepId', 'baseCheckpointData'
+  ];
+  const fields = readOwnDataRecord(value, allowed, operation);
+  const budget = readOwnDataRecord(fields.budget, [
+    'version', 'limitsHash', 'startedWallMs', 'deadlineWallMs', 'lastWallMs',
+    'elapsedMs', 'stepsAdmitted', 'stepAttempts', 'localRetries', 'replans',
+    'iterations', 'totalResultBytes'
+  ], operation);
+  const integers = [
+    'version', 'startedWallMs', 'deadlineWallMs', 'lastWallMs', 'elapsedMs',
+    'stepsAdmitted', 'stepAttempts', 'localRetries', 'replans', 'iterations',
+    'totalResultBytes'
+  ];
+  if (
+    fields.kind !== LOCAL_CHECKPOINT_KIND
+    || fields.version !== 2
+    || typeof fields.workflowId !== 'string'
+    || typeof fields.planJson !== 'string'
+    || Buffer.byteLength(fields.planJson, 'utf8') > 32_768
+    || typeof fields.planHash !== 'string'
+    || !/^plan1_[0-9a-f]{64}$/u.test(fields.planHash)
+    || typeof fields.registryVersion !== 'string'
+    || !/^registry1_[0-9a-f]{64}$/u.test(fields.registryVersion)
+    || typeof fields.runIdentity !== 'string'
+    || !/^run1_[0-9a-f]{64}$/u.test(fields.runIdentity)
+    || typeof fields.limitsJson !== 'string'
+    || Buffer.byteLength(fields.limitsJson, 'utf8') > 2_048
+    || typeof fields.limitsHash !== 'string'
+    || !/^limits1_[0-9a-f]{64}$/u.test(fields.limitsHash)
+    || typeof fields.completedResultsJson !== 'string'
+    || Buffer.byteLength(fields.completedResultsJson, 'utf8') > 131_072
+    || !(fields.pendingStepId === null || (typeof fields.pendingStepId === 'string' && LOCAL_STEP_ID.test(fields.pendingStepId)))
+    || !['step', 'replay'].includes(fields.lastAdmissionKind)
+    || typeof fields.lastAdmissionStepId !== 'string'
+    || !LOCAL_STEP_ID.test(fields.lastAdmissionStepId)
+    || !isRecord(fields.baseCheckpointData)
+    || budget.version !== 1
+    || budget.limitsHash !== fields.limitsHash
+    || integers.some(key => !Number.isSafeInteger(budget[key]) || budget[key] < 0)
+    || budget.deadlineWallMs <= budget.startedWallMs
+    || budget.lastWallMs < budget.startedWallMs
+    || budget.lastWallMs > budget.deadlineWallMs
+    || budget.elapsedMs > 30_000
+    || budget.deadlineWallMs - budget.startedWallMs > 30_000
+    || budget.stepsAdmitted > 32
+    || budget.stepAttempts > 64
+    || budget.localRetries > 32
+    || budget.replans > 8
+    || budget.iterations > 64
+    || budget.totalResultBytes > 65_536
+    || budget.stepAttempts < budget.stepsAdmitted
+    || budget.iterations < budget.stepAttempts
+    || budget.localRetries > budget.stepAttempts
+    || (fields.lastAdmissionKind === 'replay' && budget.localRetries < 1)
+    || budget.replans > budget.iterations
+  ) {
+    fail(operation, 'CHECKPOINT_CORRUPT', 'The private local checkpoint is invalid.');
+  }
+  try {
+    const limitSet = createLimitSet(fields.limitsJson);
+    if (limitSet.hash !== fields.limitsHash) throw new Error('limit identity');
+    const plan = compilePlan(fields.planJson, limitSet, undefined, fields.workflowId);
+    if (
+      plan.planHash !== fields.planHash
+      || plan.registryVersion !== fields.registryVersion
+      || plan.runIdentity !== fields.runIdentity
+    ) throw new Error('plan identity');
+    const validatedBudget = validateBudgetSnapshot(budget, limitSet);
+    const completed = validatePrivateCheckpointResults(plan, fields.completedResultsJson);
+    if (
+      completed.totalResultBytes !== validatedBudget.totalResultBytes
+      || validatedBudget.stepsAdmitted !== completed.resultCount + (fields.pendingStepId === null ? 0 : 1)
+      || (fields.pendingStepId !== null
+        && (fields.lastAdmissionStepId !== fields.pendingStepId
+          || getNextReadyStep(plan, fields.completedResultsJson) !== fields.pendingStepId))
+      || (fields.pendingStepId === null
+        && completed.resultCount > 0
+        && !completed.stepIds.includes(fields.lastAdmissionStepId))
+      || (fields.pendingStepId === null
+        && completed.resultCount === 0
+        && (validatedBudget.stepsAdmitted !== 0 || validatedBudget.stepAttempts !== 0))
+    ) throw new Error('controller history');
+  } catch {
+    fail(operation, 'CHECKPOINT_CORRUPT', 'The private local checkpoint is invalid.');
+  }
+  fields.budget = Object.freeze({ ...budget });
+  return Object.freeze(fields);
+}
+
+function equalCheckpointData(left, right, operation) {
+  return serializeCheckpoint(left, operation) === serializeCheckpoint(right, operation);
+}
+
+function assertLocalControllerTransactionClock(now, next, row, previous, operation) {
+  const persistedLastWallMs = Math.max(
+    Number(row.updated_at_ms),
+    previous?.budget.lastWallMs ?? next.budget.startedWallMs
+  );
+  const lowerBound = Math.max(next.budget.lastWallMs, persistedLastWallMs);
+  if (now < lowerBound) {
+    fail(operation, 'CLOCK_ROLLBACK', 'The local controller clock moved backwards during a transaction.');
+  }
+  if (now >= next.budget.deadlineWallMs || now - next.budget.lastWallMs > 250) {
+    fail(operation, 'INVALID_INPUT', 'The local step clock snapshot is outside its supported boundary.');
+  }
+}
+
+function assertPrivateCheckpointPins(previous, next, workflowId, operation) {
+  if (
+    next.workflowId !== workflowId
+    || previous.workflowId !== workflowId
+    || previous.kind !== next.kind
+    || previous.version !== next.version
+    || previous.planJson !== next.planJson
+    || previous.planHash !== next.planHash
+    || previous.registryVersion !== next.registryVersion
+    || previous.runIdentity !== next.runIdentity
+    || previous.limitsJson !== next.limitsJson
+    || previous.limitsHash !== next.limitsHash
+    || !equalCheckpointData(previous.baseCheckpointData, next.baseCheckpointData, operation)
+  ) {
+    fail(operation, 'CHECKPOINT_CORRUPT', 'The private local checkpoint identity changed.');
+  }
+}
+
+function assertAdmissionBudget(previous, next, kind, stepId, operation) {
+  const before = previous?.budget;
+  const after = next.budget;
+  if (next.pendingStepId !== stepId || next.lastAdmissionKind !== kind || next.lastAdmissionStepId !== stepId) {
+    fail(operation, 'INVALID_INPUT', 'The local step admission is invalid.');
+  }
+  if (before === undefined) {
+    if (
+      kind !== 'step'
+      || after.stepsAdmitted !== 1
+      || after.stepAttempts !== 1
+      || after.localRetries !== 0
+      || after.replans !== 0
+      || after.iterations !== 1
+      || after.totalResultBytes !== 0
+      || next.completedResultsJson !== '{}'
+    ) {
+      fail(operation, 'CHECKPOINT_CORRUPT', 'The initial local step allowance is invalid.');
+    }
+    return;
+  }
+  if (
+    before.startedWallMs !== after.startedWallMs
+    || before.deadlineWallMs !== after.deadlineWallMs
+    || before.limitsHash !== after.limitsHash
+    || after.lastWallMs < before.lastWallMs
+    || after.elapsedMs < before.elapsedMs
+    || after.stepsAdmitted !== before.stepsAdmitted + (kind === 'step' ? 1 : 0)
+    || after.stepAttempts !== before.stepAttempts + 1
+    || after.localRetries !== before.localRetries + (kind === 'replay' ? 1 : 0)
+    || after.replans !== before.replans
+    || after.iterations !== before.iterations + 1
+    || after.totalResultBytes !== before.totalResultBytes
+    || next.completedResultsJson !== previous.completedResultsJson
+    || (kind === 'step' && previous.pendingStepId !== null)
+    || (kind === 'replay' && previous.pendingStepId !== stepId)
+  ) {
+    fail(operation, 'CHECKPOINT_CORRUPT', 'The local step counters cannot be reset or rebound.');
+  }
+}
+
+function assertCompletionBudget(previous, next, stepId, operation) {
+  const before = previous.budget;
+  const after = next.budget;
+  if (
+    previous.pendingStepId !== stepId
+    || previous.lastAdmissionStepId !== stepId
+    || next.pendingStepId !== null
+    || next.lastAdmissionKind !== previous.lastAdmissionKind
+    || next.lastAdmissionStepId !== stepId
+    || before.startedWallMs !== after.startedWallMs
+    || before.deadlineWallMs !== after.deadlineWallMs
+    || before.limitsHash !== after.limitsHash
+    || after.lastWallMs < before.lastWallMs
+    || after.elapsedMs < before.elapsedMs
+    || after.stepsAdmitted !== before.stepsAdmitted
+    || after.stepAttempts !== before.stepAttempts
+    || after.localRetries !== before.localRetries
+    || after.replans !== before.replans
+    || after.iterations !== before.iterations
+    || after.totalResultBytes < before.totalResultBytes
+    || next.completedResultsJson === previous.completedResultsJson
+  ) {
+    fail(operation, 'CHECKPOINT_CORRUPT', 'The local step completion does not match its persisted admission.');
+  }
+  let beforeResults;
+  let afterResults;
+  try {
+    beforeResults = JSON.parse(previous.completedResultsJson);
+    afterResults = JSON.parse(next.completedResultsJson);
+  } catch {
+    fail(operation, 'CHECKPOINT_CORRUPT', 'The local result checkpoint is invalid.');
+  }
+  if (
+    !isRecord(beforeResults)
+    || !isRecord(afterResults)
+    || Object.hasOwn(beforeResults, stepId)
+    || Object.keys(afterResults).length !== Object.keys(beforeResults).length + 1
+    || !Object.hasOwn(afterResults, stepId)
+    || Object.keys(beforeResults).some(key => !Object.hasOwn(afterResults, key)
+      || !equalCheckpointData(beforeResults[key], afterResults[key], operation))
+  ) {
+    fail(operation, 'CHECKPOINT_CORRUPT', 'The local completion must add exactly its admitted result.');
   }
 }
 
@@ -1083,7 +1349,12 @@ export class DurableWorkflowStore {
       }
       let parsed;
       try {
-        parsed = JSON.parse(row.payload_json);
+        parsed = parseBoundedJson(row.payload_json, {
+          maxBytes: MAX_CHECKPOINT_SERIALIZED_BYTES,
+          maxDepth: MAX_CHECKPOINT_DEPTH + 4,
+          maxNodes: MAX_CHECKPOINT_NODES * 2 + 8,
+          allowUnsafeFiniteNumbers: true
+        });
       } catch {
         fail(operation, 'CHECKPOINT_CORRUPT', 'The latest workflow checkpoint is invalid.');
       }
@@ -1100,6 +1371,299 @@ export class DurableWorkflowStore {
     } catch (error) {
       throw mapStorageError(operation, error);
     }
+  }
+
+  /** @internal The capability token is deliberately absent from the package API. */
+  _localControllerNow(capability) {
+    if (capability !== LOCAL_CONTROLLER_STORAGE_CAPABILITY) {
+      fail('_localControllerNow', 'INVALID_INPUT', 'The private local controller capability is required.');
+    }
+    this.#assertOpen('_localControllerNow');
+    return this.#now('_localControllerNow');
+  }
+
+  /** @internal Returns one consistent workflow/checkpoint/unknown-attempt snapshot. */
+  _localControllerSnapshot(capability, workflowId) {
+    const operation = '_localControllerSnapshot';
+    if (capability !== LOCAL_CONTROLLER_STORAGE_CAPABILITY) {
+      fail(operation, 'INVALID_INPUT', 'The private local controller capability is required.');
+    }
+    expectString(workflowId, 'workflowId', operation);
+    this.#assertOpen(operation);
+    return inTransaction(this.#db, operation, () => {
+      const workflow = mapWorkflow(this.#workflow(workflowId, operation));
+      const checkpoint = this.getCheckpoint(workflowId);
+      const unresolved = this.#db.prepare(`
+        SELECT state FROM operation_attempts
+        WHERE workflow_id = ? AND state IN ('intent','outcome_unknown','response_received')
+        ORDER BY attempt_id LIMIT 33
+      `).all(workflowId);
+      return Object.freeze({
+        workflow: Object.freeze(workflow),
+        checkpoint: Object.freeze(checkpoint),
+        externalAttemptStates: Object.freeze(unresolved.slice(0, 32).map(row => row.state)),
+        externalAttemptsTruncated: unresolved.length > 32,
+        hasUnresolvedExternalAttempt: unresolved.length > 0
+      });
+    });
+  }
+
+  /** @internal Persists the allowance before a reviewed pure local step runs. */
+  _localControllerAdmit(capability, input) {
+    const operation = '_localControllerAdmit';
+    if (capability !== LOCAL_CONTROLLER_STORAGE_CAPABILITY) {
+      fail(operation, 'INVALID_INPUT', 'The private local controller capability is required.');
+    }
+    const fields = readOwnDataRecord(input, [
+      'workflowId', 'ownerId', 'fence', 'expectedRevision', 'expectedCheckpointSequence',
+      'stepId', 'admissionKind', 'eventId', 'controllerState'
+    ], operation);
+    expectString(fields.workflowId, 'workflowId', operation);
+    expectString(fields.ownerId, 'ownerId', operation);
+    expectInteger(fields.fence, 'fence', operation, 1);
+    expectInteger(fields.expectedRevision, 'expectedRevision', operation);
+    expectInteger(fields.expectedCheckpointSequence, 'expectedCheckpointSequence', operation, 1);
+    if (!LOCAL_STEP_ID.test(fields.stepId) || !['step', 'replay'].includes(fields.admissionKind)) {
+      fail(operation, 'INVALID_INPUT', 'The local step admission is invalid.');
+    }
+    expectString(fields.eventId, 'eventId', operation);
+    const next = readLocalControllerState(fields.controllerState, operation);
+    if (next.workflowId !== fields.workflowId) {
+      fail(operation, 'CHECKPOINT_CORRUPT', 'The private local checkpoint belongs to another workflow.');
+    }
+    const payload = serializeCheckpoint(next, operation);
+    const payloadHash = digest(payload);
+    this.#assertOpen(operation);
+    return inTransaction(this.#db, operation, () => {
+      const row = this.#workflow(fields.workflowId, operation);
+      const now = this.#assertLease(row, { ownerId: fields.ownerId, fence: fields.fence }, operation);
+      this.#assertMutable(row, operation);
+      this.#assertRevision(row, fields.expectedRevision, operation);
+      if (row.state !== 'running' || row.cancellation_requested) {
+        fail(operation, 'ILLEGAL_TRANSITION', 'A local step requires an active uncancelled workflow.');
+      }
+      if (Number(row.checkpoint_sequence) !== fields.expectedCheckpointSequence) {
+        fail(operation, 'CONCURRENT_MODIFICATION', 'The workflow checkpoint changed since this operation was prepared.', true);
+      }
+      if (this.#db.prepare(`
+        SELECT 1 FROM operation_attempts
+        WHERE workflow_id = ? AND state IN ('intent','outcome_unknown','response_received') LIMIT 1
+      `).get(fields.workflowId)) {
+        fail(operation, 'OUTCOME_UNRESOLVED', 'An external outcome must be reconciled before local execution.');
+      }
+      const current = this.getCheckpoint(fields.workflowId);
+      let previous = null;
+      if (isRecord(current.data) && current.data.kind === LOCAL_CHECKPOINT_KIND) {
+        previous = readLocalControllerState(current.data, operation);
+        assertPrivateCheckpointPins(previous, next, fields.workflowId, operation);
+        if (!equalCheckpointData(previous, current.data, operation)) {
+          fail(operation, 'CHECKPOINT_CORRUPT', 'The private local checkpoint changed while being read.');
+        }
+      } else if (!equalCheckpointData(next.baseCheckpointData, current.data, operation)) {
+        fail(operation, 'CHECKPOINT_CORRUPT', 'The original workflow checkpoint cannot be rebound.');
+      }
+      assertLocalControllerTransactionClock(now, next, row, previous, operation);
+      assertAdmissionBudget(previous, next, fields.admissionKind, fields.stepId, operation);
+
+      const eventType = fields.admissionKind === 'replay'
+        ? 'private_local_step_replayed'
+        : 'private_local_step_admitted';
+      this.#assertEventAvailable(fields.eventId, operation);
+      const revision = Number(row.revision) + 1;
+      const sequence = Number(row.checkpoint_sequence) + 1;
+      const update = this.#db.prepare(`
+        UPDATE workflows
+        SET revision = ?, checkpoint_sequence = ?, updated_at_ms = ?
+        WHERE workflow_id = ? AND revision = ? AND checkpoint_sequence = ?
+          AND state = 'running' AND cancellation_requested = 0
+          AND fence_token = ? AND lease_owner = ? AND lease_expires_ms > ?
+      `).run(
+        revision, sequence, now, fields.workflowId, fields.expectedRevision,
+        fields.expectedCheckpointSequence, fields.fence, fields.ownerId, now
+      );
+      if (Number(update.changes) !== 1) {
+        fail(operation, 'CONCURRENT_MODIFICATION', 'The workflow changed before local admission committed.', true);
+      }
+      this.#db.prepare(`
+        INSERT INTO workflow_checkpoints (
+          workflow_id, sequence, schema_version, payload_json, sha256, revision, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        fields.workflowId, sequence, CHECKPOINT_SCHEMA_VERSION, payload, payloadHash, revision, now
+      );
+      const eventSequence = this.#appendEvent({
+        eventId: fields.eventId,
+        workflowId: fields.workflowId,
+        revision,
+        type: eventType,
+        fromState: row.state,
+        toState: row.state,
+        fence: fields.fence,
+        atMs: now
+      });
+      return Object.freeze({
+        workflowId: fields.workflowId,
+        revision,
+        checkpointSequence: sequence,
+        eventSequence,
+        stepId: fields.stepId,
+        admissionKind: fields.admissionKind
+      });
+    });
+  }
+
+  /** @internal Atomically commits one validated local result and its checkpoint event. */
+  _localControllerComplete(capability, input) {
+    const operation = '_localControllerComplete';
+    if (capability !== LOCAL_CONTROLLER_STORAGE_CAPABILITY) {
+      fail(operation, 'INVALID_INPUT', 'The private local controller capability is required.');
+    }
+    const fields = readOwnDataRecord(input, [
+      'workflowId', 'ownerId', 'fence', 'expectedRevision', 'expectedCheckpointSequence',
+      'stepId', 'eventId', 'controllerState'
+    ], operation);
+    expectString(fields.workflowId, 'workflowId', operation);
+    expectString(fields.ownerId, 'ownerId', operation);
+    expectInteger(fields.fence, 'fence', operation, 1);
+    expectInteger(fields.expectedRevision, 'expectedRevision', operation);
+    expectInteger(fields.expectedCheckpointSequence, 'expectedCheckpointSequence', operation, 1);
+    if (!LOCAL_STEP_ID.test(fields.stepId)) fail(operation, 'INVALID_INPUT', 'The local step identity is invalid.');
+    expectString(fields.eventId, 'eventId', operation);
+    const next = readLocalControllerState(fields.controllerState, operation);
+    if (next.workflowId !== fields.workflowId) {
+      fail(operation, 'CHECKPOINT_CORRUPT', 'The private local checkpoint belongs to another workflow.');
+    }
+    const payload = serializeCheckpoint(next, operation);
+    const payloadHash = digest(payload);
+    this.#assertOpen(operation);
+    return inTransaction(this.#db, operation, () => {
+      const row = this.#workflow(fields.workflowId, operation);
+      const now = this.#assertLease(row, { ownerId: fields.ownerId, fence: fields.fence }, operation);
+      this.#assertMutable(row, operation);
+      this.#assertRevision(row, fields.expectedRevision, operation);
+      if (row.state !== 'running' || row.cancellation_requested) {
+        fail(operation, 'ILLEGAL_TRANSITION', 'A local step requires an active uncancelled workflow.');
+      }
+      if (Number(row.checkpoint_sequence) !== fields.expectedCheckpointSequence) {
+        fail(operation, 'CONCURRENT_MODIFICATION', 'The workflow checkpoint changed since this operation was prepared.', true);
+      }
+      if (this.#db.prepare(`
+        SELECT 1 FROM operation_attempts
+        WHERE workflow_id = ? AND state IN ('intent','outcome_unknown','response_received') LIMIT 1
+      `).get(fields.workflowId)) {
+        fail(operation, 'OUTCOME_UNRESOLVED', 'An external outcome must be reconciled before local execution.');
+      }
+      const current = this.getCheckpoint(fields.workflowId);
+      if (!isRecord(current.data) || current.data.kind !== LOCAL_CHECKPOINT_KIND) {
+        fail(operation, 'CHECKPOINT_CORRUPT', 'The local completion has no private admission checkpoint.');
+      }
+      const previous = readLocalControllerState(current.data, operation);
+      assertPrivateCheckpointPins(previous, next, fields.workflowId, operation);
+      if (!equalCheckpointData(previous, current.data, operation)) {
+        fail(operation, 'CHECKPOINT_CORRUPT', 'The private local checkpoint changed while being read.');
+      }
+      assertLocalControllerTransactionClock(now, next, row, previous, operation);
+      assertCompletionBudget(previous, next, fields.stepId, operation);
+
+      this.#assertEventAvailable(fields.eventId, operation);
+      const revision = Number(row.revision) + 1;
+      const sequence = Number(row.checkpoint_sequence) + 1;
+      const update = this.#db.prepare(`
+        UPDATE workflows
+        SET revision = ?, checkpoint_sequence = ?, updated_at_ms = ?
+        WHERE workflow_id = ? AND revision = ? AND checkpoint_sequence = ?
+          AND state = 'running' AND cancellation_requested = 0
+          AND fence_token = ? AND lease_owner = ? AND lease_expires_ms > ?
+      `).run(
+        revision, sequence, now, fields.workflowId, fields.expectedRevision,
+        fields.expectedCheckpointSequence, fields.fence, fields.ownerId, now
+      );
+      if (Number(update.changes) !== 1) {
+        fail(operation, 'CONCURRENT_MODIFICATION', 'The workflow changed before local completion committed.', true);
+      }
+      this.#db.prepare(`
+        INSERT INTO workflow_checkpoints (
+          workflow_id, sequence, schema_version, payload_json, sha256, revision, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        fields.workflowId, sequence, CHECKPOINT_SCHEMA_VERSION, payload, payloadHash, revision, now
+      );
+      const eventSequence = this.#appendEvent({
+        eventId: fields.eventId,
+        workflowId: fields.workflowId,
+        revision,
+        type: 'private_local_step_completed',
+        fromState: row.state,
+        toState: row.state,
+        fence: fields.fence,
+        atMs: now
+      });
+      return Object.freeze({
+        workflowId: fields.workflowId,
+        revision,
+        checkpointSequence: sequence,
+        eventSequence,
+        stepId: fields.stepId
+      });
+    });
+  }
+
+  /** @internal Bounded keyset page; the checkpoint/page state stays read-only. */
+  _localControllerListAttempts(capability, input) {
+    const operation = '_localControllerListAttempts';
+    if (capability !== LOCAL_CONTROLLER_STORAGE_CAPABILITY) {
+      fail(operation, 'INVALID_INPUT', 'The private local controller capability is required.');
+    }
+    const fields = readOwnDataRecord(input, [
+      'workflowId', 'afterAttemptId', 'expectedRevision', 'limit'
+    ], operation);
+    expectString(fields.workflowId, 'workflowId', operation);
+    const afterAttemptId = fields.afterAttemptId ?? null;
+    if (afterAttemptId !== null) expectString(afterAttemptId, 'afterAttemptId', operation);
+    const expectedRevision = fields.expectedRevision ?? null;
+    if (expectedRevision !== null) expectInteger(expectedRevision, 'expectedRevision', operation);
+    const limit = fields.limit === undefined ? 32 : fields.limit;
+    expectInteger(limit, 'limit', operation, 1);
+    if (limit > 100) fail(operation, 'INVALID_INPUT', 'The recovery page exceeds its supported size.');
+    this.#assertOpen(operation);
+    return inTransaction(this.#db, operation, () => {
+      const row = this.#workflow(fields.workflowId, operation);
+      if (expectedRevision !== null) this.#assertRevision(row, expectedRevision, operation);
+      if (afterAttemptId !== null && expectedRevision === null) {
+        fail(operation, 'INVALID_INPUT', 'A recovery cursor requires its pinned workflow revision.');
+      }
+      const rows = this.#db.prepare(`
+        SELECT a.attempt_id, a.logical_operation_ref, a.state, a.created_at_ms, a.updated_at_ms,
+               r.receipt_id, r.outcome, r.response_sha256
+        FROM operation_attempts a
+        LEFT JOIN response_receipts r ON r.attempt_id = a.attempt_id
+        WHERE a.workflow_id = ? AND (? IS NULL OR a.attempt_id > ?)
+        ORDER BY a.attempt_id COLLATE BINARY
+        LIMIT ?
+      `).all(fields.workflowId, afterAttemptId, afterAttemptId, limit + 1);
+      const hasMore = rows.length > limit;
+      const items = rows.slice(0, limit).map(attempt => Object.freeze({
+        workflowId: fields.workflowId,
+        attemptId: attempt.attempt_id,
+        logicalOperationRef: attempt.logical_operation_ref,
+        state: attempt.state,
+        createdAtMs: Number(attempt.created_at_ms),
+        updatedAtMs: Number(attempt.updated_at_ms),
+        receipt: attempt.receipt_id === null ? null : Object.freeze({
+          receiptId: attempt.receipt_id,
+          outcome: attempt.outcome,
+          responseSha256: attempt.response_sha256
+        })
+      }));
+      return Object.freeze({
+        workflowId: fields.workflowId,
+        workflowRevision: Number(row.revision),
+        items: Object.freeze(items),
+        hasMore,
+        incomplete: hasMore,
+        nextAfterAttemptId: hasMore && items.length > 0 ? items.at(-1).attemptId : null
+      });
+    });
   }
 
   acquireLease({ workflowId, ownerId, ttlMs, eventId } = {}) {
