@@ -908,9 +908,126 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         )
         parsed = profile_setup.validate_apt_record(
             record, profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
-            profile_setup.PROFILE_DEB_SHA256)
+            profile_setup.PROFILE_DEB_SHA256, source_text=record)
         self.assertEqual(parsed["APT-Sources"],
                          "https://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
+
+    def test_native_profile_setup_reads_source_from_explicit_apt_cache_v2_record(self) -> None:
+        metadata = (
+            "Package: apparmor-profiles\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Architecture: all\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+        )
+        source_record = (
+            "Package: apparmor-profiles:all\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+            "APT-Sources: https://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages\n"
+        )
+        with mock.patch.object(profile_setup, "_command", side_effect=[
+                (metadata.encode(), b""), (source_record.encode(), b"")]) as command:
+            parsed = profile_setup._package_record(
+                profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
+                profile_setup.PROFILE_DEB_SHA256)
+        self.assertEqual(parsed["APT-Sources"],
+                         "https://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
+        self.assertEqual(command.call_args_list[0].args[0], [
+            "apt-cache", "-f", "-o", "APT::Cache::Show::Version=1", "show",
+            "apparmor-profiles=4.0.1really4.0.1-0ubuntu0.24.04.8"])
+        self.assertEqual(command.call_args_list[1].args[0], [
+            "apt-cache", "-f", "-o", "APT::Cache::Show::Version=2", "show",
+            "apparmor-profiles=4.0.1really4.0.1-0ubuntu0.24.04.8"])
+
+    def test_native_profile_setup_keeps_sanitized_diagnostics_when_source_is_unrecognized(self) -> None:
+        metadata = (
+            "Package: apparmor-profiles\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Architecture: all\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+        )
+        private_source = (
+            "Package: apparmor-profiles:all\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+            "APT-Sources: https://user:secret@azure.archive.ubuntu.com/private-token noble-updates/main amd64 Packages\n"
+        )
+        with self.assertRaises(profile_setup.SetupFailure) as raised:
+            profile_setup.validate_apt_record(
+                metadata, profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
+                profile_setup.PROFILE_DEB_SHA256, source_text=private_source)
+        self.assertEqual(raised.exception.code,
+                         "signed_apt_package_origin_is_not_ubuntu_noble_updates")
+        diagnostics = json.dumps(raised.exception.details, sort_keys=True)
+        self.assertLessEqual(len(diagnostics), 2048)
+        self.assertIn('"source_host_class": "ubuntu_archive"', diagnostics)
+        self.assertNotIn("user", diagnostics)
+        self.assertNotIn("secret", diagnostics)
+        self.assertNotIn("private-token", diagnostics)
+
+    def test_native_profile_setup_reports_bounded_shape_when_v2_source_is_missing(self) -> None:
+        metadata = (
+            "Package: apparmor-profiles\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Architecture: all\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+        )
+        source_record = (
+            "Package: apparmor-profiles:all\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+        )
+        with mock.patch.object(profile_setup, "_command", side_effect=[
+                (metadata.encode(), b""), (source_record.encode(), b"")]):
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "signed_apt_package_origin_missing") as raised:
+                profile_setup._package_record(
+                    profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
+                    profile_setup.PROFILE_DEB_SHA256)
+        self.assertEqual(raised.exception.details["metadata_record"]["exact_candidate_count"], 1)
+        self.assertEqual(raised.exception.details["source_record"]["fields_present"],
+                         ["Package", "Version", "Filename", "SHA256"])
+        self.assertEqual(raised.exception.details["source_record"]["source_host_class"], "missing")
+
+    def test_native_profile_setup_requires_matching_exact_v2_package_identity(self) -> None:
+        metadata = (
+            "Package: bubblewrap\n"
+            "Version: 0.9.0-1ubuntu0.3\n"
+            "Architecture: amd64\n"
+            "Filename: pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb\n"
+            "SHA256: " + "a" * 64 + "\n"
+        )
+        for package_field in ("bubblewrap:arm64", "bubblewrap:amd64"):
+            source_record = (
+                "Package: " + package_field + "\n"
+                "Version: 0.9.0-1ubuntu0.3\n"
+                "Filename: pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.3_amd64.deb\n"
+                "SHA256: " + "a" * 64 + "\n"
+                "APT-Sources: http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages\n"
+            )
+            with self.subTest(package_field=package_field):
+                if package_field == "bubblewrap:amd64":
+                    profile_setup.validate_apt_record(
+                        metadata, "bubblewrap", "0.9.0-1ubuntu0.3", "a" * 64,
+                        source_text=source_record)
+                else:
+                    with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                                "exact_signed_apt_source_record_missing_or_ambiguous"):
+                        profile_setup.validate_apt_record(
+                            metadata, "bubblewrap", "0.9.0-1ubuntu0.3", "a" * 64,
+                            source_text=source_record)
+        mismatched_source = source_record.replace("a" * 64, "b" * 64)
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "signed_apt_source_record_metadata_mismatch"):
+            profile_setup.validate_apt_record(
+                metadata, "bubblewrap", "0.9.0-1ubuntu0.3", "a" * 64,
+                source_text=mismatched_source)
 
     def test_native_profile_setup_rejects_foreign_stale_or_unpinned_apt_record(self) -> None:
         record = (
@@ -925,7 +1042,9 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             ("0ubuntu0.24.04.8", "0ubuntu0.24.04.7"),
             (profile_setup.PROFILE_DEB_SHA256, "0" * 64),
             ("archive.ubuntu.com", "packages.example.invalid"),
+            ("archive.ubuntu.com/ubuntu", "archive.ubuntu.com:invalid/ubuntu"),
             ("noble-updates/main", "noble/main"),
+            ("noble-updates/main amd64 Packages", "noble-updates/main amd64 Sources"),
             ("pool/main/a/apparmor/", "pool/universe/a/apparmor/"),
         ):
             with self.subTest(replacement=replacement[1]):
@@ -933,7 +1052,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 with self.assertRaises(profile_setup.SetupFailure):
                     profile_setup.validate_apt_record(
                         candidate, profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
-                        profile_setup.PROFILE_DEB_SHA256)
+                        profile_setup.PROFILE_DEB_SHA256, source_text=candidate)
 
     def test_native_profile_setup_rejects_untrusted_apt_configuration_overrides(self) -> None:
         with mock.patch.dict(profile_setup.os.environ, {"APT_CONFIG": "/tmp/unreviewed-apt.conf"}):

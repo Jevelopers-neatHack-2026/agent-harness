@@ -38,9 +38,12 @@ RELEVANT_SYSCTLS = (
 
 
 class SetupFailure(Exception):
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, details: dict[str, Any] | None = None):
         super().__init__(code)
         self.code = code
+        # Callers may attach only pre-sanitized, fixed-shape diagnostics. Raw
+        # APT output is intentionally never retained in exceptions or artifacts.
+        self.details = details or {}
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -89,44 +92,177 @@ def _fields(text: str) -> dict[str, str]:
     return result
 
 
+def _stanzas(text: str) -> list[dict[str, str]]:
+    return [_fields(part) for part in re.split(r"\n\s*\n", text.strip()) if part.strip()]
+
+
+def _apt_package_matches(value: str, package: str) -> bool:
+    expected_architecture = "all" if package == PROFILE_PACKAGE else "amd64"
+    return value in {package, package + ":" + expected_architecture}
+
+
+def _candidate_record_diagnostics(metadata_text: str, source_text: str | None,
+                                  package: str, version: str) -> dict[str, Any]:
+    """Summarize APT's candidate shape without retaining mirror URLs or values."""
+    allowed_fields = (
+        "Package", "Version", "Architecture", "Filename", "SHA256", "APT-Sources",
+    )
+
+    def summarize(text: str | None) -> dict[str, Any]:
+        rows = _stanzas(text or "")
+        matches = [row for row in rows
+                   if _apt_package_matches(row.get("Package", ""), package)
+                   and row.get("Version") == version]
+        row = matches[0] if len(matches) == 1 else {}
+        source = row.get("APT-Sources", "")
+        tokens = source.split()
+        try:
+            uri = urlparse(tokens[0]) if tokens else None
+            hostname = (uri.hostname or "").lower() if uri else ""
+        except ValueError:
+            uri = None
+            hostname = ""
+        if not source:
+            host_class = "missing"
+        elif hostname == "archive.ubuntu.com" or hostname.endswith(".archive.ubuntu.com"):
+            host_class = "ubuntu_archive"
+        elif hostname == "security.ubuntu.com":
+            host_class = "ubuntu_security"
+        else:
+            host_class = "other_or_invalid"
+        release_component = tokens[1] if len(tokens) > 1 else ""
+        return {
+            "record_count": min(len(rows), 99),
+            "record_count_capped": len(rows) > 99,
+            "exact_candidate_count": min(len(matches), 99),
+            "exact_candidate_count_capped": len(matches) > 99,
+            "fields_present": [field for field in allowed_fields if field in row],
+            "source_token_count": min(len(tokens), 8),
+            "source_scheme": (
+                uri.scheme.lower() if uri and uri.scheme.lower() in {"http", "https"}
+                else ("other" if uri else "missing")
+            ),
+            "source_host_class": host_class,
+            "source_release_component": (
+                release_component if release_component == "noble-updates/main"
+                else ("other" if release_component else "missing")
+            ),
+            "source_index_architecture": (
+                tokens[2] if len(tokens) > 2 and tokens[2] in {"amd64", "all"}
+                else ("other" if len(tokens) > 2 else "missing")
+            ),
+            "source_index_type": (
+                tokens[3] if len(tokens) > 3 and tokens[3] == "Packages"
+                else ("other" if len(tokens) > 3 else "missing")
+            ),
+        }
+
+    return {"metadata_record": summarize(metadata_text),
+            "source_record": summarize(source_text)}
+
+
+def _validated_apt_source(source: str) -> str:
+    source_tokens = source.split()
+    if len(source_tokens) != 4:
+        raise SetupFailure("signed_apt_package_origin_missing")
+    try:
+        parsed = urlparse(source_tokens[0])
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError as exc:
+        raise SetupFailure("signed_apt_package_origin_is_not_ubuntu_noble_updates") from exc
+    expected_index_architecture = "amd64"
+    release_component = source_tokens[1]
+    release, separator, component = release_component.partition("/")
+    if (parsed.scheme not in {"http", "https"} or not hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment
+            or (port is not None and not 1 <= port <= 65535)
+            or not (hostname == "archive.ubuntu.com" or hostname.endswith(".archive.ubuntu.com")
+                    or hostname == "security.ubuntu.com")
+            or not separator or release != "noble-updates" or component != "main"
+            or source_tokens[2] != expected_index_architecture or source_tokens[3] != "Packages"):
+        raise SetupFailure("signed_apt_package_origin_is_not_ubuntu_noble_updates")
+    return source
+
+
 def validate_apt_record(text: str, package: str, version: str,
-                        sha256: str) -> dict[str, str]:
-    stanzas = [part for part in re.split(r"\n\s*\n", text.strip()) if part.strip()]
-    exact = [_fields(part) for part in stanzas]
-    matches = [row for row in exact if row.get("Package") == package and row.get("Version") == version]
+                        sha256: str, *, source_text: str) -> dict[str, str]:
+    exact = _stanzas(text)
+    matches = [row for row in exact
+               if _apt_package_matches(row.get("Package", ""), package)
+               and row.get("Version") == version]
+    diagnostics = _candidate_record_diagnostics(text, source_text, package, version)
     if len(matches) != 1:
-        raise SetupFailure("exact_signed_apt_package_record_missing_or_ambiguous")
+        raise SetupFailure("exact_signed_apt_package_record_missing_or_ambiguous",
+                           details=diagnostics)
     row = matches[0]
     expected_architecture = "all" if package == PROFILE_PACKAGE else "amd64"
     if (row.get("Architecture") != expected_architecture
             or not re.fullmatch(r"[0-9a-f]{64}", row.get("SHA256", ""))
             or (sha256 and row.get("SHA256") != sha256)):
-        raise SetupFailure("signed_apt_package_identity_or_digest_mismatch")
-    source = row.get("APT-Sources", "")
-    source_tokens = source.split()
-    if len(source_tokens) < 2:
-        raise SetupFailure("signed_apt_package_origin_missing")
-    parsed = urlparse(source_tokens[0])
-    hostname = (parsed.hostname or "").lower()
-    if (parsed.scheme not in {"http", "https"}
-            or not (hostname == "archive.ubuntu.com" or hostname.endswith(".archive.ubuntu.com"))
-            or not source_tokens[1].startswith("noble-updates/")):
-        raise SetupFailure("signed_apt_package_origin_is_not_ubuntu_noble_updates")
+        raise SetupFailure("signed_apt_package_identity_or_digest_mismatch",
+                           details=diagnostics)
+    source_matches = [candidate for candidate in _stanzas(source_text)
+                      if _apt_package_matches(candidate.get("Package", ""), package)
+                      and candidate.get("Version") == version]
+    if len(source_matches) != 1:
+        raise SetupFailure("exact_signed_apt_source_record_missing_or_ambiguous",
+                           details=diagnostics)
+    source_row = source_matches[0]
+    if (source_row.get("Filename") != row.get("Filename")
+            or source_row.get("SHA256") != row.get("SHA256")
+            or (source_row.get("Architecture") is not None
+                and source_row.get("Architecture") != row.get("Architecture"))):
+        raise SetupFailure("signed_apt_source_record_metadata_mismatch", details=diagnostics)
+    source = source_row.get("APT-Sources", "")
+    if not source:
+        raise SetupFailure("signed_apt_package_origin_missing", details=diagnostics)
+    try:
+        _validated_apt_source(source)
+    except SetupFailure as exc:
+        exc.details = diagnostics
+        raise
     filename = row.get("Filename", "")
     expected_prefix = ("pool/main/a/apparmor/" if package == PROFILE_PACKAGE
                        else "pool/main/b/bubblewrap/")
     if not filename.startswith(expected_prefix):
-        raise SetupFailure("signed_apt_package_filename_mismatch")
-    return {key: row[key] for key in ("Package", "Version", "Architecture", "Filename", "SHA256", "APT-Sources")}
+        raise SetupFailure("signed_apt_package_filename_mismatch", details=diagnostics)
+    result = {key: row[key] for key in (
+        "Package", "Version", "Architecture", "Filename", "SHA256",
+    )}
+    result["APT-Sources"] = source
+    return result
 
 
 def _package_record(package: str, version: str, sha256: str) -> dict[str, str]:
-    output, _ = _command(["apt-cache", "show", package + "=" + version], limit=128 * 1024)
+    # APT's default show format (v1) preserves the package-index fields we pin,
+    # but does not synthesize APT-Sources. Request v2 separately for provenance.
+    output, _ = _command(["apt-cache", "-f", "-o", "APT::Cache::Show::Version=1",
+                          "show", package + "=" + version], limit=128 * 1024)
     try:
         text = output.decode("utf-8")
     except UnicodeError as exc:
         raise SetupFailure("signed_apt_package_record_encoding_invalid") from exc
-    return validate_apt_record(text, package, version, sha256)
+    try:
+        source_output, _ = _command(["apt-cache", "-f", "-o", "APT::Cache::Show::Version=2",
+                                     "show", package + "=" + version], limit=128 * 1024)
+    except SetupFailure as exc:
+        exc.details = _candidate_record_diagnostics(text, None, package, version)
+        raise
+    try:
+        source_text = source_output.decode("utf-8")
+    except UnicodeError as exc:
+        raise SetupFailure("signed_apt_package_source_record_encoding_invalid") from exc
+    return validate_apt_record(text, package, version, sha256, source_text=source_text)
+
+
+def _public_apt_source(source: str) -> str:
+    """Return useful source identity while omitting URL credentials and paths."""
+    tokens = source.split()
+    parsed = urlparse(tokens[0])
+    host = (parsed.hostname or "").lower()
+    return f"{parsed.scheme.lower()}://{host}/[path-redacted] {' '.join(tokens[1:])}"
 
 
 def _apt_signature_configuration() -> dict[str, Any]:
@@ -350,7 +486,7 @@ def prepare(evidence_path: Path) -> int:
         if bwrap_record["Architecture"] != "amd64":
             raise SetupFailure("bubblewrap_signed_apt_record_architecture_mismatch")
         report["bubblewrap_apt_record"] = {
-            "version": bwrap_record["Version"], "origin": bwrap_record["APT-Sources"],
+            "version": bwrap_record["Version"], "origin": _public_apt_source(bwrap_record["APT-Sources"]),
         }
         _write_json(evidence_path, report)
 
@@ -374,7 +510,7 @@ def prepare(evidence_path: Path) -> int:
             "path": "/usr/bin/bwrap", "realpath": os.path.realpath(bwrap_path),
             "package_owner": bwrap_owner, "package_version": BWRAP_VERSION,
             "runtime_version": bwrap_version, "sha256": bwrap_digest,
-            "dpkg_verify": "clean", "apt_origin": bwrap_record["APT-Sources"],
+            "dpkg_verify": "clean", "apt_origin": _public_apt_source(bwrap_record["APT-Sources"]),
         }
         _write_json(evidence_path, report)
 
@@ -382,7 +518,8 @@ def prepare(evidence_path: Path) -> int:
         profile_record = _package_record(PROFILE_PACKAGE, PROFILE_VERSION, PROFILE_DEB_SHA256)
         report["profile_package"] = {
             "name": PROFILE_PACKAGE, "version": PROFILE_VERSION,
-            "architecture": profile_record["Architecture"], "origin": profile_record["APT-Sources"],
+            "architecture": profile_record["Architecture"],
+            "origin": _public_apt_source(profile_record["APT-Sources"]),
             "filename": profile_record["Filename"], "signed_index_sha256": profile_record["SHA256"],
         }
         _write_json(evidence_path, report)
@@ -496,6 +633,8 @@ def prepare(evidence_path: Path) -> int:
         return 0
     except SetupFailure as exc:
         report["failure_code"] = exc.code
+        if exc.details:
+            report["candidate_diagnostics"] = exc.details
         report["status"] = "blocked"
         _write_json(evidence_path, report)
         print("native profile setup blocked: " + exc.code, file=sys.stderr)
