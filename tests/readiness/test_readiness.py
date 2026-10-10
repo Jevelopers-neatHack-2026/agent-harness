@@ -1509,6 +1509,9 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("nested_userns_setup_stage", parent_code)
         self.assertIn("nested_userns_creation_attempted", parent_code)
         self.assertIn("nested_userns_mapping_observation", parent_code)
+        self.assertIn("user_namespace_creation_failed", parent_code)
+        self.assertIn("uid_mapping_failed", parent_code)
+        self.assertIn("_classify_namespace_setup_stderr", parent_code)
         self.assertIn("nested_userns_utility_version", parent_code)
         self.assertIn("nested_mount_attempted", parent_code)
         self.assertIn("nested_mount_namespace_denied", parent_code)
@@ -1518,6 +1521,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("private_shadow_visible", child_code)
         self.assertIn("loopback: failed rtm_newaddr: operation not permitted", parent_code)
         self.assertIn("nested_bwrap_setup_stage", parent_code)
+        self.assertIn("loopback_link_setup_failed", parent_code)
         self.assertIn("ACV1_NESTED_PAYLOAD_REACHED", parent_code)
         self.assertNotIn("--share-net", command)
         self.assertEqual(mocked_run.call_args.kwargs["timeout"], 20)
@@ -1530,6 +1534,17 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted")
         self.assertEqual(loopback_category, "network_namespace_loopback_setup_denied")
         self.assertIn("RTM_NEWADDR", loopback_excerpt)
+
+    def test_namespace_setup_stderr_requires_a_specific_upstream_stage_marker(self) -> None:
+        classify = contracts._classify_namespace_setup_stderr
+        self.assertEqual(classify(b"unshare: unshare failed: Operation not permitted", "unshare"),
+                         "user_namespace_creation_failed")
+        self.assertEqual(classify(b"unshare: write failed /proc/17/uid_map: Operation not permitted", "unshare"),
+                         "uid_mapping_failed")
+        self.assertEqual(classify(b"unshare: Operation not permitted", "unshare"), "setup_before_payload")
+        self.assertEqual(classify(b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted", "bubblewrap"),
+                         "loopback_setup_denied")
+        self.assertEqual(classify(b"bwrap: Operation not permitted", "bubblewrap"), "setup_or_exec_failed")
 
     def test_native_profile_setup_accepts_only_exact_signed_ubuntu_apt_record(self) -> None:
         record = (

@@ -1537,9 +1537,42 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
             + json.dumps(detail, sort_keys=True, separators=(",", ":")))[:640]
 
 
+def _classify_namespace_setup_stderr(stderr: bytes, utility: str) -> str:
+    """Classify only explicit, versioned utility-stage diagnostics.
+
+    Generic EPERM/EACCES remains a generic setup failure. The embedded Linux
+    canary mirrors these finite markers and never publishes raw stderr.
+    """
+    text = stderr.decode("utf-8", "replace").casefold().replace("_", " ")
+    if utility == "unshare":
+        if "unshare failed" in text:
+            return "user_namespace_creation_failed"
+        if "uid map" in text:
+            return "uid_mapping_failed"
+        if "gid map" in text or "setgroups" in text:
+            return "gid_mapping_failed"
+        return "setup_before_payload"
+    if utility == "bubblewrap":
+        if "unshare user ns" in text:
+            return "user_namespace_creation_failed"
+        if "setting up uid map" in text:
+            return "uid_mapping_failed"
+        if "setting up gid map" in text or "error writing to setgroups" in text:
+            return "gid_mapping_failed"
+        if ("loopback: failed rtm newaddr" in text
+                and "operation not permitted" in text):
+            return "loopback_setup_denied"
+        if "loopback: failed rtm newlink" in text:
+            return "loopback_link_setup_failed"
+        return "setup_or_exec_failed"
+    return "unclassified"
+
+
 def _run_sandbox_canary(package_root: Path, outside: Path,
                         observed: dict[str, Any] | None = None) -> str | None:
     """Exercise real filesystem, network, profile-stack, and capability boundaries."""
+    import inspect
+
     bwrap = shutil.which("bwrap")
     if not bwrap:
         return "bubblewrap is unavailable. Provision a supported bubblewrap runtime with user, network, and PID namespaces; adapters are not executed without an enforceable OS sandbox."
@@ -1785,7 +1818,9 @@ if unshare:
  elif not nested['bounded']:
   r['nested_userns_setup_stage']='timeout_or_output_limit'
  else:
-  r['nested_userns_setup_stage']='setup_before_payload'
+  r['nested_userns_setup_stage']=_classify_namespace_setup_stderr(nested.get('stderr',b''),'unshare')
+  if r['nested_userns_setup_stage'] in ('uid_mapping_failed','gid_mapping_failed'):
+   r['nested_userns_setup_stage']='mapping_setup_failed'
  r['nested_userns_created']=nested_report.get('created') is True and nested['bounded']
  r['nested_userns_setup_complete']=(nested_report.get('created') is True
   and nested_report.get('mount_attempted') is True and isinstance(nested_report.get('capabilities'),dict)
@@ -1808,13 +1843,17 @@ if unshare:
   r['nested_mount_errno_category']=nested_report['mount_errno_category']
  r['nested_userns_process_exit_code']=nested.get('code') if type(nested.get('code')) is int else None
  nested_error=nested.get('stderr',b'').decode('utf-8','replace').lower()
- r['nested_userns_stderr_class']=('mapping_setup_failure' if any(term in nested_error for term in ('uid map','gid map','setgroups')) else
+ normalized_nested_error=nested_error.replace('_',' ')
+ r['nested_userns_stderr_class']=('mapping_setup_failure' if any(term in normalized_nested_error for term in ('uid map','gid map','setgroups')) else
   'operation_not_permitted' if 'operation not permitted' in nested_error else
   'permission_denied' if 'permission denied' in nested_error else 'missing_file' if 'no such file or directory' in nested_error else
   'other' if nested_error else 'empty')
- if r['nested_userns_stderr_class']=='mapping_setup_failure':
+ if any(term in normalized_nested_error for term in ('uid map','gid map','setgroups')):
   r['nested_userns_setup_stage']='mapping_setup_failed'
   r['nested_userns_mapping_observation']='failed'
+ elif r['nested_userns_setup_stage']=='user_namespace_creation_failed':
+  r['nested_userns_creation_observation']=('denied' if r['nested_userns_stderr_class'] in
+   ('operation_not_permitted','permission_denied') else 'failed')
 else:
  r['nested_userns_setup_stage']='tool_unavailable'
 
@@ -1841,12 +1880,10 @@ if r['nested_bwrap_payload_reached']:
  r['nested_bwrap_setup_stage']='payload_reached'
 elif not inner['bounded']:
  r['nested_bwrap_setup_stage']='timeout_or_output_limit'
-elif r['nested_bwrap_stderr_class']=='network_namespace_loopback_setup_denied':
- r['nested_bwrap_setup_stage']='loopback_setup_denied'
-elif inner['code'] is not None and inner['code']!=0:
- r['nested_bwrap_setup_stage']='setup_or_exec_failed'
 else:
- r['nested_bwrap_setup_stage']='not_observed'
+ r['nested_bwrap_setup_stage']=_classify_namespace_setup_stderr(inner.get('stderr',b''),'bubblewrap')
+ if inner['code'] is None or inner['code']==0:
+  r['nested_bwrap_setup_stage']='not_observed'
 r['nested_bwrap_denied']=(inner['bounded'] and inner['code'] is not None and inner['code']!=0
  and r['nested_bwrap_setup_stage']=='loopback_setup_denied')
 print(json.dumps(r,sort_keys=True,separators=(',',':')))
@@ -1870,6 +1907,9 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
         return "The host network namespace identity cannot be inspected; no owner adapter is executed."
     command = prefix + [python_exe, "-I", "-B", "-S", "-c", parent_code,
                         str(outside), child_code, str(host_network_namespace), bwrap]
+    classifier_source = inspect.getsource(_classify_namespace_setup_stderr)
+    parent_code = classifier_source + "\n" + parent_code
+    command[command.index("-c") + 1] = parent_code
     run = run_bounded(command, cwd=package_root,
                       env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
                            "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"},
