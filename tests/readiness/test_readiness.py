@@ -34,6 +34,65 @@ def sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def synthetic_apt_transport() -> dict:
+    mirrors = tuple(line.split(b"\t", 1)[0].decode("ascii")
+                    for line in profile_setup.APT_MIRRORLIST_BYTES.splitlines())
+    return {
+        "transport": "github_ubuntu_runner_root_owned_mirrorlist",
+        "_source_uri": profile_setup.APT_MIRROR_URI,
+        "_mirror_uris": mirrors,
+        "mirrorlist_sha256": sha(profile_setup.APT_MIRRORLIST_BYTES),
+    }
+
+
+def synthetic_apt_index_target(repo_uri: str | None = None, **changes: str) -> str:
+    values = {
+        "Identifier": "Packages",
+        "MetaKey": "main/binary-amd64/Packages",
+        "Target-Of": "deb",
+        "Architecture": "amd64",
+        "Component": "main",
+        "Suite": "noble-updates",
+        "Codename": "noble",
+        "Origin": "Ubuntu",
+        "Label": "Ubuntu",
+        "Trusted": "yes",
+        "Signed-By": str(profile_setup.UBUNTU_ARCHIVE_KEYRING),
+        "Repo-URI": repo_uri or profile_setup.APT_MIRROR_URI,
+    }
+    values.update(changes)
+    return "".join(f"{field}: {value}\n" for field, value in values.items()) + "\n"
+
+
+def append_synthetic_dependencies(manifest_path: Path, count: int,
+                                  payload: bytes = b"test-only") -> list[Path]:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    package_root = manifest_path.parent
+    dependency_root = package_root / "cache-bound-dependencies"
+    dependency_root.mkdir(exist_ok=True)
+    descriptors = []
+    paths = []
+    for index in range(count):
+        relative = f"cache-bound-dependencies/{index:04d}.bin"
+        target = package_root / relative
+        target.write_bytes(payload)
+        paths.append(target.resolve())
+        descriptors.append({"path": relative, "sha256": sha(payload)})
+    manifest["canonical_release"]["validator_adapter"]["dependencies"] = descriptors
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+                             encoding="utf-8")
+    return paths
+
+
+SYNTHETIC_UBUNTU_SOURCES = (
+    "Types: deb\n"
+    "URIs: mirror+file:/etc/apt/apt-mirrors.txt\n"
+    "Suites: noble noble-updates noble-backports noble-security\n"
+    "Components: main restricted universe multiverse\n"
+    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+)
+
+
 def validate_synthetic_fixture(schema_path: Path, fixture_path: Path) -> dict:
     """Small TEST-ONLY schema reader; it is never used for canonical release readiness."""
     schema_bytes = schema_path.read_bytes()
@@ -343,6 +402,126 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIsNone(path)
         self.assertIsNone(digest)
         self.assertIn("artifact_sha256_mismatch", {item["code"] for item in errors})
+
+    def test_verified_artifact_cache_bounds_unique_files_and_deduplicates_exact_pins(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-artifact-cache-files-") as temp:
+            root = Path(temp).resolve()
+            first = root / "first.bin"
+            second = root / "second.bin"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            cache = contracts.VerifiedArtifactCache()
+            errors: list[dict[str, str]] = []
+            with mock.patch.object(contracts, "MAX_SEALED_SNAPSHOT_FILES", 1):
+                path, digest, raw = contracts.check_artifact_bytes(
+                    root, {"path": first.name, "sha256": sha(b"first")},
+                    "$.first", "shared-contracts", errors, cache)
+                self.assertEqual(errors, [])
+                self.assertEqual((path, digest, raw), (first, sha(b"first"), b"first"))
+                self.assertEqual(cache.retained_bytes, len(b"first"))
+
+                with mock.patch.object(contracts, "read_bounded_file",
+                                       side_effect=AssertionError("cached bytes must be reused")):
+                    reused = contracts.check_artifact_bytes(
+                        root, {"path": first.name, "sha256": sha(b"first")},
+                        "$.first_again", "shared-contracts", errors, cache)
+                    self.assertEqual(reused, (first, sha(b"first"), b"first"))
+                    conflict = contracts.check_artifact_bytes(
+                        root, {"path": first.name, "sha256": sha(b"other")},
+                        "$.conflicting_pin", "shared-contracts", errors, cache)
+                    self.assertEqual(conflict, (None, None, None))
+                    limited = contracts.check_artifact_bytes(
+                        root, {"path": second.name, "sha256": sha(b"second")},
+                        "$.second", "shared-contracts", errors, cache)
+                    self.assertEqual(limited, (None, None, None))
+
+                codes = {item["code"] for item in errors}
+                self.assertIn("artifact_sha256_mismatch", codes)
+                self.assertIn("artifact_cache_file_limit_exceeded", codes)
+                self.assertEqual(cache.retained_bytes, len(b"first"))
+                snapshot_errors: list[dict[str, str]] = []
+                snapshot = contracts._read_execution_artifacts(
+                    root,
+                    [(first, sha(b"first"), "first copy"), (first, sha(b"first"), "reused copy")],
+                    snapshot_errors, cache)
+                self.assertEqual(snapshot_errors, [])
+                self.assertEqual(snapshot, {"first.bin": (b"first", sha(b"first"))})
+
+    def test_verified_artifact_cache_bounds_each_read_by_remaining_bytes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-artifact-cache-bytes-") as temp:
+            root = Path(temp).resolve()
+            first = root / "first.bin"
+            growing = root / "growing.bin"
+            first.write_bytes(b"four")
+            growing.write_bytes(b"xy")
+            cache: dict[Path, tuple[bytes, str]] = {}
+            errors: list[dict[str, str]] = []
+            original_read = contracts.read_bounded_file
+
+            def grow_then_read(path: Path, limit: int = contracts.MAX_ARTIFACT_BYTES) -> bytes:
+                if Path(path) == growing:
+                    self.assertEqual(limit, 2)
+                    growing.write_bytes(b"xyz")
+                return original_read(path, limit)
+
+            with mock.patch.object(contracts, "MAX_SEALED_SNAPSHOT_BYTES", 6), \
+                    mock.patch.object(contracts, "read_bounded_file", side_effect=grow_then_read):
+                accepted = contracts.check_artifact_bytes(
+                    root, {"path": first.name, "sha256": sha(b"four")},
+                    "$.first", "shared-contracts", errors, cache)
+                self.assertEqual(accepted, (first, sha(b"four"), b"four"))
+                rejected = contracts.check_artifact_bytes(
+                    root, {"path": growing.name, "sha256": sha(b"xyz")},
+                    "$.growing", "shared-contracts", errors, cache)
+            self.assertEqual(rejected, (None, None, None))
+            self.assertIn("artifact_cache_byte_limit_exceeded", {item["code"] for item in errors})
+            self.assertEqual(len(cache), 1)
+
+    def test_assembled_release_cache_rejects_file_limit_with_missing_owner_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-assembled-cache-files-") as temp:
+            root = Path(temp).resolve()
+            manifest_path, _evidence_path, _evidence_sha = write_complete_synthetic_contract(root)
+            append_synthetic_dependencies(manifest_path, 520, b"x")
+            result = self.run_contract("--manifest", str(manifest_path), "--offline")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        codes = {item["code"] for item in report["errors"]}
+        self.assertIn("artifact_cache_file_limit_exceeded", codes)
+        self.assertIn("owner_evidence_index_unavailable", codes)
+        self.assertFalse(report["ready"])
+        self.assertIsNot(report.get("owner_evidence_verified"), True)
+        self.assertNotIn("execution_sandbox_unavailable", codes)
+
+    def test_assembled_release_byte_limit_stops_reads_after_capacity_is_filled(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-assembled-cache-bytes-") as temp:
+            root = Path(temp).resolve()
+            manifest_path, _evidence_path, _evidence_sha = write_complete_synthetic_contract(root)
+            dependency_paths = append_synthetic_dependencies(
+                manifest_path, 2, b"1234")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            release = manifest["canonical_release"]
+            package_root = manifest_path.parent
+            baseline_descriptors = [*release["schema_artifacts"], release["field_inventory"],
+                                    release["validator_adapter"]]
+            baseline_bytes = sum((package_root / row["path"]).stat().st_size
+                                 for row in baseline_descriptors)
+            original_read = contracts.read_bounded_file
+            reads: list[Path] = []
+
+            def track_reads(path: Path, limit: int = contracts.MAX_ARTIFACT_BYTES) -> bytes:
+                reads.append(Path(path).resolve())
+                return original_read(path, limit)
+
+            errors: list[dict[str, str]] = []
+            with mock.patch.object(contracts, "MAX_SEALED_SNAPSHOT_BYTES", baseline_bytes + 4), \
+                    mock.patch.object(contracts, "read_bounded_file", side_effect=track_reads):
+                output = contracts.validate_and_run(manifest, manifest_path, errors, evidence=None)
+            codes = {item["code"] for item in errors}
+            self.assertIsNone(output)
+            self.assertIn("artifact_cache_byte_limit_exceeded", codes)
+            self.assertIn(dependency_paths[0], reads)
+            self.assertNotIn(dependency_paths[1], reads)
+            self.assertIn("owner_evidence_index_unavailable", codes)
 
     def test_empty_json_schema_and_fixture_are_not_semantic_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1067,6 +1246,153 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(parsed["APT-Sources"],
                          "https://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
 
+    def test_native_profile_setup_accepts_only_exact_runner_mirror_source_config(self) -> None:
+        evidence = profile_setup._validate_runner_mirror_configuration(
+            SYNTHETIC_UBUNTU_SOURCES.replace(
+                "Suites:", "# runner source comment\nSuites:").encode("utf-8"),
+            profile_setup.APT_MIRRORLIST_BYTES)
+        self.assertEqual(evidence["transport"], "github_ubuntu_runner_root_owned_mirrorlist")
+        self.assertEqual(evidence["mirror_uri_count"], 3)
+        self.assertEqual(evidence["mirror_hosts"], [
+            "azure.archive.ubuntu.com", "archive.ubuntu.com", "security.ubuntu.com"])
+        self.assertEqual(evidence["mirrorlist_sha256"], sha(profile_setup.APT_MIRRORLIST_BYTES))
+        self.assertEqual(evidence["_source_uri"], profile_setup.APT_MIRROR_URI)
+        self.assertNotIn("username", json.dumps(evidence))
+
+    def test_native_profile_setup_rejects_untrusted_or_changed_runner_mirror_configuration(self) -> None:
+        bad_sources = (
+            SYNTHETIC_UBUNTU_SOURCES.replace("noble-updates", "noble-proposed"),
+            SYNTHETIC_UBUNTU_SOURCES.replace(
+                "/usr/share/keyrings/ubuntu-archive-keyring.gpg", "/tmp/untrusted.gpg"),
+            SYNTHETIC_UBUNTU_SOURCES + "\nTypes: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\n",
+            SYNTHETIC_UBUNTU_SOURCES.replace(
+                "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n",
+                "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\nTrusted: yes\n"),
+        )
+        for source_text in bad_sources:
+            with self.subTest(source_text=source_text), self.assertRaises(profile_setup.SetupFailure):
+                profile_setup._validate_runner_mirror_configuration(
+                    source_text.encode("utf-8"), profile_setup.APT_MIRRORLIST_BYTES)
+
+        changed_mirrorlist = profile_setup.APT_MIRRORLIST_BYTES.replace(
+            b"https://archive.ubuntu.com/ubuntu/", b"https://mirror.invalid/ubuntu/")
+        with self.assertRaises(profile_setup.SetupFailure) as raised:
+            profile_setup._validate_runner_mirror_configuration(
+                SYNTHETIC_UBUNTU_SOURCES.encode("utf-8"), changed_mirrorlist)
+        self.assertEqual(raised.exception.code, "ubuntu_runner_apt_mirrorlist_unrecognized")
+        diagnostic = json.dumps(raised.exception.details, sort_keys=True)
+        self.assertNotIn("mirror.invalid", diagnostic)
+        self.assertNotIn("https://", diagnostic)
+
+    def test_native_profile_setup_reads_only_root_owned_nonsymlink_trust_files(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-apt-root-trust-") as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.write_bytes(b"synthetic")
+            link = root / "link"
+            link.symlink_to(target)
+            with self.assertRaises(profile_setup.SetupFailure) as raised:
+                profile_setup._read_root_owned_file(
+                    link, limit=64, failure_code="synthetic_trust_file_rejected")
+            self.assertEqual(raised.exception.code, "synthetic_trust_file_rejected")
+            if os.geteuid() != 0:
+                with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                            "synthetic_trust_file_rejected"):
+                    profile_setup._read_root_owned_file(
+                        target, limit=64, failure_code="synthetic_trust_file_rejected")
+
+    def test_native_profile_setup_binds_candidate_to_authenticated_apt_release_target(self) -> None:
+        transport = synthetic_apt_transport()
+        source = (profile_setup.APT_MIRROR_URI
+                  + " noble-updates/main amd64 Packages")
+        for repo_uri in (
+            profile_setup.APT_MIRROR_URI,
+            "http://azure.archive.ubuntu.com/ubuntu/",
+            "https://archive.ubuntu.com/ubuntu/",
+            "https://security.ubuntu.com/ubuntu/",
+        ):
+            with self.subTest(repo_uri=repo_uri):
+                evidence = profile_setup._validate_signed_apt_index_target(
+                    synthetic_apt_index_target(repo_uri), source, transport)
+            self.assertEqual(evidence["trusted"], "yes")
+            self.assertEqual(evidence["origin"], "Ubuntu")
+            self.assertEqual(evidence["suite"], "noble-updates")
+            self.assertEqual(evidence["component"], "main")
+            self.assertEqual(evidence["architecture"], "amd64")
+            self.assertEqual(evidence["signed_by"], str(profile_setup.UBUNTU_ARCHIVE_KEYRING))
+
+    def test_native_profile_setup_rejects_untrusted_or_ambiguous_apt_release_targets(self) -> None:
+        transport = synthetic_apt_transport()
+        source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
+        for changes in (
+            {"Trusted": "no"},
+            {"Origin": "Other"},
+            {"Label": "Other"},
+            {"Suite": "noble"},
+            {"Codename": "jammy"},
+            {"Component": "universe"},
+            {"Architecture": "arm64"},
+            {"Signed-By": "/etc/apt/trusted.gpg"},
+            {"Repo-URI": "https://mirror.invalid/ubuntu/"},
+            {"MetaKey": "main/binary-amd64/Sources"},
+        ):
+            record = synthetic_apt_index_target(**changes)
+            with self.subTest(changes=changes), self.assertRaises(profile_setup.SetupFailure):
+                profile_setup._validate_signed_apt_index_target(record, source, transport)
+        duplicate = synthetic_apt_index_target() + synthetic_apt_index_target()
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_target_missing_or_ambiguous"):
+            profile_setup._validate_signed_apt_index_target(duplicate, source, transport)
+        with self.assertRaises(profile_setup.SetupFailure) as raised:
+            profile_setup._validate_signed_apt_index_target(
+                synthetic_apt_index_target().replace("Trusted: yes", "Trusted: no"),
+                source, transport)
+        diagnostics = json.dumps(raised.exception.details, sort_keys=True)
+        self.assertNotIn("/etc/apt/apt-mirrors.txt", diagnostics)
+        self.assertNotIn("ubuntu-archive-keyring.gpg", diagnostics)
+
+    def test_native_profile_setup_apt_source_diagnostics_identify_runner_mirror_transport(self) -> None:
+        metadata = (
+            "Package: apparmor-profiles\n"
+            "Version: " + profile_setup.PROFILE_VERSION + "\n"
+            "Architecture: all\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_" + profile_setup.PROFILE_VERSION
+            + "_all.deb\n"
+            "SHA256: " + profile_setup.PROFILE_DEB_SHA256 + "\n"
+        )
+        source = (
+            "Package: apparmor-profiles:all\n"
+            "Version: " + profile_setup.PROFILE_VERSION + "\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_" + profile_setup.PROFILE_VERSION
+            + "_all.deb\n"
+            "SHA256: " + profile_setup.PROFILE_DEB_SHA256 + "\n"
+            "APT-Sources: mirror+file:/etc/apt/apt-mirrors.txt noble-updates/main amd64 Packages\n"
+        )
+        diagnostics = profile_setup._candidate_record_diagnostics(
+            metadata, source, profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION)
+        self.assertEqual(diagnostics["source_record"]["source_scheme"], "mirror+file")
+        self.assertEqual(diagnostics["source_record"]["source_host_class"], "ubuntu_runner_mirrorlist")
+
+    def test_native_profile_setup_classifies_but_rejects_unknown_mirrorlist_path(self) -> None:
+        source = (
+            "Package: apparmor-profiles:all\n"
+            "Version: " + profile_setup.PROFILE_VERSION + "\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_" + profile_setup.PROFILE_VERSION
+            + "_all.deb\n"
+            "SHA256: " + profile_setup.PROFILE_DEB_SHA256 + "\n"
+            "APT-Sources: mirror+file:/etc/apt/unreviewed-mirrors.txt noble-updates/main amd64 Packages\n"
+        )
+        with self.assertRaises(profile_setup.SetupFailure) as raised:
+            profile_setup.validate_apt_record(
+                source, profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
+                profile_setup.PROFILE_DEB_SHA256, source_text=source)
+        diagnostics = raised.exception.details["source_record"]
+        self.assertEqual(diagnostics["source_scheme"], "mirror+file")
+        self.assertEqual(diagnostics["source_host_class"], "unrecognized_mirrorlist_path")
+        rendered = json.dumps(raised.exception.details, sort_keys=True)
+        self.assertNotIn("unreviewed-mirrors.txt", rendered)
+        self.assertNotIn("/etc/apt", rendered)
+
     def test_native_profile_setup_parses_labelled_dpkg_fields_without_control_order_assumptions(self) -> None:
         labelled = (
             "Architecture: all\n"
@@ -1119,13 +1445,17 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
             "APT-Sources: https://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages\n"
         )
+        index_targets = synthetic_apt_index_target(
+            "https://azure.archive.ubuntu.com/ubuntu/")
         with mock.patch.object(profile_setup, "_command", side_effect=[
-                (metadata.encode(), b""), (source_record.encode(), b"")]) as command:
+                (metadata.encode(), b""), (source_record.encode(), b""),
+                (index_targets.encode(), b"")]) as command:
             parsed = profile_setup._package_record(
                 profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
-                profile_setup.PROFILE_DEB_SHA256)
+                profile_setup.PROFILE_DEB_SHA256, apt_transport=synthetic_apt_transport())
         self.assertEqual(parsed["APT-Sources"],
                          "https://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
+        self.assertEqual(parsed["_release_evidence"]["trusted"], "yes")
         self.assertEqual(command.call_args_list[0].args[0], [
             "apt-cache", "-o", "APT::Cache::ShowFull=true",
             "-o", "APT::Cache::Show::Version=1", "show",
@@ -1134,8 +1464,11 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             "apt-cache", "-o", "APT::Cache::ShowFull=true",
             "-o", "APT::Cache::Show::Version=2", "show",
             "apparmor-profiles=4.0.1really4.0.1-0ubuntu0.24.04.8"])
+        self.assertEqual(command.call_args_list[2].args[0], [
+            "apt-get", "indextargets", "--format", profile_setup.APT_INDEXTARGETS_FORMAT])
         self.assertEqual(command.call_args_list[0].kwargs["apt_phase"], "metadata_v1")
         self.assertEqual(command.call_args_list[1].kwargs["apt_phase"], "source_v2")
+        self.assertEqual(command.call_args_list[2].kwargs["apt_phase"], "index_targets")
         self.assertNotIn("-f", command.call_args_list[0].args[0])
         self.assertNotIn("-f", command.call_args_list[1].args[0])
 
@@ -1143,8 +1476,8 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         cases = (
             (b"E: Command line option 'f' [from -f] is not understood in this command", "unsupported_option"),
             (b"E: No packages found matching bubblewrap=stale-version", "pinned_package_or_version_unavailable"),
-            (b"W: Failed to fetch https://user:secret@mirror.invalid/private/Packages", "apt_cache_or_index_infrastructure_failure"),
-            (b"APT failed with an unrecognized condition", "unclassified_apt_cache_failure"),
+            (b"W: Failed to fetch https://user:secret@mirror.invalid/private/Packages", "apt_repository_or_index_infrastructure_failure"),
+            (b"APT failed with an unrecognized condition", "unclassified_apt_command_failure"),
         )
         for stderr, expected_category in cases:
             with self.subTest(expected_category=expected_category), \
@@ -1185,12 +1518,43 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             with self.assertRaises(profile_setup.SetupFailure) as raised:
                 profile_setup._package_record(
                     profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
-                    profile_setup.PROFILE_DEB_SHA256)
+                    profile_setup.PROFILE_DEB_SHA256, apt_transport=synthetic_apt_transport())
         self.assertEqual(raised.exception.details["apt_command"]["phase"], "source_v2")
         self.assertEqual(raised.exception.details["metadata_record"]["exact_candidate_count"], 1)
         serialized = json.dumps(raised.exception.details)
         self.assertNotIn("Failed to fetch", serialized)
         self.assertNotIn("mirror.invalid", serialized)
+
+    def test_native_profile_setup_distinguishes_apt_get_release_target_failure(self) -> None:
+        metadata = (
+            "Package: apparmor-profiles\n"
+            "Version: " + profile_setup.PROFILE_VERSION + "\n"
+            "Architecture: all\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_" + profile_setup.PROFILE_VERSION
+            + "_all.deb\n"
+            "SHA256: " + profile_setup.PROFILE_DEB_SHA256 + "\n"
+        )
+        source = metadata.replace("Package: apparmor-profiles", "Package: apparmor-profiles:all") + (
+            "APT-Sources: " + profile_setup.APT_MIRROR_URI
+            + " noble-updates/main amd64 Packages\n")
+        failure = profile_setup.SetupFailure("command_failed", details={
+            "apt_command": profile_setup._apt_command_diagnostics(
+                "index_targets", "nonzero_exit", return_code=100,
+                error_category="apt_repository_or_index_infrastructure_failure",
+                stderr_bytes=51),
+        })
+        with mock.patch.object(profile_setup, "_command", side_effect=[
+                (metadata.encode(), b""), (source.encode(), b""), failure]):
+            with self.assertRaises(profile_setup.SetupFailure) as raised:
+                profile_setup._package_record(
+                    profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
+                    profile_setup.PROFILE_DEB_SHA256, apt_transport=synthetic_apt_transport())
+        self.assertEqual(raised.exception.details["apt_command"]["tool"], "apt-get")
+        self.assertEqual(raised.exception.details["apt_command"]["phase"], "index_targets")
+        self.assertEqual(raised.exception.details["apt_command"]["return_code"], 100)
+        diagnostic = json.dumps(raised.exception.details, sort_keys=True)
+        self.assertNotIn("APT-Sources:", diagnostic)
+        self.assertNotIn("noble-updates/main amd64 Packages", diagnostic)
 
     def test_native_profile_setup_publishes_only_sanitized_apt_failure_diagnostic(self) -> None:
         state = {
@@ -1216,6 +1580,8 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 mock.patch.object(profile_setup, "_state_snapshot", return_value=state), \
                 mock.patch.object(profile_setup, "_apt_signature_configuration", return_value={
                     "signed_repository_checks_enabled": True, "unsafe_overrides": []}), \
+                mock.patch.object(profile_setup, "_runner_mirror_configuration",
+                                  return_value=synthetic_apt_transport()), \
                 mock.patch.object(profile_setup, "_quiet_command"), \
                 mock.patch.object(profile_setup, "_package_record", side_effect=failure), \
                 redirect_stdout(io.StringIO()) as captured, \
@@ -1284,7 +1650,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                                         "signed_apt_package_origin_missing") as raised:
                 profile_setup._package_record(
                     profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
-                    profile_setup.PROFILE_DEB_SHA256)
+                    profile_setup.PROFILE_DEB_SHA256, apt_transport=synthetic_apt_transport())
         self.assertEqual(raised.exception.details["metadata_record"]["exact_candidate_count"], 1)
         self.assertEqual(raised.exception.details["source_record"]["fields_present"],
                          ["Package", "Version", "Filename", "SHA256"])

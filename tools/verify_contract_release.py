@@ -174,6 +174,32 @@ class SealedSnapshot:
         self.files.clear()
 
 
+class VerifiedArtifactCache(dict[Path, tuple[bytes, str]]):
+    """Hash-verified bytes retained under the snapshot's aggregate resource bounds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.retained_bytes = 0
+
+    def __setitem__(self, path: Path, value: tuple[bytes, str]) -> None:
+        previous = self.get(path)
+        if previous is not None and isinstance(previous[0], bytes):
+            self.retained_bytes -= len(previous[0])
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], bytes):
+            self.retained_bytes += len(value[0])
+        super().__setitem__(path, value)
+
+    def clear(self) -> None:
+        super().clear()
+        self.retained_bytes = 0
+
+
+def _verified_cache_bytes(cache: dict[Path, tuple[bytes, str]]) -> int:
+    if isinstance(cache, VerifiedArtifactCache):
+        return cache.retained_bytes
+    return sum(len(raw) for raw, _digest in cache.values() if isinstance(raw, bytes))
+
+
 def _make_sealed_snapshot(artifacts: dict[str, tuple[bytes, str]]) -> tuple[SealedSnapshot | None, str | None]:
     """Seal the exact bytes whose expected hashes came from the release manifest."""
     if not hasattr(os, "memfd_create"):
@@ -380,12 +406,50 @@ def check_artifact_bytes(base: Path, item: Any, json_path: str, owner: str,
                           "Reuse an artifact path only when its descriptor pins the same exact verified bytes.")
                 return None, None, None
             return path, actual, raw
+        read_limit = MAX_ARTIFACT_BYTES
+        if verified_artifacts is not None:
+            if len(verified_artifacts) >= MAX_SEALED_SNAPSHOT_FILES:
+                add_error(errors, "artifact_cache_file_limit_exceeded", json_path, owner,
+                          "Reduce the unique owner artifact set to the verifier's fixed 512-file execution bound.")
+                return None, None, None
+            retained_bytes = _verified_cache_bytes(verified_artifacts)
+            remaining_bytes = MAX_SEALED_SNAPSHOT_BYTES - retained_bytes
+            if remaining_bytes <= 0:
+                add_error(errors, "artifact_cache_byte_limit_exceeded", json_path, owner,
+                          "Reduce retained owner artifact bytes to the verifier's fixed 128 MiB execution bound.")
+                return None, None, None
+            read_limit = min(MAX_ARTIFACT_BYTES, remaining_bytes)
+            try:
+                candidate_size = path.stat().st_size
+            except OSError:
+                add_error(errors, "artifact_unreadable", json_path + ".path", owner,
+                          "Publish readable artifact bytes within the standalone verifier's fixed size limit.")
+                return None, None, None
+            if candidate_size > read_limit:
+                code = ("artifact_cache_byte_limit_exceeded"
+                        if remaining_bytes < MAX_ARTIFACT_BYTES
+                        else "artifact_size_limit_exceeded")
+                action = ("Reduce retained owner artifact bytes to the verifier's fixed 128 MiB execution bound."
+                          if code == "artifact_cache_byte_limit_exceeded" else
+                          "Republish a bounded artifact within the standalone verifier's documented size limit.")
+                add_error(errors, code, json_path + ".path", owner, action)
+                return None, None, None
         try:
-            raw = read_bounded_file(path)
+            # The read is bounded by both the per-artifact and remaining
+            # aggregate capacity, even if a file grows after the size check.
+            raw = read_bounded_file(path, limit=read_limit)
         except OSError as exc:
-            code = "artifact_size_limit_exceeded" if "size bound" in str(exc) else "artifact_unreadable"
-            add_error(errors, code, json_path + ".path", owner,
+            if "size bound" not in str(exc):
+                code = "artifact_unreadable"
+            elif verified_artifacts is not None and read_limit < MAX_ARTIFACT_BYTES:
+                code = "artifact_cache_byte_limit_exceeded"
+            else:
+                code = "artifact_size_limit_exceeded"
+            action = ("Reduce retained owner artifact bytes to the verifier's fixed 128 MiB execution bound."
+                      if code == "artifact_cache_byte_limit_exceeded" else
                       "Publish readable artifact bytes within the standalone verifier's fixed size limit.")
+            add_error(errors, code, json_path + ".path", owner,
+                      action)
             return None, None, None
         if not raw:
             add_error(errors, "artifact_empty", json_path + ".path", owner,
@@ -397,6 +461,17 @@ def check_artifact_bytes(base: Path, item: Any, json_path: str, owner: str,
                       "Republish the descriptor with the exact owner artifact SHA-256.")
             return None, None, None
         if verified_artifacts is not None:
+            retained_bytes = _verified_cache_bytes(verified_artifacts)
+            if (len(verified_artifacts) >= MAX_SEALED_SNAPSHOT_FILES
+                    or retained_bytes + len(raw) > MAX_SEALED_SNAPSHOT_BYTES):
+                code = ("artifact_cache_file_limit_exceeded"
+                        if len(verified_artifacts) >= MAX_SEALED_SNAPSHOT_FILES
+                        else "artifact_cache_byte_limit_exceeded")
+                action = ("Reduce the unique owner artifact set to the verifier's fixed 512-file execution bound."
+                          if code == "artifact_cache_file_limit_exceeded" else
+                          "Reduce retained owner artifact bytes to the verifier's fixed 128 MiB execution bound.")
+                add_error(errors, code, json_path, owner, action)
+                return None, None, None
             verified_artifacts[path] = (raw, actual)
         return path, actual, raw
     return path, None, None
@@ -436,15 +511,16 @@ def _read_execution_artifacts(base: Path,
                       f"Use the same exact hash-verified {label} bytes for validation and immutable execution.")
             continue
         raw = captured[0]
+        previous = result.get(relative)
+        if previous is not None:
+            if previous[1] != expected_sha or previous[0] != raw:
+                add_error(errors, "execution_snapshot_path_collision", "$.canonical_release", "shared-contracts",
+                          "Give each distinct adapter, dependency, schema, inventory, and fixture artifact a unique relative package path.")
+            continue
         total_size += len(raw)
         if total_size > MAX_SEALED_SNAPSHOT_BYTES or len(result) >= MAX_SEALED_SNAPSHOT_FILES:
             add_error(errors, "execution_snapshot_limit_exceeded", "$.canonical_release", "shared-contracts",
                       "Reduce the published runtime adapter/schema/fixture set to the standalone verifier's fixed snapshot resource bound.")
-            continue
-        previous = result.get(relative)
-        if previous is not None and previous[1] != expected_sha:
-            add_error(errors, "execution_snapshot_path_collision", "$.canonical_release", "shared-contracts",
-                      "Give each distinct adapter, dependency, schema, inventory, and fixture artifact a unique relative package path.")
             continue
         result[relative] = (raw, expected_sha)
     if errors:
@@ -1944,7 +2020,7 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
                   "Provision the independently verified owner-evidence index outside the repository and pin its exact SHA-256 in trusted runner configuration; local manifest assertions are not approval evidence.")
 
     base = manifest_path.resolve().parent
-    verified_artifacts: dict[Path, tuple[bytes, str]] = {}
+    verified_artifacts: dict[Path, tuple[bytes, str]] = VerifiedArtifactCache()
     release = manifest.get("canonical_release")
     if not isinstance(release, dict):
         release = {}

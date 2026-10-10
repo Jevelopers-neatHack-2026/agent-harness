@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,8 +28,36 @@ BWRAP_VERSION = "0.9.0-1ubuntu0.3"
 INSTALLED_PROFILE = Path("/run/acv1-native-profile/bwrap-userns-restrict")
 APPARMOR_PROFILES = Path("/sys/kernel/security/apparmor/profiles")
 PROFILE_TABLE_MAX_BYTES = 128 * 1024
-APT_CACHE_FAILURE_PHASES = frozenset({"metadata_v1", "source_v2"})
+APT_PROVENANCE_FAILURE_PHASES = frozenset({"metadata_v1", "source_v2", "index_targets"})
 APT_CACHE_DIAGNOSTIC_BYTES = 8 * 1024
+APT_INDEX_TARGETS_LIMIT = 128 * 1024
+APT_MIRROR_URI = "mirror+file:/etc/apt/apt-mirrors.txt"
+APT_MIRRORLIST_PATH = Path("/etc/apt/apt-mirrors.txt")
+UBUNTU_SOURCES_PATH = Path("/etc/apt/sources.list.d/ubuntu.sources")
+UBUNTU_ARCHIVE_KEYRING = Path("/usr/share/keyrings/ubuntu-archive-keyring.gpg")
+APT_MIRRORLIST_BYTES = (
+    b"http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
+    b"https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
+    b"https://security.ubuntu.com/ubuntu/\tpriority:3\n"
+)
+APT_INDEXTARGETS_FORMAT = (
+    "Identifier: $(IDENTIFIER)\n"
+    "MetaKey: $(METAKEY)\n"
+    "Target-Of: $(TARGET_OF)\n"
+    "Architecture: $(ARCHITECTURE)\n"
+    "Component: $(COMPONENT)\n"
+    "Suite: $(SUITE)\n"
+    "Codename: $(CODENAME)\n"
+    "Origin: $(ORIGIN)\n"
+    "Label: $(LABEL)\n"
+    "Trusted: $(TRUSTED)\n"
+    "Signed-By: $(SIGNED_BY)\n"
+    "Repo-URI: $(REPO_URI)\n\n"
+)
+APT_INDEX_TARGET_FIELDS = frozenset({
+    "identifier", "metakey", "target-of", "architecture", "component", "suite",
+    "codename", "origin", "label", "trusted", "signed-by", "repo-uri",
+})
 LOCAL_OVERRIDES = (
     Path("/etc/apparmor.d/local/bwrap-userns-restrict"),
     Path("/etc/apparmor.d/local/unpriv_bwrap"),
@@ -48,7 +77,7 @@ class SetupFailure(Exception):
         self.details = details or {}
 
 
-def _apt_cache_error_category(stderr: bytes) -> str:
+def _apt_error_category(stderr: bytes) -> str:
     """Classify a bounded APT diagnostic without returning its contents."""
     text = stderr[:APT_CACHE_DIAGNOSTIC_BYTES].decode("utf-8", "replace").lower()
     if any(marker in text for marker in (
@@ -62,17 +91,17 @@ def _apt_cache_error_category(stderr: bytes) -> str:
             "could not open file", "cannot open", "failed to fetch", "some index files failed",
             "hash sum mismatch", "temporary failure resolving", "cache file is corrupted",
             "could not get lock", "unable to acquire the dpkg frontend lock")):
-        return "apt_cache_or_index_infrastructure_failure"
-    return "unclassified_apt_cache_failure"
+        return "apt_repository_or_index_infrastructure_failure"
+    return "unclassified_apt_command_failure"
 
 
 def _apt_command_diagnostics(phase: str, failure_kind: str, *, return_code: int | None = None,
                              error_category: str | None = None, stdout_bytes: int = 0,
                              stderr_bytes: int = 0) -> dict[str, Any]:
-    if phase not in APT_CACHE_FAILURE_PHASES:
+    if phase not in APT_PROVENANCE_FAILURE_PHASES:
         raise SetupFailure("apt_cache_command_phase_invalid")
     result: dict[str, Any] = {
-        "tool": "apt-cache",
+        "tool": "apt-cache" if phase in {"metadata_v1", "source_v2"} else "apt-get",
         "phase": phase,
         "failure_kind": failure_kind,
         "stdout_bytes_capped": min(max(stdout_bytes, 0), 128 * 1024 + 1),
@@ -95,7 +124,7 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 
 def _command(args: list[str], *, timeout: float = 20, limit: int = 128 * 1024,
              cwd: Path | None = None, apt_phase: str | None = None) -> tuple[bytes, bytes]:
-    if apt_phase is not None and apt_phase not in APT_CACHE_FAILURE_PHASES:
+    if apt_phase is not None and apt_phase not in APT_PROVENANCE_FAILURE_PHASES:
         raise SetupFailure("apt_cache_command_phase_invalid")
     try:
         result = subprocess.run(args, cwd=cwd, stdin=subprocess.DEVNULL,
@@ -103,24 +132,24 @@ def _command(args: list[str], *, timeout: float = 20, limit: int = 128 * 1024,
                                 check=False, timeout=timeout, close_fds=True)
     except OSError as exc:
         details = ({"apt_command": _apt_command_diagnostics(
-            apt_phase, "launch_failed", error_category="apt_cache_executable_unavailable")}
+            apt_phase, "launch_failed", error_category="apt_tool_executable_unavailable")}
                    if apt_phase else None)
         raise SetupFailure("command_unavailable_or_timed_out", details=details) from exc
     except subprocess.TimeoutExpired as exc:
         details = ({"apt_command": _apt_command_diagnostics(
-            apt_phase, "timed_out", error_category="apt_cache_command_timed_out")}
+            apt_phase, "timed_out", error_category="apt_tool_command_timed_out")}
                    if apt_phase else None)
         raise SetupFailure("command_unavailable_or_timed_out", details=details) from exc
     if len(result.stdout) > limit or len(result.stderr) > 8 * 1024:
         details = ({"apt_command": _apt_command_diagnostics(
-            apt_phase, "output_limit_exceeded", error_category="apt_cache_output_limit_exceeded",
+            apt_phase, "output_limit_exceeded", error_category="apt_tool_output_limit_exceeded",
             stdout_bytes=len(result.stdout), stderr_bytes=len(result.stderr))}
                    if apt_phase else None)
         raise SetupFailure("command_output_exceeded_bound", details=details)
     if result.returncode != 0:
         details = ({"apt_command": _apt_command_diagnostics(
             apt_phase, "nonzero_exit", return_code=result.returncode,
-            error_category=_apt_cache_error_category(result.stderr),
+            error_category=_apt_error_category(result.stderr),
             stdout_bytes=len(result.stdout), stderr_bytes=len(result.stderr))}
                    if apt_phase else None)
         raise SetupFailure("command_failed", details=details)
@@ -180,14 +209,27 @@ def _candidate_record_diagnostics(metadata_text: str, source_text: str | None,
         except ValueError:
             uri = None
             hostname = ""
-        if not source:
+        if tokens and tokens[0] == APT_MIRROR_URI:
+            host_class = "ubuntu_runner_mirrorlist"
+            source_scheme = "mirror+file"
+        elif uri and uri.scheme.lower() == "mirror+file":
+            host_class = "unrecognized_mirrorlist_path"
+            source_scheme = "mirror+file"
+        elif uri and uri.scheme.lower() in {"mirror", "mirror+http", "mirror+https"}:
+            host_class = "unrecognized_mirror_transport"
+            source_scheme = uri.scheme.lower()
+        elif not source:
             host_class = "missing"
+            source_scheme = "missing"
         elif hostname == "archive.ubuntu.com" or hostname.endswith(".archive.ubuntu.com"):
             host_class = "ubuntu_archive"
+            source_scheme = uri.scheme.lower() if uri and uri.scheme.lower() in {"http", "https"} else "other"
         elif hostname == "security.ubuntu.com":
             host_class = "ubuntu_security"
+            source_scheme = uri.scheme.lower() if uri and uri.scheme.lower() in {"http", "https"} else "other"
         else:
             host_class = "other_or_invalid"
+            source_scheme = uri.scheme.lower() if uri and uri.scheme.lower() in {"http", "https"} else "other"
         release_component = tokens[1] if len(tokens) > 1 else ""
         return {
             "record_count": min(len(rows), 99),
@@ -196,10 +238,7 @@ def _candidate_record_diagnostics(metadata_text: str, source_text: str | None,
             "exact_candidate_count_capped": len(matches) > 99,
             "fields_present": [field for field in allowed_fields if field in row],
             "source_token_count": min(len(tokens), 8),
-            "source_scheme": (
-                uri.scheme.lower() if uri and uri.scheme.lower() in {"http", "https"}
-                else ("other" if uri else "missing")
-            ),
+            "source_scheme": source_scheme,
             "source_host_class": host_class,
             "source_release_component": (
                 release_component if release_component == "noble-updates/main"
@@ -223,25 +262,324 @@ def _validated_apt_source(source: str) -> str:
     source_tokens = source.split()
     if len(source_tokens) != 4:
         raise SetupFailure("signed_apt_package_origin_missing")
+    uri_text = source_tokens[0]
+    release_component = source_tokens[1]
+    release, separator, component = release_component.partition("/")
+    expected_index_architecture = "amd64"
+    if (not separator or release != "noble-updates" or component != "main"
+            or source_tokens[2] != expected_index_architecture or source_tokens[3] != "Packages"):
+        raise SetupFailure("signed_apt_package_origin_is_not_ubuntu_noble_updates")
+    if uri_text == APT_MIRROR_URI:
+        return source
     try:
-        parsed = urlparse(source_tokens[0])
+        parsed = urlparse(uri_text)
         hostname = (parsed.hostname or "").lower()
         port = parsed.port
     except ValueError as exc:
         raise SetupFailure("signed_apt_package_origin_is_not_ubuntu_noble_updates") from exc
-    expected_index_architecture = "amd64"
-    release_component = source_tokens[1]
-    release, separator, component = release_component.partition("/")
     if (parsed.scheme not in {"http", "https"} or not hostname
             or parsed.username is not None or parsed.password is not None
             or parsed.query or parsed.fragment
-            or (port is not None and not 1 <= port <= 65535)
+            or (port is not None and port != (443 if parsed.scheme == "https" else 80))
             or not (hostname == "archive.ubuntu.com" or hostname.endswith(".archive.ubuntu.com")
                     or hostname == "security.ubuntu.com")
-            or not separator or release != "noble-updates" or component != "main"
-            or source_tokens[2] != expected_index_architecture or source_tokens[3] != "Packages"):
+            or parsed.path.rstrip("/") != "/ubuntu"):
         raise SetupFailure("signed_apt_package_origin_is_not_ubuntu_noble_updates")
     return source
+
+
+def _parse_deb822_records(text: str, *, failure_code: str,
+                          max_bytes: int = APT_INDEX_TARGETS_LIMIT) -> list[dict[str, str]]:
+    if len(text.encode("utf-8")) > max_bytes:
+        raise SetupFailure(failure_code)
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    last_key: str | None = None
+
+    def finish() -> None:
+        nonlocal current, last_key
+        if current:
+            records.append(current)
+            current = {}
+        last_key = None
+
+    for line in text.splitlines():
+        if not line.strip():
+            finish()
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        if line[:1].isspace():
+            if last_key is None:
+                raise SetupFailure(failure_code)
+            current[last_key] += " " + line.strip()
+            continue
+        name, separator, value = line.partition(":")
+        key = name.strip().lower()
+        if (not separator or not re.fullmatch(r"[a-z][a-z0-9-]*", key)
+                or key in current):
+            raise SetupFailure(failure_code)
+        current[key] = value.strip()
+        last_key = key
+    finish()
+    if not records or len(records) > 512:
+        raise SetupFailure(failure_code)
+    return records
+
+
+def _canonical_archive_uri(value: str) -> str | None:
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return None
+    if (parsed.scheme not in {"http", "https"} or not host
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment
+            or (port is not None and port != (443 if parsed.scheme == "https" else 80))
+            or not (host == "archive.ubuntu.com" or host.endswith(".archive.ubuntu.com")
+                    or host == "security.ubuntu.com")
+            or parsed.path.rstrip("/") != "/ubuntu"):
+        return None
+    return f"{parsed.scheme.lower()}://{host}/ubuntu"
+
+
+def _parse_runner_mirrorlist(mirrorlist: bytes) -> tuple[str, ...]:
+    if mirrorlist != APT_MIRRORLIST_BYTES:
+        rows = mirrorlist.splitlines()
+        recognized = 0
+        for row in rows[:8]:
+            candidate = row.split(b"\t", 1)[0].decode("ascii", "ignore")
+            if _canonical_archive_uri(candidate):
+                recognized += 1
+        raise SetupFailure("ubuntu_runner_apt_mirrorlist_unrecognized", details={
+            "mirrorlist_line_count": min(len(rows), 99),
+            "mirrorlist_line_count_capped": len(rows) > 99,
+            "recognized_ubuntu_archive_uri_count": recognized,
+            "expected_format": "pinned_github_ubuntu_2404_mirrorlist_v1",
+        })
+    return tuple(line.split(b"\t", 1)[0].decode("ascii") for line in mirrorlist.splitlines())
+
+
+def _validate_runner_mirror_configuration(source_file: bytes,
+                                          mirrorlist: bytes) -> dict[str, Any]:
+    try:
+        source_text = source_file.decode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise SetupFailure("ubuntu_runner_sources_configuration_invalid") from exc
+    records = _parse_deb822_records(source_text, failure_code="ubuntu_runner_sources_configuration_invalid",
+                                    max_bytes=64 * 1024)
+    matches = [row for row in records
+               if APT_MIRROR_URI in row.get("uris", "").split()]
+    if len(matches) != 1:
+        raise SetupFailure("ubuntu_runner_sources_configuration_untrusted", details={
+            "mirror_source_stanza_count": min(len(matches), 99),
+            "expected_format": "pinned_github_ubuntu_2404_mirrorlist_v1",
+        })
+    source = matches[0]
+    if (source.get("uris", "").split() != [APT_MIRROR_URI]
+            or source.get("types", "").split() != ["deb"]
+            or "noble-updates" not in source.get("suites", "").split()
+            or "main" not in source.get("components", "").split()
+            or source.get("signed-by") != str(UBUNTU_ARCHIVE_KEYRING)
+            or any(source.get(name) == "yes" for name in ("trusted", "allow-insecure", "allow-weak",
+                                                            "allow-downgrade-to-insecure"))):
+        raise SetupFailure("ubuntu_runner_sources_configuration_untrusted", details={
+            "mirror_source_stanza_count": 1,
+            "mirror_uri_count": min(len(source.get("uris", "").split()), 99),
+            "suite_noble_updates": "noble-updates" in source.get("suites", "").split(),
+            "component_main": "main" in source.get("components", "").split(),
+            "signed_by_is_ubuntu_archive_keyring": (
+                source.get("signed-by") == str(UBUNTU_ARCHIVE_KEYRING)),
+            "signature_bypass_option_present": any(
+                source.get(name) == "yes" for name in (
+                    "trusted", "allow-insecure", "allow-weak", "allow-downgrade-to-insecure")),
+        })
+    mirrors = _parse_runner_mirrorlist(mirrorlist)
+    return {
+        "transport": "github_ubuntu_runner_root_owned_mirrorlist",
+        "source_file_sha256": hashlib.sha256(source_file).hexdigest(),
+        "mirrorlist_sha256": hashlib.sha256(mirrorlist).hexdigest(),
+        "mirror_uri_count": len(mirrors),
+        "mirror_hosts": [urlparse(value).hostname for value in mirrors],
+        "signed_by": "ubuntu_archive_keyring_package",
+        "_source_uri": APT_MIRROR_URI,
+        "_mirror_uris": mirrors,
+    }
+
+
+def _read_root_owned_file(path: Path, *, limit: int, failure_code: str) -> bytes:
+    """Read a fixed system trust file without following links or accepting writable custody."""
+    current = Path("/")
+    try:
+        for part in path.parts[1:-1]:
+            current = current / part
+            parent = current.lstat()
+            if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+                    or parent.st_uid != 0 or parent.st_mode & 0o022):
+                raise SetupFailure(failure_code)
+        before = path.lstat()
+        if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+                or before.st_uid != 0 or before.st_gid != 0 or before.st_mode & 0o022
+                or before.st_size > limit):
+            raise SetupFailure(failure_code)
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise SetupFailure(failure_code)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+        descriptor = os.open(str(path), flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0
+                    or opened.st_gid != 0 or opened.st_mode & 0o022
+                    or (opened.st_dev, opened.st_ino) !=
+                    (before.st_dev, before.st_ino)):
+                raise SetupFailure(failure_code)
+            chunks: list[bytes] = []
+            remaining = limit + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if (len(data) > limit or (opened.st_dev, opened.st_ino, opened.st_size,
+                                     opened.st_mtime_ns, opened.st_ctime_ns, opened.st_uid,
+                                     opened.st_gid, opened.st_mode) !=
+                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                     after.st_ctime_ns, after.st_uid, after.st_gid, after.st_mode)):
+                raise SetupFailure(failure_code)
+            return data
+        finally:
+            os.close(descriptor)
+    except SetupFailure:
+        raise
+    except OSError as exc:
+        raise SetupFailure(failure_code) from exc
+
+
+def _runner_mirror_configuration() -> dict[str, Any]:
+    source_file = _read_root_owned_file(
+        UBUNTU_SOURCES_PATH, limit=64 * 1024,
+        failure_code="ubuntu_runner_sources_configuration_unavailable")
+    mirrorlist = _read_root_owned_file(
+        APT_MIRRORLIST_PATH, limit=4096,
+        failure_code="ubuntu_runner_apt_mirrorlist_unavailable")
+    evidence = _validate_runner_mirror_configuration(source_file, mirrorlist)
+    keyring = _read_root_owned_file(
+        UBUNTU_ARCHIVE_KEYRING, limit=1024 * 1024,
+        failure_code="ubuntu_archive_keyring_unavailable")
+    if not keyring:
+        raise SetupFailure("ubuntu_archive_keyring_unverified")
+    if _owner_of(str(UBUNTU_ARCHIVE_KEYRING)) != "ubuntu-keyring":
+        raise SetupFailure("ubuntu_archive_keyring_package_owner_mismatch")
+    _verify_package("ubuntu-keyring")
+    evidence["ubuntu_archive_keyring_sha256"] = hashlib.sha256(keyring).hexdigest()
+    evidence["ubuntu_archive_keyring_package_owner"] = "ubuntu-keyring"
+    evidence["ubuntu_archive_keyring_dpkg_verify"] = "clean"
+    return evidence
+
+
+def _apt_index_target_diagnostics(text: str, source: str,
+                                  transport: dict[str, Any]) -> dict[str, Any]:
+    try:
+        records = _parse_deb822_records(text, failure_code="apt_signed_release_target_record_invalid")
+    except SetupFailure:
+        records = []
+    source_uri = source.split()[0] if source.split() else ""
+    candidate_repositories: set[str] = set()
+    canonical_source = _canonical_archive_uri(source_uri)
+    if canonical_source:
+        candidate_repositories.add(canonical_source)
+    elif source_uri == transport.get("_source_uri"):
+        candidate_repositories.add(source_uri)
+        candidate_repositories.update(
+            value for value in transport.get("_mirror_uris", ())
+            if isinstance(value, str) and _canonical_archive_uri(value))
+    matches = [row for row in records
+               if row.get("identifier") == "Packages"
+               and row.get("metakey") == "main/binary-amd64/Packages"
+               and row.get("target-of") == "deb"
+               and row.get("architecture") == "amd64"
+               and row.get("component") == "main"
+               and row.get("suite") == "noble-updates"
+               and row.get("repo-uri", "").rstrip("/") in
+               {value.rstrip("/") for value in candidate_repositories}]
+    row = matches[0] if len(matches) == 1 else {}
+    trusted = row.get("trusted", "").lower()
+    origin = row.get("origin", "")
+    label = row.get("label", "")
+    suite = row.get("suite", "")
+    codename = row.get("codename", "")
+    signed_by = row.get("signed-by", "")
+    return {
+        "target_record_count": min(len(records), 99),
+        "target_record_count_capped": len(records) > 99,
+        "matching_ubuntu_updates_target_count": min(len(matches), 99),
+        "matching_ubuntu_updates_target_count_capped": len(matches) > 99,
+        "trusted_state": trusted if trusted in {"yes", "no"} else ("other" if trusted else "missing"),
+        "release_origin": "Ubuntu" if origin == "Ubuntu" else ("other" if origin else "missing"),
+        "release_label": "Ubuntu" if label == "Ubuntu" else ("other" if label else "missing"),
+        "release_suite": "noble-updates" if suite == "noble-updates" else ("other" if suite else "missing"),
+        "release_codename": "noble" if codename == "noble" else ("other" if codename else "missing"),
+        "signed_by": ("ubuntu_archive_keyring" if signed_by == str(UBUNTU_ARCHIVE_KEYRING)
+                      else ("other" if signed_by else "missing")),
+        "repo_transport": (
+            "runner_mirrorlist" if row.get("repo-uri", "").rstrip("/") == APT_MIRROR_URI
+            else ("ubuntu_archive_endpoint" if row else "missing_or_unrecognized")
+        ),
+    }
+
+
+def _validate_signed_apt_index_target(text: str, source: str,
+                                      transport: dict[str, Any]) -> dict[str, str]:
+    diagnostics = _apt_index_target_diagnostics(text, source, transport)
+    try:
+        records = _parse_deb822_records(text, failure_code="apt_signed_release_target_record_invalid")
+    except SetupFailure as exc:
+        exc.details = {"apt_release_target_diagnostics": diagnostics}
+        raise
+    if any(set(row) != APT_INDEX_TARGET_FIELDS for row in records):
+        raise SetupFailure("apt_signed_release_target_record_fields_invalid",
+                           details={"apt_release_target_diagnostics": diagnostics})
+    source_uri = source.split()[0] if source.split() else ""
+    allowed_repositories: set[str] = set()
+    canonical_source = _canonical_archive_uri(source_uri)
+    if canonical_source:
+        allowed_repositories.add(canonical_source)
+    elif source_uri == transport.get("_source_uri"):
+        allowed_repositories.add(source_uri)
+        allowed_repositories.update(
+            value for value in transport.get("_mirror_uris", ())
+            if isinstance(value, str) and _canonical_archive_uri(value))
+    matches = [row for row in records
+               if row.get("identifier") == "Packages"
+               and row.get("metakey") == "main/binary-amd64/Packages"
+               and row.get("target-of") == "deb"
+               and row.get("architecture") == "amd64"
+               and row.get("component") == "main"
+               and row.get("suite") == "noble-updates"
+               and row.get("repo-uri", "").rstrip("/") in
+               {value.rstrip("/") for value in allowed_repositories}]
+    if len(matches) != 1:
+        raise SetupFailure("apt_signed_release_target_missing_or_ambiguous",
+                           details={"apt_release_target_diagnostics": diagnostics})
+    row = matches[0]
+    if (row.get("codename") != "noble" or row.get("origin") != "Ubuntu"
+            or row.get("label") != "Ubuntu" or row.get("trusted", "").lower() != "yes"
+            or row.get("signed-by") != str(UBUNTU_ARCHIVE_KEYRING)):
+        raise SetupFailure("apt_signed_release_metadata_not_ubuntu_noble_updates",
+                           details={"apt_release_target_diagnostics": diagnostics})
+    return {
+        "target": "Packages/main/binary-amd64",
+        "origin": row["origin"], "label": row["label"],
+        "suite": row["suite"], "codename": row["codename"],
+        "component": row["component"], "architecture": row["architecture"],
+        "trusted": row["trusted"].lower(), "signed_by": str(UBUNTU_ARCHIVE_KEYRING),
+        "transport": diagnostics["repo_transport"],
+    }
 
 
 def validate_apt_record(text: str, package: str, version: str,
@@ -293,7 +631,8 @@ def validate_apt_record(text: str, package: str, version: str,
     return result
 
 
-def _package_record(package: str, version: str, sha256: str) -> dict[str, str]:
+def _package_record(package: str, version: str, sha256: str, *,
+                    apt_transport: dict[str, Any]) -> dict[str, Any]:
     # APT's default show format (v1) preserves the package-index fields we pin,
     # but does not synthesize APT-Sources. Request v2 separately for provenance.
     # In APT 2.7.14, -f/--full is registered only for `search`; `show` gets the
@@ -321,7 +660,30 @@ def _package_record(package: str, version: str, sha256: str) -> dict[str, str]:
         source_text = source_output.decode("utf-8")
     except UnicodeError as exc:
         raise SetupFailure("signed_apt_package_source_record_encoding_invalid") from exc
-    return validate_apt_record(text, package, version, sha256, source_text=source_text)
+    record = validate_apt_record(text, package, version, sha256, source_text=source_text)
+    try:
+        target_output, _ = _command(
+            ["apt-get", "indextargets", "--format", APT_INDEXTARGETS_FORMAT],
+            limit=APT_INDEX_TARGETS_LIMIT, apt_phase="index_targets")
+    except SetupFailure as exc:
+        diagnostics = _candidate_record_diagnostics(text, source_text, package, version)
+        diagnostics["apt_command"] = exc.details.get(
+            "apt_command", _apt_command_diagnostics("index_targets", "unclassified_failure"))
+        exc.details = diagnostics
+        raise
+    try:
+        target_text = target_output.decode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise SetupFailure("apt_signed_release_target_encoding_invalid") from exc
+    try:
+        release_evidence = _validate_signed_apt_index_target(
+            target_text, record["APT-Sources"], apt_transport)
+    except SetupFailure as exc:
+        exc.details["candidate_diagnostics"] = _candidate_record_diagnostics(
+            text, source_text, package, version)
+        raise
+    record["_release_evidence"] = release_evidence
+    return record
 
 
 def parse_dpkg_deb_fields(output: str) -> dict[str, str]:
@@ -355,6 +717,8 @@ def validate_profile_deb_metadata(output: bytes) -> dict[str, str]:
 def _public_apt_source(source: str) -> str:
     """Return useful source identity while omitting URL credentials and paths."""
     tokens = source.split()
+    if tokens and tokens[0] == APT_MIRROR_URI:
+        return "mirror+file:<verified Ubuntu runner mirrorlist> " + " ".join(tokens[1:])
     parsed = urlparse(tokens[0])
     host = (parsed.hostname or "").lower()
     return f"{parsed.scheme.lower()}://{host}/[path-redacted] {' '.join(tokens[1:])}"
@@ -572,16 +936,25 @@ def prepare(evidence_path: Path) -> int:
         report["apt_security"] = apt_security
         _write_json(evidence_path, report)
 
+        report["stage"] = "trusted_ubuntu_source_configuration"
+        apt_transport = _runner_mirror_configuration()
+        report["apt_source_transport"] = {
+            key: value for key, value in apt_transport.items() if not key.startswith("_")
+        }
+        _write_json(evidence_path, report)
+
         report["stage"] = "signed_apt_index_refresh"
         _quiet_command(["sudo", "-n", "apt-get", "-o", "APT::Update::Error-Mode=any",
                         "update", "-qq"], timeout=240)
 
         report["stage"] = "bubblewrap_package_record"
-        bwrap_record = _package_record("bubblewrap", BWRAP_VERSION, "")
+        bwrap_record = _package_record("bubblewrap", BWRAP_VERSION, "",
+                                       apt_transport=apt_transport)
         if bwrap_record["Architecture"] != "amd64":
             raise SetupFailure("bubblewrap_signed_apt_record_architecture_mismatch")
         report["bubblewrap_apt_record"] = {
             "version": bwrap_record["Version"], "origin": _public_apt_source(bwrap_record["APT-Sources"]),
+            "release_evidence": bwrap_record["_release_evidence"],
         }
         _write_json(evidence_path, report)
 
@@ -610,12 +983,14 @@ def prepare(evidence_path: Path) -> int:
         _write_json(evidence_path, report)
 
         report["stage"] = "exact_profile_signed_apt_record"
-        profile_record = _package_record(PROFILE_PACKAGE, PROFILE_VERSION, PROFILE_DEB_SHA256)
+        profile_record = _package_record(PROFILE_PACKAGE, PROFILE_VERSION, PROFILE_DEB_SHA256,
+                                         apt_transport=apt_transport)
         report["profile_package"] = {
             "name": PROFILE_PACKAGE, "version": PROFILE_VERSION,
             "architecture": profile_record["Architecture"],
             "origin": _public_apt_source(profile_record["APT-Sources"]),
             "filename": profile_record["Filename"], "signed_index_sha256": profile_record["SHA256"],
+            "release_evidence": profile_record["_release_evidence"],
         }
         _write_json(evidence_path, report)
 
