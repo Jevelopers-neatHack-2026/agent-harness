@@ -14,11 +14,11 @@
     }
   },
   "scripts": {
-    "build": "node --check src/internal/errors.js && node --check src/internal/config.js && node --check src/internal/durable-store.js && node --check src/internal/index.js && node --input-type=module -e \"import('@jevelopers/agent-harness-runtime')\" && npm run typecheck",
-    "typecheck": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext tests/runtime/public-api.typecheck.ts",
+    "build": "node --check src/internal/errors.js && node --check src/internal/config.js && node --check src/internal/durable-store.js && node --check src/internal/telemetry.js && node --check src/internal/index.js && node --input-type=module -e \"import('@jevelopers/agent-harness-runtime')\" && npm run typecheck",
+    "typecheck": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext tests/runtime/public-api.typecheck.ts tests/observability/public-api.typecheck.ts",
     "check": "npm run build",
-    "test": "node --test --test-concurrency=1 tests/runtime/*.test.js",
-    "test:internal": "node --test --test-concurrency=1 tests/runtime/*.test.js"
+    "test": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/observability/*.test.js",
+    "test:internal": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/observability/*.test.js"
   },
   "devDependencies": {
     "typescript": "5.9.3"

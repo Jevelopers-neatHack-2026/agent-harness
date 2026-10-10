@@ -22,5 +22,6 @@ verify: runtime
 	  AH-03:state-crash-matrix) echo "AH-03 internal prerequisite durability suite; global acceptance remains pending."; node --test tests/runtime/durability.test.js ;; \
 	  AH-03:lease-migration) echo "AH-03 internal prerequisite durability suite; global acceptance remains pending."; node --test tests/runtime/durability.test.js ;; \
 	  AH-01:internal-boundary) echo "AH-01 internal foundation suite; canonical compatibility remains pending."; node --test tests/runtime/foundation.test.js ;; \
+	  AH-10:internal-redaction-outage) echo "AH-10 internal synthetic telemetry suite; Neatlogs, Entire, and cross-repository acceptance remain pending."; node tests/observability/verify-fixture.js AH-10 mock internal-redaction-outage ;; \
 	  *) echo "Unsupported case or fixture. Required canonical and cross-repository acceptance cannot pass in this increment."; exit 2 ;; \
 	esac

@@ -33,7 +33,14 @@ export type SafeErrorCode =
   | 'ARTIFACT_IMMUTABLE'
   | 'ARTIFACT_NOT_FOUND'
   | 'IDEMPOTENCY_CONFLICT'
-  | 'CHECKPOINT_CORRUPT';
+  | 'CHECKPOINT_CORRUPT'
+  | 'TELEMETRY_INVALID_INPUT'
+  | 'TELEMETRY_REDACTION_FAILED'
+  | 'TELEMETRY_STORE_UNAVAILABLE'
+  | 'TELEMETRY_SINK_UNAVAILABLE'
+  | 'TELEMETRY_SINK_TIMEOUT'
+  | 'TELEMETRY_CURSOR_GAP'
+  | 'TELEMETRY_CURSOR_CONFLICT';
 export type WorkflowState =
   | 'queued'
   | 'running'
@@ -90,7 +97,7 @@ export interface RuntimeConfig {
 export function parseRuntimeConfig(env: Record<string, string | undefined>): RuntimeConfig;
 export function assertExecutionModeAvailable(config: RuntimeConfig): true;
 
-export const INTERNAL_SCHEMA_VERSION: 3;
+export const INTERNAL_SCHEMA_VERSION: 4;
 export interface StoreOptions {
   databasePath: string;
   clock?: () => number;
@@ -104,6 +111,18 @@ export interface Lease {
   fence: number;
   expiresAtMs: number;
   revision: number;
+}
+
+export interface DurableWorkflowEvent {
+  sequence: number;
+  eventId: string;
+  workflowId: string;
+  revision: number;
+  type: string;
+  fromState: WorkflowState | null;
+  toState: WorkflowState | null;
+  fence: number;
+  occurredAtMs: number;
 }
 
 export class DurableWorkflowStore {
@@ -190,7 +209,103 @@ export class DurableWorkflowStore {
     sha256: string;
     bytes: Uint8Array;
   };
-  listEvents(input?: { workflowId?: string; afterSequence?: number }): Array<Record<string, unknown>>;
+  listEvents(input?: { workflowId?: string; afterSequence?: number }): DurableWorkflowEvent[];
+  readEventPage(input?: {
+    afterSequence?: number;
+    limit?: number;
+    workflowId?: string;
+  }): {
+    events: DurableWorkflowEvent[];
+    hasMore: boolean;
+    nextAfterSequence: number;
+  };
+  countEventRowsAfter(afterSequence?: number, cap?: number): { count: number; capped: boolean };
+  getTelemetryCursor(consumerId?: string): number;
+  advanceTelemetryCursor(input: {
+    consumerId?: string;
+    expectedSequence: number;
+    nextSequence: number;
+  }): number;
   readOutbox(input?: { afterSequence?: number; limit?: number }): Array<Record<string, unknown>>;
   acknowledgeOutbox(eventId: string): { acknowledged: boolean };
 }
+
+export interface TelemetryRecord {
+  readonly schema: 'agent-harness.telemetry.v1';
+  readonly sequence: number;
+  readonly eventId: string;
+  readonly workflowId: string;
+  readonly revision: number;
+  readonly eventType: string;
+  readonly fromState: WorkflowState | null;
+  readonly toState: WorkflowState | null;
+  readonly fence: number;
+  readonly occurredAtMs: number;
+}
+
+export interface TelemetryTokenizer {
+  tokenize(kind: 'event' | 'workflow', value: string): string;
+  destroy?(): void;
+}
+
+export interface TelemetryLimits {
+  queueRecords?: number;
+  queueBytes?: number;
+  batchSize?: number;
+  maxAttempts?: number;
+  retryDelayMs?: number;
+  sinkTimeoutMs?: number;
+  maxBatchesPerFlush?: number;
+  maxPolicyDropsPerFlush?: number;
+}
+
+export interface TelemetryDiagnostics {
+  readonly state: 'idle' | 'flushing' | 'sink-pending' | 'unavailable' | 'closed';
+  readonly cursor: number;
+  readonly pendingRecords: number;
+  readonly pendingCapped: boolean;
+  readonly deliveredRecords: number;
+  readonly policyDroppedRecords: number;
+  readonly sinkAttempts: number;
+  readonly lastErrorCode:
+    | 'TELEMETRY_STORE_UNAVAILABLE'
+    | 'TELEMETRY_CURSOR_GAP'
+    | 'TELEMETRY_REDACTION_FAILED'
+    | 'TELEMETRY_SINK_TIMEOUT'
+    | 'TELEMETRY_SINK_UNAVAILABLE'
+    | 'TELEMETRY_CURSOR_CONFLICT'
+    | null;
+}
+
+export interface TelemetrySink {
+  (
+    records: readonly TelemetryRecord[],
+    context: { readonly signal: AbortSignal }
+  ): Promise<{ accepted: true; acceptedCount: number }> | { accepted: true; acceptedCount: number };
+}
+
+export function createHmacTokenizer(key: Uint8Array): TelemetryTokenizer;
+export function projectTelemetryEvent(
+  event: DurableWorkflowEvent,
+  tokenize: (kind: 'event' | 'workflow', value: string) => string
+): TelemetryRecord;
+export type TelemetryExporterOptions = {
+  store: DurableWorkflowStore;
+  sink: TelemetrySink;
+  limits?: TelemetryLimits;
+} & (
+  | { tokenizer: TelemetryTokenizer; tokenize?: never }
+  | { tokenize: (kind: 'event' | 'workflow', value: string) => string; tokenizer?: never }
+);
+
+export function createTelemetryExporter(options: TelemetryExporterOptions): TelemetryExporter;
+export class TelemetryExporter {
+  constructor(options: TelemetryExporterOptions);
+  diagnostics(): TelemetryDiagnostics;
+  flush(): Promise<TelemetryDiagnostics>;
+  close(): Promise<TelemetryDiagnostics>;
+}
+export const TELEMETRY_LIMITS: {
+  readonly defaults: Readonly<Required<TelemetryLimits>>;
+  readonly maximums: Readonly<Record<string, number>>;
+};

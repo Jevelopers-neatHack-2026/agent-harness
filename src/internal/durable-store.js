@@ -4,7 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { RuntimeError, runtimeError } from './errors.js';
 
-export const INTERNAL_SCHEMA_VERSION = 3;
+export const INTERNAL_SCHEMA_VERSION = 4;
 const CHECKPOINT_SCHEMA_VERSION = 2;
 const MAX_CHECKPOINT_DEPTH = 128;
 const MAX_CHECKPOINT_NODES = 10_000;
@@ -323,6 +323,16 @@ function createSchemaV3(db) {
   `);
 }
 
+function createTelemetryCursorSchema(db) {
+  db.exec(`
+    CREATE TABLE telemetry_cursors (
+      consumer_id TEXT PRIMARY KEY,
+      last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0),
+      updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
+    ) STRICT, WITHOUT ROWID;
+  `);
+}
+
 function readUserVersion(db) {
   return Number(db.prepare('PRAGMA user_version').get().user_version);
 }
@@ -346,8 +356,8 @@ function appendMigrationEvent(db, workflowId, state, revision, occurredAtMs) {
   );
 }
 
-function migrateV1ToV3(db) {
-  inTransaction(db, 'migrateV1ToV3', () => {
+function migrateV1ToV4(db) {
+  inTransaction(db, 'migrateV1ToV4', () => {
     db.exec('ALTER TABLE workflows RENAME TO workflows_v1');
     createSchemaV3(db);
     const oldRows = db.prepare('SELECT * FROM workflows_v1 ORDER BY workflow_id').all();
@@ -399,16 +409,25 @@ function migrateV1ToV3(db) {
       appendMigrationEvent(db, workflowId, state, revision, updated);
     }
     db.exec('DROP TABLE workflows_v1');
-    db.exec('PRAGMA user_version = 3');
+    createTelemetryCursorSchema(db);
+    db.exec('PRAGMA user_version = 4');
   });
 }
 
-function migrateV2ToV3(db) {
-  inTransaction(db, 'migrateV2ToV3', () => {
+function migrateV2ToV4(db) {
+  inTransaction(db, 'migrateV2ToV4', () => {
     // Existing receipts have no proof binding their proposed checkpoint bytes.
     // Leave them NULL: they remain readable, but reconciliation fails closed.
     db.exec('ALTER TABLE response_receipts ADD COLUMN next_checkpoint_sha256 TEXT');
-    db.exec('PRAGMA user_version = 3');
+    createTelemetryCursorSchema(db);
+    db.exec('PRAGMA user_version = 4');
+  });
+}
+
+function migrateV3ToV4(db) {
+  inTransaction(db, 'migrateV3ToV4', () => {
+    createTelemetryCursorSchema(db);
+    db.exec('PRAGMA user_version = 4');
   });
 }
 
@@ -423,7 +442,8 @@ function initializeDatabase(db) {
     }
     inTransaction(db, 'initializeDatabase', () => {
       createSchemaV3(db);
-      db.exec('PRAGMA user_version = 3');
+      createTelemetryCursorSchema(db);
+      db.exec('PRAGMA user_version = 4');
     });
     return;
   }
@@ -432,9 +452,11 @@ function initializeDatabase(db) {
       "SELECT name FROM sqlite_master WHERE type='table' AND name='workflows'"
     ).get();
     if (!table) fail('initializeDatabase', 'CHECKPOINT_CORRUPT', 'The legacy workflow table is missing.');
-    migrateV1ToV3(db);
+    migrateV1ToV4(db);
   } else if (version === 2) {
-    migrateV2ToV3(db);
+    migrateV2ToV4(db);
+  } else if (version === 3) {
+    migrateV3ToV4(db);
   }
 }
 
@@ -1445,6 +1467,140 @@ export class DurableWorkflowStore {
     } catch (error) {
       throw mapStorageError(operation, error);
     }
+  }
+
+  readEventPage({ afterSequence = 0, limit = 100, workflowId } = {}) {
+    const operation = 'readEventPage';
+    expectInteger(afterSequence, 'afterSequence', operation);
+    expectInteger(limit, 'limit', operation, 1);
+    if (limit > 500) fail(operation, 'INVALID_INPUT', 'The event page exceeds its supported record limit.');
+    if (workflowId !== undefined) expectString(workflowId, 'workflowId', operation);
+    this.#assertOpen(operation);
+    try {
+      const rows = workflowId === undefined
+        ? this.#db.prepare(`
+            SELECT sequence, event_id, workflow_id, revision, event_type,
+                   from_state, to_state, fence_token, occurred_at_ms
+            FROM workflow_events WHERE sequence > ? ORDER BY sequence LIMIT ?
+          `).all(afterSequence, limit + 1)
+        : this.#db.prepare(`
+            SELECT sequence, event_id, workflow_id, revision, event_type,
+                   from_state, to_state, fence_token, occurred_at_ms
+            FROM workflow_events WHERE workflow_id = ? AND sequence > ? ORDER BY sequence LIMIT ?
+          `).all(workflowId, afterSequence, limit + 1);
+      const hasMore = rows.length > limit;
+      if (hasMore) rows.pop();
+      const events = rows.map(row => ({
+        sequence: Number(row.sequence),
+        eventId: row.event_id,
+        workflowId: row.workflow_id,
+        revision: Number(row.revision),
+        type: row.event_type,
+        fromState: row.from_state,
+        toState: row.to_state,
+        fence: Number(row.fence_token),
+        occurredAtMs: Number(row.occurred_at_ms)
+      }));
+      if (events.some(event => !Number.isSafeInteger(event.sequence)
+          || !Number.isSafeInteger(event.revision)
+          || !Number.isSafeInteger(event.fence)
+          || !Number.isSafeInteger(event.occurredAtMs))) {
+        fail(operation, 'CHECKPOINT_CORRUPT', 'The event page contains an unsupported numeric value.');
+      }
+      return {
+        events,
+        hasMore,
+        nextAfterSequence: events.length === 0 ? afterSequence : events.at(-1).sequence
+      };
+    } catch (error) {
+      throw mapStorageError(operation, error);
+    }
+  }
+
+  countEventRowsAfter(afterSequence = 0, cap = 10_000) {
+    const operation = 'countEventRowsAfter';
+    expectInteger(afterSequence, 'afterSequence', operation);
+    expectInteger(cap, 'cap', operation, 1);
+    if (cap > 1_000_000) fail(operation, 'INVALID_INPUT', 'The event count cap exceeds its supported range.');
+    this.#assertOpen(operation);
+    try {
+      const row = this.#db.prepare(`
+        SELECT COUNT(*) AS count FROM (
+          SELECT sequence FROM workflow_events WHERE sequence > ? ORDER BY sequence LIMIT ?
+        )
+      `).get(afterSequence, cap + 1);
+      const count = Number(row.count);
+      return { count: Math.min(count, cap), capped: count > cap };
+    } catch (error) {
+      throw mapStorageError(operation, error);
+    }
+  }
+
+  getTelemetryCursor(consumerId = 'internal-telemetry-v1') {
+    const operation = 'getTelemetryCursor';
+    if (typeof consumerId !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(consumerId)) {
+      fail(operation, 'INVALID_INPUT', 'The telemetry consumer identity is invalid.');
+    }
+    this.#assertOpen(operation);
+    try {
+      const row = this.#db.prepare(
+        'SELECT last_sequence FROM telemetry_cursors WHERE consumer_id = ?'
+      ).get(consumerId);
+      const cursor = row ? Number(row.last_sequence) : 0;
+      if (!Number.isSafeInteger(cursor) || cursor < 0) {
+        fail(operation, 'CHECKPOINT_CORRUPT', 'The telemetry cursor contains an unsupported numeric value.');
+      }
+      return cursor;
+    } catch (error) {
+      throw mapStorageError(operation, error);
+    }
+  }
+
+  advanceTelemetryCursor({ consumerId = 'internal-telemetry-v1', expectedSequence, nextSequence } = {}) {
+    const operation = 'advanceTelemetryCursor';
+    if (typeof consumerId !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(consumerId)) {
+      fail(operation, 'INVALID_INPUT', 'The telemetry consumer identity is invalid.');
+    }
+    expectInteger(expectedSequence, 'expectedSequence', operation);
+    expectInteger(nextSequence, 'nextSequence', operation, 1);
+    if (nextSequence - expectedSequence !== 1) {
+      fail(operation, 'INVALID_INPUT', 'The telemetry cursor advances one event at a time.');
+    }
+    this.#assertOpen(operation);
+    return inTransaction(this.#db, operation, () => {
+      const currentRow = this.#db.prepare(
+        'SELECT last_sequence FROM telemetry_cursors WHERE consumer_id = ?'
+      ).get(consumerId);
+      const current = currentRow ? Number(currentRow.last_sequence) : 0;
+      if (current !== expectedSequence) {
+        fail(operation, 'CONCURRENT_MODIFICATION', 'The telemetry cursor changed before it could be advanced.');
+      }
+      const available = Number(this.#db.prepare(`
+        SELECT COUNT(*) AS count FROM workflow_events
+        WHERE sequence > ? AND sequence <= ?
+      `).get(expectedSequence, nextSequence).count);
+      if (available !== 1) {
+        fail(operation, 'CONCURRENT_MODIFICATION', 'The telemetry cursor cannot skip an unavailable event.');
+      }
+      const now = this.#now(operation);
+      if (currentRow) {
+        const changed = this.#db.prepare(`
+          UPDATE telemetry_cursors SET last_sequence = ?, updated_at_ms = ?
+          WHERE consumer_id = ? AND last_sequence = ?
+        `).run(nextSequence, now, consumerId, expectedSequence);
+        if (Number(changed.changes) !== 1) {
+          fail(operation, 'CONCURRENT_MODIFICATION', 'The telemetry cursor changed before it could be advanced.');
+        }
+      } else {
+        if (expectedSequence !== 0) {
+          fail(operation, 'CONCURRENT_MODIFICATION', 'The telemetry cursor has no matching starting point.');
+        }
+        this.#db.prepare(`
+          INSERT INTO telemetry_cursors (consumer_id, last_sequence, updated_at_ms) VALUES (?, ?, ?)
+        `).run(consumerId, nextSequence, now);
+      }
+      return nextSequence;
+    });
   }
 
   readOutbox({ afterSequence = 0, limit = 100 } = {}) {
