@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import copy
 import hashlib
@@ -22,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tools import validate_jev_targets as jev  # noqa: E402
 from tools import verify_contract_release as contracts  # noqa: E402
+import prepare_ubuntu_bwrap_profile as profile_setup  # noqa: E402
 from synthetic_contract import write_complete_synthetic_contract  # noqa: E402
 
 
@@ -860,8 +862,31 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 }) as mocked_run:
             reason = contracts._run_sandbox_canary(Path(temp), Path(temp) / "host-canary.txt")
             command = mocked_run.call_args.args[0]
-        compile(command[command.index("-c") + 1], "<synthetic-canary-parent>", "exec")
-        compile(command[-1], "<synthetic-canary-child>", "exec")
+        parent_code = command[command.index("-c") + 1]
+        child_code = command[-3]
+        compile(parent_code, "<synthetic-canary-parent>", "exec")
+        compile(child_code, "<synthetic-canary-child>", "exec")
+        nested_tree = ast.parse(parent_code)
+        nested_code = next(ast.literal_eval(node.value) for node in ast.walk(nested_tree)
+                           if isinstance(node, ast.Assign)
+                           and any(isinstance(target, ast.Name) and target.id == "nested_code"
+                                   for target in node.targets))
+        shell_code = next(ast.literal_eval(node.value) for node in ast.walk(nested_tree)
+                          if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "shell_code"
+                                  for target in node.targets))
+        compile(nested_code, "<synthetic-canary-nested-userns>", "exec")
+        shell_check = subprocess.run(["/bin/sh", "-n"], input=shell_code.encode("utf-8"),
+                                     capture_output=True, check=False)
+        self.assertEqual(shell_check.returncode, 0, shell_check.stderr.decode("utf-8", "replace"))
+        self.assertIn("/proc/self/attr/current", parent_code)
+        self.assertIn("--unshare-all", command)
+        self.assertIn("--cap-drop", command)
+        self.assertIn("nested_cap_sys_admin_available", parent_code)
+        self.assertIn("nested_mount_denied", parent_code)
+        self.assertIn("loopback: failed rtm_newaddr: operation not permitted", parent_code)
+        self.assertNotIn("--share-net", command)
+        self.assertEqual(mocked_run.call_args.kwargs["timeout"], 20)
         self.assertIsNotNone(reason)
         self.assertIn("namespace_operation_not_permitted", reason or "")
         self.assertIn("<path>", reason or "")
@@ -871,6 +896,69 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted")
         self.assertEqual(loopback_category, "network_namespace_loopback_setup_denied")
         self.assertIn("RTM_NEWADDR", loopback_excerpt)
+
+    def test_native_profile_setup_accepts_only_exact_signed_ubuntu_apt_record(self) -> None:
+        record = (
+            "Package: apparmor-profiles\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Architecture: all\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+            "APT-Sources: https://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages\n"
+        )
+        parsed = profile_setup.validate_apt_record(
+            record, profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
+            profile_setup.PROFILE_DEB_SHA256)
+        self.assertEqual(parsed["APT-Sources"],
+                         "https://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
+
+    def test_native_profile_setup_rejects_foreign_stale_or_unpinned_apt_record(self) -> None:
+        record = (
+            "Package: apparmor-profiles\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Architecture: all\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+            "APT-Sources: https://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages\n"
+        )
+        for replacement in (
+            ("0ubuntu0.24.04.8", "0ubuntu0.24.04.7"),
+            (profile_setup.PROFILE_DEB_SHA256, "0" * 64),
+            ("archive.ubuntu.com", "packages.example.invalid"),
+            ("noble-updates/main", "noble/main"),
+            ("pool/main/a/apparmor/", "pool/universe/a/apparmor/"),
+        ):
+            with self.subTest(replacement=replacement[1]):
+                candidate = record.replace(*replacement)
+                with self.assertRaises(profile_setup.SetupFailure):
+                    profile_setup.validate_apt_record(
+                        candidate, profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
+                        profile_setup.PROFILE_DEB_SHA256)
+
+    def test_native_profile_setup_rejects_untrusted_apt_configuration_overrides(self) -> None:
+        with mock.patch.dict(profile_setup.os.environ, {"APT_CONFIG": "/tmp/unreviewed-apt.conf"}):
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "external_apt_configuration_override_unverified"):
+                profile_setup._apt_signature_configuration()
+        with mock.patch.object(profile_setup, "_command", return_value=(
+                b'Acquire::AllowWeakRepositories "true";\n', b"")):
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "apt_signature_validation_is_disabled"):
+                profile_setup._apt_signature_configuration()
+
+    def test_native_profile_setup_rejects_any_unreviewed_local_include(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-local-profile-override-") as temp:
+            first = Path(temp) / "bwrap-userns-restrict"
+            second = Path(temp) / "unpriv_bwrap"
+            with mock.patch.object(profile_setup, "LOCAL_OVERRIDES", (first, second)):
+                self.assertEqual(profile_setup._check_local_overrides(), ["absent", "absent"])
+                first.write_bytes(b"")
+                with self.assertRaises(profile_setup.SetupFailure):
+                    profile_setup._check_local_overrides()
+                first.unlink()
+                second.symlink_to(first.name)
+                with self.assertRaises(profile_setup.SetupFailure):
+                    profile_setup._check_local_overrides()
 
     def test_sandbox_command_imports_only_declared_sealed_dependency_root(self) -> None:
         with tempfile.TemporaryDirectory(prefix="acv1-dependency-import-root-") as temp, \
@@ -920,6 +1008,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(report["status"], "synthetic_test_only_validation_passed")
         self.assertFalse(report["ready"])
         self.assertFalse(report["owner_evidence_verified"])
+        self.assertFalse(report["result"]["ready"])
         self.assertFalse(report["result"]["owner_evidence_verified"])
         self.assertIn("TEST ONLY", report["result"]["scope"])
         self.assertEqual(report["result"]["validated_fixture_cases"], len(contracts.REQUIRED_CASES))

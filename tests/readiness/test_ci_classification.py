@@ -32,6 +32,67 @@ class CICheckerClassificationTests(unittest.TestCase):
         self.assertNotIn("/home/runner", detail)
         self.assertLessEqual(len(detail), 640)
 
+    def test_sandbox_success_requires_complete_profile_observations_and_sanitizes_audit(self):
+        observations = {key: True for key in ci.SANDBOX_OBSERVATION_KEYS}
+        observations.update({"apparmor_label": "bwrap//unpriv_bwrap (enforce)",
+                             "python_reexec_label": "bwrap//unpriv_bwrap (enforce)",
+                             "other_exec_label": "bwrap//unpriv_bwrap (enforce)",
+                             "nested_userns_label": "bwrap//unpriv_bwrap (enforce)",
+                             "nested_cap_eff": "000001ffffffffff", "host_canary_unchanged": True})
+
+        def successful_probe(_root, output):
+            output.update(observations)
+            return None
+
+        def bounded(command, **_kwargs):
+            if "--version" in command:
+                return {"ok": True, "stdout": b"bubblewrap 0.9.0", "stderr": b""}
+            return {
+                "ok": True,
+                "stdout": (b'audit: apparmor="DENIED" operation="capable" '
+                           b'profile="bwrap//unpriv_bwrap" capname="sys_admin" '
+                           b'name="/synthetic/private/path"\n'),
+                "stderr": b"",
+            }
+
+        with mock.patch.object(ci.platform, "system", return_value="Linux"), \
+                mock.patch.object(ci.shutil, "which", return_value="/usr/bin/bwrap"), \
+                mock.patch.object(ci.os, "access", return_value=True), \
+                mock.patch.object(ci.contracts, "probe_sandbox", side_effect=successful_probe), \
+                mock.patch.object(ci.contracts, "run_bounded", side_effect=bounded):
+            evidence, problems = ci.classify_sandbox()
+
+        self.assertFalse(problems)
+        self.assertEqual(evidence["implementation_check"], "required_linux_isolation_canaries_confirmed")
+        self.assertEqual(evidence["canary"]["status"], "synthetic_canaries_confirmed")
+        audit = evidence["canary"]["kernel_audit"]
+        self.assertEqual(audit["status"], "matching_bwrap_denial_records_observed")
+        self.assertEqual(audit["records"], [{"operation": "capable", "profile": "bwrap//unpriv_bwrap",
+                                             "capability": "sys_admin"}])
+        self.assertNotIn("/synthetic/private/path", str(audit))
+        self.assertEqual(audit["prior_loopback_failure_cause"], "unproven_from_frozen_CI_logs")
+
+    def test_sandbox_success_is_rejected_when_any_required_native_observation_is_missing(self):
+        observations = {key: True for key in ci.SANDBOX_OBSERVATION_KEYS}
+        observations.pop("nested_mount_denied")
+        observations.update({"apparmor_label": "bwrap//unpriv_bwrap (enforce)", "host_canary_unchanged": True})
+
+        def incomplete_probe(_root, output):
+            output.update(observations)
+            return None
+
+        with mock.patch.object(ci.platform, "system", return_value="Linux"), \
+                mock.patch.object(ci.shutil, "which", return_value="/usr/bin/bwrap"), \
+                mock.patch.object(ci.os, "access", return_value=True), \
+                mock.patch.object(ci.contracts, "run_bounded", return_value={
+                    "ok": True, "stdout": b"bubblewrap 0.9.0", "stderr": b"",
+                }), \
+                mock.patch.object(ci.contracts, "probe_sandbox", side_effect=incomplete_probe):
+            evidence, problems = ci.classify_sandbox()
+
+        self.assertIn("bubblewrap_canary_evidence_incomplete", problems)
+        self.assertEqual(evidence["canary"]["status"], "failed")
+
     def test_checked_in_release_is_classified_blocked_with_exit_two(self):
         observed = ci._run_checker("contracts")
         evidence, problems = ci.classify_readiness_report(

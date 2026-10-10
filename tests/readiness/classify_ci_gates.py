@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import hashlib
 import json
 import os
@@ -28,6 +29,15 @@ from tools import validate_jev_targets as jev  # noqa: E402
 from tools import verify_contract_release as contracts  # noqa: E402
 
 FORMAT = "agent-creative.readiness-ci-evidence/v1"
+SANDBOX_OBSERVATION_KEYS = (
+    "outside_read_blocked", "sandbox_shadow_write_succeeded", "network_blocked",
+    "network_namespace_isolated", "sandbox_exec_capabilities_dropped", "apparmor_stack_verified",
+    "payload_no_new_privs", "payload_capability_sets_zero", "python_reexec_stack_verified",
+    "python_reexec_capabilities_zero", "python_reexec_no_new_privs", "other_exec_stack_verified",
+    "other_exec_capabilities_zero", "other_exec_no_new_privs", "nested_userns_created",
+    "nested_userns_stack_verified", "nested_userns_no_new_privs", "nested_cap_sys_admin_available",
+    "nested_mount_denied", "nested_bwrap_denied", "child_isolated", "child_capabilities_dropped",
+)
 EXPECTED_CONTRACT_CODES = {
     "canonical_release_not_published": 9,
     "owner_evidence_index_unavailable": 1,
@@ -256,6 +266,62 @@ def _run_checker(gate: str) -> Dict[str, Any]:
     }
 
 
+def _kernel_apparmor_audit(since: str) -> Dict[str, Any]:
+    """Return only bounded, sanitized bwrap capability-denial fields."""
+    command = ["sudo", "-n", "journalctl", "-k", "-b", "-n", "300", "--no-pager", "-o", "cat",
+               "--since", since, "--grep", 'apparmor="DENIED".*(bwrap|unpriv_bwrap)']
+    result = contracts.run_bounded(command, cwd=ROOT,
+                                   env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C"},
+                                   input_bytes=b"", timeout=4, stdout_limit=64 * 1024, stderr_limit=1024)
+    status = "unavailable"
+    records: List[Dict[str, str]] = []
+    if result.get("ok"):
+        status = "no_matching_records"
+        text = result.get("stdout", b"").decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            if 'apparmor="DENIED"' not in line or not re.search(r"(?:^|[\s\"/])(?:bwrap|unpriv_bwrap)(?:[\s\"/]|$)", line):
+                continue
+            operation = re.search(r'operation="([a-zA-Z0-9_-]{1,48})"', line)
+            profile = re.search(r'profile="([^"\r\n]{1,160})"', line)
+            capability = re.search(r'(?:capname|capability)="?([a-zA-Z0-9_-]{1,48})', line)
+            if not operation or not profile:
+                continue
+            normalized_profile = profile.group(1)
+            if "bwrap" not in normalized_profile:
+                continue
+            record = {"operation": operation.group(1), "profile": normalized_profile}
+            if capability:
+                record["capability"] = capability.group(1)
+            records.append(record)
+            if len(records) >= 10:
+                break
+        if records:
+            status = "matching_bwrap_denial_records_observed"
+    return {
+        "status": status,
+        "records": records,
+        "prior_loopback_failure_cause": "unproven_from_frozen_CI_logs",
+    }
+
+
+def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key in SANDBOX_OBSERVATION_KEYS:
+        if type(observed.get(key)) is bool:
+            result[key] = observed[key]
+    for key in ("apparmor_label", "python_reexec_label", "other_exec_label", "nested_userns_label"):
+        label = observed.get(key)
+        if (isinstance(label, str) and len(label) <= 160 and "bwrap" in label
+                and "unpriv_bwrap" in label and label.endswith("(enforce)")
+                and re.fullmatch(r"[A-Za-z0-9_./&() -]+", label)):
+            result[key] = label
+    nested_cap_eff = observed.get("nested_cap_eff")
+    if isinstance(nested_cap_eff, str) and len(nested_cap_eff) <= 32 and re.fullmatch(r"[0-9a-fA-F]+", nested_cap_eff):
+        result["nested_cap_eff"] = nested_cap_eff
+    result["host_canary_unchanged"] = observed.get("host_canary_unchanged") is True
+    return result
+
+
 def classify_sandbox() -> Tuple[Dict[str, Any], List[str]]:
     problems: List[str] = []
     evidence: Dict[str, Any] = {
@@ -294,18 +360,31 @@ def classify_sandbox() -> Tuple[Dict[str, Any], List[str]]:
         else:
             problems.append("bubblewrap_is_not_executable")
 
+    audit_since = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     if not problems and evidence["bubblewrap"]["available"]:
         # The probe's subprocesses use a reduced environment and the exact path
         # that was just version-checked; the child canaries execute inside bwrap.
         original_which = contracts.shutil.which
+        observations: Dict[str, Any] = {}
         try:
             contracts.shutil.which = lambda name: bwrap if name == "bwrap" else original_which(name)
-            reason = contracts.probe_sandbox(ROOT)
+            reason = contracts.probe_sandbox(ROOT, observations)
         finally:
             contracts.shutil.which = original_which
+        evidence["canary"]["observations"] = _safe_sandbox_observations(observations)
+        evidence["canary"]["kernel_audit"] = _kernel_apparmor_audit(audit_since)
         if reason is None:
-            evidence["canary"]["status"] = "synthetic_canaries_confirmed"
-            evidence["implementation_check"] = "required_linux_isolation_canaries_confirmed"
+            missing = [key for key in SANDBOX_OBSERVATION_KEYS
+                       if evidence["canary"]["observations"].get(key) is not True]
+            if evidence["canary"]["observations"].get("host_canary_unchanged") is not True:
+                missing.append("host_canary_unchanged")
+            if missing:
+                problems.append("bubblewrap_canary_evidence_incomplete")
+                evidence["canary"]["status"] = "failed"
+                evidence["canary"]["details"] = "required synthetic observations were absent or false"
+            else:
+                evidence["canary"]["status"] = "synthetic_canaries_confirmed"
+                evidence["implementation_check"] = "required_linux_isolation_canaries_confirmed"
         else:
             problems.append("bubblewrap_canary_failed")
             evidence["canary"]["status"] = "failed"

@@ -1296,10 +1296,22 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         run.get("stderr") if isinstance(run.get("stderr"), bytes) else b"")
     flags = {}
     if isinstance(report, dict):
-        for key in ("outside_read_blocked", "sandbox_shadow_write_succeeded", "network_blocked",
-                    "network_namespace_isolated", "sandbox_exec_capabilities_dropped",
-                    "child_isolated", "child_capabilities_dropped"):
-            flags[key] = report.get(key) is True
+        flags = {
+            "outside_read_blocked": report.get("outside_read_blocked") is True,
+            "shadow_write_private": report.get("sandbox_shadow_write_succeeded") is True,
+            "network_blocked": report.get("network_blocked") is True,
+            "network_namespace_isolated": report.get("network_namespace_isolated") is True,
+            "apparmor_stack": report.get("apparmor_stack_verified") is True,
+            "payload_no_new_privs": report.get("payload_no_new_privs") is True,
+            "payload_capability_sets_zero": report.get("payload_capability_sets_zero") is True,
+            "python_reexec_stack": report.get("python_reexec_stack_verified") is True,
+            "other_exec_stack": report.get("other_exec_stack_verified") is True,
+            "nested_userns_created": report.get("nested_userns_created") is True,
+            "nested_capability_denied": (report.get("nested_cap_sys_admin_available") is True
+                                          and report.get("nested_mount_denied") is True),
+            "nested_bwrap_denied": report.get("nested_bwrap_denied") is True,
+            "child_isolated": report.get("child_isolated") is True,
+        }
         child_code = report.get("child_exit_code")
         flags["child_exit_code"] = child_code if type(child_code) is int else "unavailable"
         flags["child_stderr_present"] = report.get("child_stderr_present") is True
@@ -1311,14 +1323,16 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         "process_code": code,
         "exit_code": exit_code,
         "stderr_class": stderr_category,
-        "stderr": stderr_excerpt or "<empty>",
+        "stderr": (stderr_excerpt or "<empty>")[:120],
         "canary": flags,
     }
-    return "bubblewrap internal canary failed: " + json.dumps(detail, sort_keys=True, separators=(",", ":"))
+    return ("bubblewrap internal canary failed: "
+            + json.dumps(detail, sort_keys=True, separators=(",", ":")))[:640]
 
 
-def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
-    """Exercise the real filesystem, network namespace, and descendant boundaries."""
+def _run_sandbox_canary(package_root: Path, outside: Path,
+                        observed: dict[str, Any] | None = None) -> str | None:
+    """Exercise real filesystem, network, profile-stack, and capability boundaries."""
     bwrap = shutil.which("bwrap")
     if not bwrap:
         return "bubblewrap is unavailable. Provision a supported bubblewrap runtime with user, network, and PID namespaces; adapters are not executed without an enforceable OS sandbox."
@@ -1334,71 +1348,245 @@ def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
     prefix.extend(["--dir", "/release", "--ro-bind", str(package_root.resolve()), "/release",
                    "--chdir", "/release", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
                    "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8"])
-    child_code = (
-        "import socket,sys\n"
-        "def capabilities_are_empty():\n"
-        " try:\n"
-        "  status={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in open('/proc/self/status',encoding='ascii') if ':' in line}\n"
-        "  return all(name in status and int(status[name],16)==0 for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))\n"
-        " except (OSError,ValueError): return False\n"
-        "read_blocked=False\n"
-        "try: open(sys.argv[1],'rb').read()\n"
-        "except OSError: read_blocked=True\n"
-        "network_namespace_isolated=(__import__('os').stat('/proc/self/ns/net').st_ino != int(sys.argv[2]))\n"
-        "capabilities_dropped=capabilities_are_empty()\n"
-        "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2)\n"
-        "try: s.connect(('198.18.0.1',9)); net_blocked=False\n"
-        "except OSError: net_blocked=True\n"
-        "print('child-read-blocked='+str(read_blocked)+' child-network-blocked='+str(net_blocked)+' child-network-namespace-isolated='+str(network_namespace_isolated)+' child-capabilities-dropped='+str(capabilities_dropped))\n"
-        "sys.exit(0 if read_blocked and net_blocked and network_namespace_isolated and capabilities_dropped else 7)\n"
-    )
-    parent_code = (
-        "import json,os,socket,subprocess,sys\n"
-        "r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_blocked':False,'network_namespace_isolated':False,'sandbox_exec_capabilities_dropped':False,'child_isolated':False,'child_capabilities_dropped':False,'child_exit_code':None,'child_stderr_present':False,'child_stderr_class':'not_run'}\n"
-        "def capabilities_are_empty():\n"
-        " try:\n"
-        "  status={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in open('/proc/self/status',encoding='ascii') if ':' in line}\n"
-        "  return all(name in status and int(status[name],16)==0 for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))\n"
-        " except (OSError,ValueError): return False\n"
-        "host_network_namespace=int(sys.argv[3])\n"
-        "r['network_namespace_isolated']=(os.stat('/proc/self/ns/net').st_ino != host_network_namespace)\n"
-        "r['sandbox_exec_capabilities_dropped']=capabilities_are_empty()\n"
-        "try: open(sys.argv[1],'rb').read()\n"
-        "except OSError: r['outside_read_blocked']=True\n"
-        "try:\n"
-        " s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2); s.connect(('198.18.0.1',9))\n"
-        "except OSError: r['network_blocked']=True\n"
-        "p=subprocess.run([sys.executable,'-I','-B','-S','-c',sys.argv[2],sys.argv[1],sys.argv[3]],capture_output=True,timeout=2)\n"
-        "r['child_exit_code']=p.returncode\n"
-        "r['child_stderr_present']=bool(p.stderr)\n"
-        "child_error=p.stderr.decode('utf-8','replace').lower()\n"
-        "r['child_stderr_class']=('operation_not_permitted' if 'operation not permitted' in child_error else 'permission_denied' if 'permission denied' in child_error else 'missing_file' if 'no such file or directory' in child_error else 'python_dependency_import_failure' if 'modulenotfounderror' in child_error or 'no module named' in child_error else 'python_traceback' if 'traceback' in child_error else 'other' if child_error else 'empty')\n"
-        "r['child_isolated']=(p.returncode==0 and b'child-read-blocked=True child-network-blocked=True child-network-namespace-isolated=True child-capabilities-dropped=True' in p.stdout)\n"
-        "r['child_capabilities_dropped']=b'child-capabilities-dropped=True' in p.stdout\n"
-        "try:\n"
-        " os.makedirs(os.path.dirname(sys.argv[1]),exist_ok=True)\n"
-        " with open(sys.argv[1],'wb') as f: f.write(b'sandbox-shadow-write')\n"
-        " with open(sys.argv[1],'rb') as f: r['sandbox_shadow_write_succeeded']=(f.read()==b'sandbox-shadow-write')\n"
-        "except OSError: pass\n"
-        "print(json.dumps(r,sort_keys=True,separators=(',',':')))\n"
-        "sys.exit(0 if all(r[k] for k in ('outside_read_blocked','sandbox_shadow_write_succeeded','network_blocked','network_namespace_isolated','sandbox_exec_capabilities_dropped','child_isolated','child_capabilities_dropped')) else 8)\n"
-    )
+    child_code = r'''import json,os,socket,sys
+CAPS=('CapInh','CapPrm','CapEff','CapBnd','CapAmb')
+def context():
+ try:
+  label=open('/proc/self/attr/current',encoding='ascii').read(256).strip()
+  status={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in open('/proc/self/status',encoding='ascii') if ':' in line}
+  values={name:int(status[name],16) for name in CAPS}
+  stacked=label.endswith('(enforce)') and 'unpriv_bwrap' in label and 'bwrap' in label
+  return {'label':label if stacked else 'unverified','stack':stacked,'no_new_privs':status.get('NoNewPrivs')=='1','caps_zero':all(value==0 for value in values.values())}
+ except (OSError,ValueError,KeyError):
+  return {'label':'unavailable','stack':False,'no_new_privs':False,'caps_zero':False}
+outside=sys.argv[1]
+host_net=int(sys.argv[2])
+try:
+ open(outside,'rb').read()
+ outside_blocked=False
+except OSError:
+ outside_blocked=True
+netns=os.stat('/proc/self/ns/net').st_ino != host_net
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.settimeout(0.2)
+try:
+ s.connect(('198.18.0.1',9));network_blocked=False
+except OSError:
+ network_blocked=True
+c=context()
+r={'outside_read_blocked':outside_blocked,'network_blocked':network_blocked,'network_namespace_isolated':netns,
+   'apparmor_label':c['label'],'apparmor_stack_verified':c['stack'],'no_new_privs':c['no_new_privs'],
+   'capabilities_zero':c['caps_zero']}
+print(json.dumps(r,sort_keys=True,separators=(',',':')))
+sys.exit(0 if all((outside_blocked,network_blocked,netns,c['stack'],c['no_new_privs'],c['caps_zero'])) else 7)
+'''
+    parent_code = r'''import ctypes,errno,json,os,selectors,signal,socket,subprocess,sys,time
+CAPS=('CapInh','CapPrm','CapEff','CapBnd','CapAmb')
+def context():
+ try:
+  label=open('/proc/self/attr/current',encoding='ascii').read(256).strip()
+  status={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in open('/proc/self/status',encoding='ascii') if ':' in line}
+  values={name:int(status[name],16) for name in CAPS}
+  stacked=label.endswith('(enforce)') and 'unpriv_bwrap' in label and 'bwrap' in label
+  return {'label':label if stacked else 'unverified','stack':stacked,'no_new_privs':status.get('NoNewPrivs')=='1',
+          'caps_zero':all(value==0 for value in values.values()),'values':values}
+ except (OSError,ValueError,KeyError):
+  return {'label':'unavailable','stack':False,'no_new_privs':False,'caps_zero':False,'values':{}}
+def run_child(command,timeout=3):
+ process=None;selector=None;buffers={'stdout':bytearray(),'stderr':bytearray()};failure=False
+ try:
+  process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,close_fds=True)
+  selector=selectors.DefaultSelector()
+  for stream,name in ((process.stdout,'stdout'),(process.stderr,'stderr')):
+   os.set_blocking(stream.fileno(),False);selector.register(stream,selectors.EVENT_READ,name)
+  deadline=time.monotonic()+timeout
+  while selector.get_map() or process.poll() is None:
+   remaining=deadline-time.monotonic()
+   if remaining<=0:failure=True;break
+   for key,_ in selector.select(min(0.1,remaining)):
+    try:chunk=os.read(key.fileobj.fileno(),1024)
+    except OSError:chunk=b''
+    if not chunk:
+     selector.unregister(key.fileobj);continue
+    target=buffers[key.data];target.extend(chunk)
+    if len(target)>2048:failure=True;break
+   if failure:break
+  if failure:
+   os.killpg(process.pid,signal.SIGKILL)
+  code=process.wait(timeout=1)
+ except (OSError,subprocess.TimeoutExpired):
+  failure=True;code=None
+  if process is not None:
+   try:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=1);code=process.returncode
+   except (OSError,subprocess.TimeoutExpired):pass
+ finally:
+  if selector is not None:selector.close()
+  if process is not None:
+   for stream in (process.stdout,process.stderr):
+    try:stream.close()
+    except OSError:pass
+ return {'code':code,'stdout':bytes(buffers['stdout'][:2048]),'stderr':bytes(buffers['stderr'][:2048]),'bounded':not failure}
+def parse_object(raw):
+ try:
+  value=json.loads(raw.decode('utf-8'))
+  return value if isinstance(value,dict) else {}
+ except (ValueError,UnicodeError,RecursionError):
+  return {}
+outside=sys.argv[1]; child_code=sys.argv[2]; host_net=int(sys.argv[3]); bwrap=sys.argv[4]
+parent=context()
+r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_blocked':False,
+   'network_namespace_isolated':os.stat('/proc/self/ns/net').st_ino != host_net,
+   'sandbox_exec_capabilities_dropped':parent['caps_zero'],'apparmor_label':parent['label'],
+   'apparmor_stack_verified':parent['stack'],'payload_no_new_privs':parent['no_new_privs'],
+   'payload_capability_sets_zero':parent['caps_zero'],'python_reexec_stack_verified':False,
+   'python_reexec_label':'unverified','python_reexec_capabilities_zero':False,'python_reexec_no_new_privs':False,
+   'other_exec_label':'unverified',
+   'other_exec_stack_verified':False,'other_exec_capabilities_zero':False,
+   'other_exec_no_new_privs':False,'nested_userns_created':False,'nested_userns_stack_verified':False,
+   'nested_userns_label':'unverified','nested_userns_no_new_privs':False,'nested_cap_sys_admin_available':False,
+   'nested_cap_eff':'','nested_mount_denied':False,'nested_bwrap_denied':False,
+   'child_isolated':False,'child_capabilities_dropped':False,'child_exit_code':None,
+   'child_stderr_present':False,'child_stderr_class':'not_run'}
+try:
+ open(outside,'rb').read();r['outside_read_blocked']=False
+except OSError:
+ r['outside_read_blocked']=True
+try:
+ os.makedirs(os.path.dirname(outside),exist_ok=True)
+ with open(outside,'wb') as target:target.write(b'sandbox-shadow-write')
+ with open(outside,'rb') as target:r['sandbox_shadow_write_succeeded']=(target.read()==b'sandbox-shadow-write')
+except OSError:
+ pass
+try:
+ s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.settimeout(0.2);s.connect(('198.18.0.1',9))
+except OSError:
+ r['network_blocked']=True
+child=run_child([sys.executable,'-I','-B','-S','-c',child_code,outside,str(host_net)])
+child_report=parse_object(child['stdout'])
+r['child_exit_code']=child['code'];r['child_stderr_present']=bool(child['stderr'])
+child_error=child['stderr'].decode('utf-8','replace').lower()
+r['child_stderr_class']=('operation_not_permitted' if 'operation not permitted' in child_error else
+ 'permission_denied' if 'permission denied' in child_error else 'missing_file' if 'no such file or directory' in child_error else
+ 'python_dependency_import_failure' if 'modulenotfounderror' in child_error or 'no module named' in child_error else
+ 'python_traceback' if 'traceback' in child_error else 'other' if child_error else 'empty')
+r['child_isolated']=(child['code']==0 and child['bounded'] and child_report.get('outside_read_blocked') is True
+ and child_report.get('network_blocked') is True and child_report.get('network_namespace_isolated') is True
+ and child_report.get('apparmor_stack_verified') is True and child_report.get('no_new_privs') is True
+ and child_report.get('capabilities_zero') is True)
+r['child_capabilities_dropped']=child_report.get('capabilities_zero') is True
+r['python_reexec_label']=child_report.get('apparmor_label','unverified')
+r['python_reexec_no_new_privs']=child_report.get('no_new_privs') is True
+r['python_reexec_capabilities_zero']=child_report.get('capabilities_zero') is True
+r['python_reexec_stack_verified']=child_report.get('apparmor_stack_verified') is True
+
+shell_code="""profile=; IFS= read -r profile < /proc/self/attr/current
+nnp=; inh=; prm=; eff=; bnd=; amb=
+while IFS=: read -r key value; do
+ value=\"${value#\"${value%%[![:space:]]*}\"}\"
+ case \"$key\" in
+  NoNewPrivs) nnp=$value;; CapInh) inh=$value;; CapPrm) prm=$value;; CapEff) eff=$value;; CapBnd) bnd=$value;; CapAmb) amb=$value;;
+ esac
+done < /proc/self/status
+printf 'profile=%s\\nNoNewPrivs=%s\\nCapInh=%s\\nCapPrm=%s\\nCapEff=%s\\nCapBnd=%s\\nCapAmb=%s\\n' \"$profile\" \"$nnp\" \"$inh\" \"$prm\" \"$eff\" \"$bnd\" \"$amb\""""
+shell=run_child(['/bin/sh','-c',shell_code])
+shell_text=shell['stdout'].decode('ascii','replace')
+shell_values={}
+for line in shell_text.splitlines():
+ if '=' in line:
+  key,value=line.split('=',1);shell_values[key]=value
+shell_label=shell_values.get('profile','')
+shell_stack=shell_label.endswith('(enforce)') and 'bwrap' in shell_label and 'unpriv_bwrap' in shell_label
+r['other_exec_stack_verified']=shell['code']==0 and shell['bounded'] and shell_stack
+r['other_exec_label']=shell_label if shell_stack else 'unverified'
+r['other_exec_no_new_privs']=shell_values.get('NoNewPrivs')=='1'
+try:
+ r['other_exec_capabilities_zero']=all(int(shell_values[name],16)==0 for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+except (KeyError,ValueError):
+ r['other_exec_capabilities_zero']=False
+
+nested_code=r"""import ctypes,errno,json,os,sys
+def status():return {line.split(':',1)[0]:line.split(':',1)[1].strip() for line in open('/proc/self/status',encoding='ascii') if ':' in line}
+try:
+ label=open('/proc/self/attr/current',encoding='ascii').read(256).strip();s=status();cap_eff=int(s['CapEff'],16)
+ stacked=label.endswith('(enforce)') and 'bwrap' in label and 'unpriv_bwrap' in label
+ libc=ctypes.CDLL(None,use_errno=True);libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_char_p]
+ target=b'/tmp/acv1-capability-mount-probe';ctypes.set_errno(0)
+ result=libc.mount(b'tmpfs',target,b'tmpfs',2|4,b'size=4096');error=ctypes.get_errno()
+ denied=result<0 and error in (errno.EPERM,errno.EACCES)
+ if result==0:
+  libc.umount.argtypes=[ctypes.c_char_p];libc.umount(target)
+  try:os.rmdir(target.decode())
+  except OSError:pass
+ report={'created':True,'label':label if stacked else 'unverified','stack':stacked,'no_new_privs':s.get('NoNewPrivs')=='1',
+         'cap_eff':format(cap_eff,'x'),'cap_sys_admin':bool(cap_eff & (1<<21)),'mount_denied':denied}
+ print(json.dumps(report,sort_keys=True,separators=(',',':')))
+ sys.exit(0 if stacked and report['no_new_privs'] and report['cap_sys_admin'] and denied else 9)
+except (OSError,ValueError,KeyError):
+ print('{}');sys.exit(10)
+"""
+try:os.mkdir('/tmp/acv1-capability-mount-probe')
+except FileExistsError:pass
+unshare=__import__('shutil').which('unshare')
+if unshare:
+ nested=run_child([unshare,'--user','--map-root-user','--mount',sys.executable,'-I','-B','-S','-c',nested_code],timeout=4)
+ nested_report=parse_object(nested['stdout'])
+ r['nested_userns_created']=nested_report.get('created') is True and nested['bounded']
+ r['nested_userns_label']=nested_report.get('label','unverified')
+ r['nested_userns_stack_verified']=nested_report.get('stack') is True
+ r['nested_userns_no_new_privs']=nested_report.get('no_new_privs') is True
+ r['nested_cap_sys_admin_available']=nested_report.get('cap_sys_admin') is True
+ r['nested_cap_eff']=nested_report.get('cap_eff','') if isinstance(nested_report.get('cap_eff'),str) else ''
+ r['nested_mount_denied']=nested_report.get('mount_denied') is True
+
+inner=run_child([bwrap,'--die-with-parent','--new-session','--unshare-all','--cap-drop','ALL','/usr/bin/true'],timeout=4)
+inner_error=inner['stderr'].decode('utf-8','replace').lower()
+r['nested_bwrap_denied']=(inner['bounded'] and inner['code'] is not None and inner['code']!=0
+ and 'bwrap: loopback: failed rtm_newaddr: operation not permitted' in inner_error)
+try:os.rmdir('/tmp/acv1-capability-mount-probe')
+except OSError:pass
+print(json.dumps(r,sort_keys=True,separators=(',',':')))
+required=('outside_read_blocked','sandbox_shadow_write_succeeded','network_blocked','network_namespace_isolated',
+ 'sandbox_exec_capabilities_dropped','apparmor_stack_verified','payload_no_new_privs','payload_capability_sets_zero',
+ 'python_reexec_stack_verified','python_reexec_capabilities_zero','python_reexec_no_new_privs',
+ 'other_exec_stack_verified','other_exec_capabilities_zero','other_exec_no_new_privs','nested_userns_created',
+ 'nested_userns_stack_verified','nested_userns_no_new_privs','nested_cap_sys_admin_available','nested_mount_denied',
+ 'nested_bwrap_denied','child_isolated','child_capabilities_dropped')
+sys.exit(0 if all(r.get(key) is True for key in required) and r['child_exit_code']==0
+ and not r['child_stderr_present'] and r['child_stderr_class']=='empty' else 8)
+'''
     try:
         host_network_namespace = os.stat("/proc/self/ns/net").st_ino
     except OSError:
         return "The host network namespace identity cannot be inspected; no owner adapter is executed."
     command = prefix + [python_exe, "-I", "-B", "-S", "-c", parent_code,
-                        str(outside), child_code, str(host_network_namespace)]
+                        str(outside), child_code, str(host_network_namespace), bwrap]
     run = run_bounded(command, cwd=package_root,
                       env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
                            "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"},
-                      input_bytes=b"", timeout=5, stdout_limit=4096, stderr_limit=4096)
+                      input_bytes=b"", timeout=20, stdout_limit=4096, stderr_limit=4096)
     report = None
     try:
         if run.get("stdout"):
             report = parse_json_bytes(run["stdout"])
     except (ValueError, UnicodeError, json.JSONDecodeError, RecursionError):
         report = None
+    if observed is not None:
+        observed.clear()
+        if isinstance(report, dict):
+            allowed = {
+                "outside_read_blocked", "sandbox_shadow_write_succeeded", "network_blocked",
+                "network_namespace_isolated", "sandbox_exec_capabilities_dropped", "apparmor_label",
+                "python_reexec_label", "other_exec_label", "nested_userns_label",
+                "apparmor_stack_verified", "payload_no_new_privs", "payload_capability_sets_zero",
+                "python_reexec_stack_verified", "python_reexec_capabilities_zero",
+                "python_reexec_no_new_privs", "other_exec_stack_verified", "other_exec_capabilities_zero",
+                "other_exec_no_new_privs", "nested_userns_created", "nested_userns_stack_verified",
+                "nested_userns_no_new_privs", "nested_cap_sys_admin_available", "nested_cap_eff",
+                "nested_mount_denied", "nested_bwrap_denied", "child_isolated",
+                "child_capabilities_dropped", "child_exit_code", "child_stderr_present", "child_stderr_class",
+            }
+            observed.update({key: report[key] for key in allowed if key in report})
+        observed["process_code"] = run.get("code", "unavailable")
+        observed["exit_code"] = run.get("returncode")
     if not run.get("ok"):
         return _sandbox_process_failure(run, report)
     if (not isinstance(report, dict) or report.get("outside_read_blocked") is not True
@@ -1406,6 +1594,21 @@ def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
             or report.get("network_blocked") is not True
             or report.get("network_namespace_isolated") is not True
             or report.get("sandbox_exec_capabilities_dropped") is not True
+            or report.get("apparmor_stack_verified") is not True
+            or report.get("payload_no_new_privs") is not True
+            or report.get("payload_capability_sets_zero") is not True
+            or report.get("python_reexec_stack_verified") is not True
+            or report.get("python_reexec_capabilities_zero") is not True
+            or report.get("python_reexec_no_new_privs") is not True
+            or report.get("other_exec_stack_verified") is not True
+            or report.get("other_exec_capabilities_zero") is not True
+            or report.get("other_exec_no_new_privs") is not True
+            or report.get("nested_userns_created") is not True
+            or report.get("nested_userns_stack_verified") is not True
+            or report.get("nested_userns_no_new_privs") is not True
+            or report.get("nested_cap_sys_admin_available") is not True
+            or report.get("nested_mount_denied") is not True
+            or report.get("nested_bwrap_denied") is not True
             or report.get("child_isolated") is not True
             or report.get("child_capabilities_dropped") is not True
             or type(report.get("child_exit_code")) is not int or report.get("child_exit_code") != 0
@@ -1414,7 +1617,7 @@ def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
     return None
 
 
-def probe_sandbox(package_root: Path) -> str | None:
+def probe_sandbox(package_root: Path, observed: dict[str, Any] | None = None) -> str | None:
     """Require an offline canary proving host paths and host networking are isolated."""
     if platform.system() != "Linux":
         return "The current platform has no accepted supported no-network filesystem sandbox backend; macOS sandbox-exec is deprecated and is not used as a security boundary. Provision reviewed bubblewrap on a supported Linux runner or another audited OS sandbox."
@@ -1426,11 +1629,15 @@ def probe_sandbox(package_root: Path) -> str | None:
         with tempfile.TemporaryDirectory(prefix="acv1-sandbox-canary-") as temp:
             outside = Path(temp) / "host-canary.txt"
             outside.write_text("synthetic-host-canary", encoding="utf-8")
-            reason = _run_sandbox_canary(package_root, outside)
+            reason = _run_sandbox_canary(package_root, outside, observed)
             if reason is not None:
                 return reason
             if outside.read_text(encoding="utf-8") != "synthetic-host-canary":
+                if observed is not None:
+                    observed["host_canary_unchanged"] = False
                 return "bubblewrap isolation canary changed the host canary file; the owner adapter is not executed."
+            if observed is not None:
+                observed["host_canary_unchanged"] = True
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return "bubblewrap isolation prerequisite could not be verified with synthetic canaries; the owner adapter is not executed."
     return None
@@ -1933,6 +2140,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
         return 2
     if args.test_only_synthetic:
+        output["ready"] = False
         output["owner_evidence_verified"] = False
         output["scope"] = "TEST ONLY synthetic sealed-sandbox exercise; no canonical owner approval, release readiness, producer/consumer conformance, or global acceptance is established"
         report = {"tool": "verify_contract_release", "status": "synthetic_test_only_validation_passed",
