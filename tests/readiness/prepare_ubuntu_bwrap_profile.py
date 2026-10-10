@@ -433,6 +433,38 @@ def _parse_runner_mirrorlist(mirrorlist: bytes) -> tuple[str, ...]:
     return tuple(line.split(b"\t", 1)[0].decode("ascii") for line in mirrorlist.splitlines())
 
 
+def _component_field_diagnostics(value: str) -> dict[str, Any]:
+    """Classify runner components without copying untrusted token text to evidence."""
+    tokens = value.split()
+    allowed = frozenset(APT_RUNNER_COMPONENTS)
+    counts = {name: tokens.count(name) for name in APT_RUNNER_COMPONENTS}
+    unknown_count = sum(token not in allowed for token in tokens)
+    duplicate_count = len(tokens) - len(set(tokens))
+    exact_set = (
+        len(tokens) == len(APT_RUNNER_COMPONENTS)
+        and not unknown_count
+        and not duplicate_count
+        and set(tokens) == allowed
+    )
+    if not exact_set:
+        order_class = "invalid"
+    elif tokens == list(APT_RUNNER_COMPONENTS):
+        order_class = "canonical"
+    else:
+        order_class = "permutation"
+    return {
+        "token_count": min(len(tokens), 99),
+        "token_count_capped": len(tokens) > 99,
+        "allowed_component_counts": {name: min(count, 99) for name, count in counts.items()},
+        "unknown_component_count": min(unknown_count, 99),
+        "unknown_component_count_capped": unknown_count > 99,
+        "duplicate_component_count": min(duplicate_count, 99),
+        "duplicate_component_count_capped": duplicate_count > 99,
+        "order_class": order_class,
+        "exact_set": exact_set,
+    }
+
+
 def _runner_source_layout_diagnostics(records: list[dict[str, str]], source_file: bytes) -> dict[str, Any]:
     archive_count = 0
     security_count = 0
@@ -441,32 +473,50 @@ def _runner_source_layout_diagnostics(records: list[dict[str, str]], source_file
     exact_types_count = 0
     exact_mirror_uri_count = 0
     exact_components_count = 0
+    component_order_counts = {"canonical": 0, "permutation": 0, "invalid": 0}
+    component_unknown_total = 0
+    component_duplicate_total = 0
+    component_stanzas: list[dict[str, Any]] = []
     exact_signed_by_count = 0
     invalid_count = 0
     mirror_count = sum(
         APT_MIRROR_URI in row.get("uris", "").split() for row in records)
     for row in records:
         uris = row.get("uris", "").split()
-        suites = tuple(row.get("suites", "").split())
+        suites = row.get("suites", "").split()
+        archive_suites = (
+            len(suites) == len(APT_RUNNER_ARCHIVE_SUITES)
+            and set(suites) == set(APT_RUNNER_ARCHIVE_SUITES)
+        )
+        security_suites = (
+            len(suites) == len(APT_RUNNER_SECURITY_SUITES)
+            and set(suites) == set(APT_RUNNER_SECURITY_SUITES)
+        )
+        component_diagnostics = _component_field_diagnostics(row.get("components", ""))
         exact_field_set = set(row) == APT_RUNNER_SOURCE_FIELDS
         exact_types = row.get("types", "").split() == ["deb"]
         exact_mirror_uri = uris == [APT_MIRROR_URI]
-        exact_components = row.get("components", "").split() == list(APT_RUNNER_COMPONENTS)
+        exact_components = component_diagnostics["exact_set"]
         exact_signed_by = row.get("signed-by") == str(UBUNTU_ARCHIVE_KEYRING)
+        component_order_counts[component_diagnostics["order_class"]] += 1
+        component_unknown_total += component_diagnostics["unknown_component_count"]
+        component_duplicate_total += component_diagnostics["duplicate_component_count"]
+        if len(component_stanzas) < 2:
+            component_stanzas.append(component_diagnostics)
         exact_field_set_count += int(exact_field_set)
         exact_types_count += int(exact_types)
         exact_mirror_uri_count += int(exact_mirror_uri)
         exact_components_count += int(exact_components)
         exact_signed_by_count += int(exact_signed_by)
-        if suites == APT_RUNNER_ARCHIVE_SUITES:
+        if archive_suites:
             archive_count += 1
-        elif suites == APT_RUNNER_SECURITY_SUITES:
+        elif security_suites:
             security_count += 1
         else:
             unknown_suite_count += 1
         if not (exact_field_set and exact_types and exact_mirror_uri and exact_components
                 and exact_signed_by
-                and suites in (APT_RUNNER_ARCHIVE_SUITES, APT_RUNNER_SECURITY_SUITES)):
+                and (archive_suites or security_suites)):
             invalid_count += 1
     expected_layout = (
         len(records) == 2 and archive_count == 1 and security_count == 1
@@ -486,6 +536,13 @@ def _runner_source_layout_diagnostics(records: list[dict[str, str]], source_file
         "exact_types_deb_stanza_count": exact_types_count,
         "exact_mirror_uri_stanza_count": exact_mirror_uri_count,
         "exact_component_set_stanza_count": exact_components_count,
+        "component_order_class_counts": component_order_counts,
+        "component_unknown_token_count": min(component_unknown_total, 99),
+        "component_unknown_token_count_capped": component_unknown_total > 99,
+        "component_duplicate_token_count": min(component_duplicate_total, 99),
+        "component_duplicate_token_count_capped": component_duplicate_total > 99,
+        "component_stanza_diagnostics": component_stanzas,
+        "component_stanza_diagnostics_capped": len(records) > len(component_stanzas),
         "exact_archive_keyring_stanza_count": exact_signed_by_count,
         "archive_suite_stanza_count": archive_count,
         "security_suite_stanza_count": security_count,
@@ -607,6 +664,12 @@ def _runner_mirror_configuration() -> dict[str, Any]:
     return evidence
 
 
+def _is_pinned_package_index_target(row: dict[str, str]) -> bool:
+    return (row.get("identifier") == "Packages"
+            and row.get("metakey") == "main/binary-amd64/Packages"
+            and row.get("target-of") == "deb")
+
+
 def _apt_index_target_diagnostics(text: str, source: str,
                                   transport: dict[str, Any]) -> dict[str, Any]:
     try:
@@ -623,16 +686,29 @@ def _apt_index_target_diagnostics(text: str, source: str,
         candidate_repositories.update(
             value for value in transport.get("_mirror_uris", ())
             if isinstance(value, str) and _canonical_archive_uri(value))
-    matches = [row for row in records
-               if row.get("identifier") == "Packages"
-               and row.get("metakey") == "main/binary-amd64/Packages"
-               and row.get("target-of") == "deb"
-               and row.get("architecture") == "amd64"
+    candidates = [row for row in records if _is_pinned_package_index_target(row)]
+    matches = [row for row in candidates
+               if row.get("architecture") == "amd64"
                and row.get("component") == "main"
                and row.get("suite") == "noble-updates"
                and row.get("repo-uri", "").rstrip("/") in
                {value.rstrip("/") for value in candidate_repositories}]
-    row = matches[0] if len(matches) == 1 else {}
+    row = candidates[0] if len(candidates) == 1 else {}
+    unrelated = [record for record in records
+                 if not _is_pinned_package_index_target(record)]
+    unsupported_field_record_count = sum(
+        bool(set(record) - APT_INDEX_TARGET_FIELDS) for record in records
+    )
+    unresolved_candidate_fields = sum(
+        "$(" in value
+        for candidate in candidates for value in candidate.values()
+    )
+    # APT 2.8.3 can leave a format variable in an unrelated Translation target
+    # because that target has no Architecture option. Count this safely without
+    # treating the unrelated record as part of the pinned Packages decision.
+    unrelated_unresolved_count = sum(
+        any("$(" in value for value in record.values()) for record in unrelated
+    )
     trusted = row.get("trusted", "").lower()
     origin = row.get("origin", "")
     label = row.get("label", "")
@@ -648,8 +724,19 @@ def _apt_index_target_diagnostics(text: str, source: str,
     return {
         "target_record_count": min(len(records), 99),
         "target_record_count_capped": len(records) > 99,
+        "package_candidate_count": min(len(candidates), 99),
+        "package_candidate_count_capped": len(candidates) > 99,
         "matching_ubuntu_updates_target_count": min(len(matches), 99),
         "matching_ubuntu_updates_target_count_capped": len(matches) > 99,
+        "unrelated_target_record_count": min(len(unrelated), 99),
+        "unrelated_target_record_count_capped": len(unrelated) > 99,
+        "unrelated_unresolved_variable_record_count": min(unrelated_unresolved_count, 99),
+        "unrelated_unresolved_variable_record_count_capped": unrelated_unresolved_count > 99,
+        "unsupported_field_record_count": min(unsupported_field_record_count, 99),
+        "unsupported_field_record_count_capped": unsupported_field_record_count > 99,
+        "candidate_field_set_exact": set(row) == APT_INDEX_TARGET_FIELDS if row else False,
+        "candidate_unexpanded_field_count": min(unresolved_candidate_fields, 99),
+        "candidate_unexpanded_field_count_capped": unresolved_candidate_fields > 99,
         "trusted_state": trusted if trusted in {"yes", "no"} else ("other" if trusted else "missing"),
         "release_origin": "Ubuntu" if origin == "Ubuntu" else ("other" if origin else "missing"),
         "release_label": "Ubuntu" if label == "Ubuntu" else ("other" if label else "missing"),
@@ -667,9 +754,6 @@ def _apt_index_target_diagnostics(text: str, source: str,
 def _validate_signed_apt_index_target(text: str, source: str,
                                       transport: dict[str, Any]) -> dict[str, str]:
     diagnostics = _apt_index_target_diagnostics(text, source, transport)
-    if "$(" in text:
-        raise SetupFailure("apt_signed_release_target_unexpanded_format_variable",
-                           details={"apt_release_target_diagnostics": diagnostics})
     try:
         records = _parse_deb822_records(
             text, failure_code="apt_signed_release_target_record_invalid",
@@ -678,8 +762,23 @@ def _validate_signed_apt_index_target(text: str, source: str,
     except SetupFailure as exc:
         exc.details = {"apt_release_target_diagnostics": diagnostics}
         raise
-    if any(set(row) != APT_INDEX_TARGET_FIELDS for row in records):
+    if any(set(row) - APT_INDEX_TARGET_FIELDS for row in records):
         raise SetupFailure("apt_signed_release_target_record_fields_invalid",
+                           details={"apt_release_target_diagnostics": diagnostics})
+    # First identify the one pinned package-index record using stable selector
+    # fields. APT's supported --format output also includes unrelated target
+    # kinds (for example Translation-en); missing substitutions in those rows
+    # must not be mistaken for defects in the signed Packages target.
+    candidates = [row for row in records if _is_pinned_package_index_target(row)]
+    if len(candidates) != 1:
+        raise SetupFailure("apt_signed_release_target_missing_or_ambiguous",
+                           details={"apt_release_target_diagnostics": diagnostics})
+    row = candidates[0]
+    if set(row) != APT_INDEX_TARGET_FIELDS:
+        raise SetupFailure("apt_signed_release_target_record_fields_invalid",
+                           details={"apt_release_target_diagnostics": diagnostics})
+    if any("$(" in value for value in row.values()):
+        raise SetupFailure("apt_signed_release_target_unexpanded_format_variable",
                            details={"apt_release_target_diagnostics": diagnostics})
     if diagnostics["source_keyring_binding"] != "root_owned_source_stanza":
         raise SetupFailure("apt_signed_release_source_keyring_binding_missing",
@@ -694,19 +793,13 @@ def _validate_signed_apt_index_target(text: str, source: str,
         allowed_repositories.update(
             value for value in transport.get("_mirror_uris", ())
             if isinstance(value, str) and _canonical_archive_uri(value))
-    matches = [row for row in records
-               if row.get("identifier") == "Packages"
-               and row.get("metakey") == "main/binary-amd64/Packages"
-               and row.get("target-of") == "deb"
-               and row.get("architecture") == "amd64"
-               and row.get("component") == "main"
-               and row.get("suite") == "noble-updates"
-               and row.get("repo-uri", "").rstrip("/") in
-               {value.rstrip("/") for value in allowed_repositories}]
-    if len(matches) != 1:
+    if (row.get("architecture") != "amd64"
+            or row.get("component") != "main"
+            or row.get("suite") != "noble-updates"
+            or row.get("repo-uri", "").rstrip("/") not in
+            {value.rstrip("/") for value in allowed_repositories}):
         raise SetupFailure("apt_signed_release_target_missing_or_ambiguous",
                            details={"apt_release_target_diagnostics": diagnostics})
-    row = matches[0]
     repository_uri = row["repo-uri"].rstrip("/")
     expected_index_uri = (
         repository_uri + "/dists/noble-updates/" + row["metakey"]

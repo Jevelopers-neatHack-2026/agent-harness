@@ -6,6 +6,7 @@ import copy
 from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
+import itertools
 import json
 import os
 import platform
@@ -1279,6 +1280,67 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(evidence["_source_uri"], profile_setup.APT_MIRROR_URI)
         self.assertNotIn("username", json.dumps(evidence))
 
+    def test_native_profile_setup_accepts_exact_component_and_archive_suite_sets_in_any_order(self) -> None:
+        expected_components = profile_setup.APT_RUNNER_COMPONENTS
+        for permutation in itertools.permutations(expected_components):
+            with self.subTest(components=permutation):
+                source = SYNTHETIC_UBUNTU_SOURCES.replace(
+                    "Components: " + " ".join(expected_components),
+                    "Components: " + " ".join(permutation),
+                ).encode("utf-8")
+                evidence = profile_setup._validate_runner_mirror_configuration(
+                    source, profile_setup.APT_MIRRORLIST_BYTES)
+                self.assertEqual(evidence["source_layout"], "noble_archive_security_split")
+                records = profile_setup._parse_deb822_records(
+                    source.decode("utf-8"),
+                    failure_code="synthetic_source_invalid",
+                    max_bytes=64 * 1024,
+                )
+                diagnostics = profile_setup._runner_source_layout_diagnostics(records, source)
+                self.assertEqual(diagnostics["exact_component_set_stanza_count"], 2)
+                expected_order_class = (
+                    "canonical" if permutation == expected_components else "permutation")
+                self.assertEqual(
+                    diagnostics["component_order_class_counts"][expected_order_class], 2)
+
+        for permutation in itertools.permutations(profile_setup.APT_RUNNER_ARCHIVE_SUITES):
+            with self.subTest(archive_suites=permutation):
+                source = SYNTHETIC_UBUNTU_SOURCES.replace(
+                    "Suites: " + " ".join(profile_setup.APT_RUNNER_ARCHIVE_SUITES),
+                    "Suites: " + " ".join(permutation),
+                ).encode("utf-8")
+                evidence = profile_setup._validate_runner_mirror_configuration(
+                    source, profile_setup.APT_MIRRORLIST_BYTES)
+                self.assertEqual(evidence["source_layout"], "noble_archive_security_split")
+
+    def test_native_profile_setup_component_diagnostics_are_allowlisted_and_distinguish_bad_sets(self) -> None:
+        cases = (
+            ("main main universe multiverse", 0, 2),
+            ("main restricted universe", 0, 0),
+            ("main restricted universe multiverse private-component", 2, 0),
+        )
+        for components, expected_unknown, expected_duplicates in cases:
+            with self.subTest(components=components), self.assertRaises(profile_setup.SetupFailure) as raised:
+                source = SYNTHETIC_UBUNTU_SOURCES.replace(
+                    "Components: main restricted universe multiverse",
+                    "Components: " + components,
+                ).encode("utf-8")
+                profile_setup._validate_runner_mirror_configuration(
+                    source, profile_setup.APT_MIRRORLIST_BYTES)
+            details = raised.exception.details
+            self.assertEqual(details["exact_component_set_stanza_count"], 0)
+            self.assertEqual(details["component_unknown_token_count"], expected_unknown)
+            self.assertEqual(details["component_duplicate_token_count"], expected_duplicates)
+            self.assertEqual(details["component_order_class_counts"]["invalid"], 2)
+            rendered = json.dumps(details, sort_keys=True)
+            self.assertNotIn("private-component", rendered)
+            self.assertEqual(len(details["component_stanza_diagnostics"]), 2)
+            for stanza in details["component_stanza_diagnostics"]:
+                self.assertEqual(
+                    set(stanza["allowed_component_counts"]),
+                    set(profile_setup.APT_RUNNER_COMPONENTS),
+                )
+
     def test_native_profile_setup_rejects_untrusted_or_changed_runner_mirror_configuration(self) -> None:
         bad_sources = (
             SYNTHETIC_UBUNTU_SOURCES.replace("noble-updates", "noble-proposed"),
@@ -1378,6 +1440,35 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             self.assertEqual(evidence["architecture"], "amd64")
             self.assertEqual(evidence["signed_by"], str(profile_setup.UBUNTU_ARCHIVE_KEYRING))
 
+    def test_native_profile_setup_filters_unrelated_supported_index_target_records(self) -> None:
+        transport = synthetic_apt_transport()
+        source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
+        package_target = synthetic_apt_index_target()
+        translation_target = synthetic_apt_index_target(**{
+            "Identifier": "Translations",
+            "MetaKey": "main/i18n/Translation-en",
+            "Architecture": "$(ARCHITECTURE)",
+            "URI": (profile_setup.APT_MIRROR_URI.rstrip("/")
+                    + "/dists/noble-updates/main/i18n/Translation-en"),
+        })
+        contents_target = synthetic_apt_index_target(**{
+            "Identifier": "Contents-deb",
+            "MetaKey": "main/Contents-amd64",
+            "URI": (profile_setup.APT_MIRROR_URI.rstrip("/")
+                    + "/dists/noble-updates/main/Contents-amd64"),
+        })
+        combined = translation_target + contents_target + package_target
+        evidence = profile_setup._validate_signed_apt_index_target(
+            combined, source, transport)
+        self.assertEqual(evidence["target"], "Packages/main/binary-amd64")
+        diagnostics = profile_setup._apt_index_target_diagnostics(combined, source, transport)
+        self.assertEqual(diagnostics["target_record_count"], 3)
+        self.assertEqual(diagnostics["package_candidate_count"], 1)
+        self.assertEqual(diagnostics["matching_ubuntu_updates_target_count"], 1)
+        self.assertEqual(diagnostics["unrelated_target_record_count"], 2)
+        self.assertEqual(diagnostics["unrelated_unresolved_variable_record_count"], 1)
+        self.assertEqual(diagnostics["candidate_unexpanded_field_count"], 0)
+
     def test_native_profile_setup_rejects_untrusted_or_ambiguous_apt_release_targets(self) -> None:
         transport = synthetic_apt_transport()
         source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
@@ -1400,6 +1491,16 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         with self.assertRaisesRegex(profile_setup.SetupFailure,
                                     "apt_signed_release_target_missing_or_ambiguous"):
             profile_setup._validate_signed_apt_index_target(duplicate, source, transport)
+        missing_candidate_field = synthetic_apt_index_target().replace(
+            "Architecture: amd64\n", "")
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_target_record_fields_invalid"):
+            profile_setup._validate_signed_apt_index_target(
+                missing_candidate_field, source, transport)
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_target_unexpanded_format_variable"):
+            profile_setup._validate_signed_apt_index_target(
+                synthetic_apt_index_target(Architecture="$(ARCHITECTURE)"), source, transport)
         with self.assertRaises(profile_setup.SetupFailure) as raised:
             profile_setup._validate_signed_apt_index_target(
                 synthetic_apt_index_target().replace("Trusted: yes", "Trusted: no"),
@@ -1502,8 +1603,20 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
             "APT-Sources: https://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages\n"
         )
-        index_targets = synthetic_apt_index_target(
+        package_target = synthetic_apt_index_target(
             "https://azure.archive.ubuntu.com/ubuntu/")
+        translation_target = synthetic_apt_index_target(**{
+            "Identifier": "Translations",
+            "MetaKey": "main/i18n/Translation-en",
+            "Architecture": "$(ARCHITECTURE)",
+            "URI": "https://azure.archive.ubuntu.com/ubuntu/dists/noble-updates/main/i18n/Translation-en",
+        })
+        other_target = synthetic_apt_index_target(**{
+            "Identifier": "Contents-deb",
+            "MetaKey": "main/Contents-amd64",
+            "URI": "https://azure.archive.ubuntu.com/ubuntu/dists/noble-updates/main/Contents-amd64",
+        })
+        index_targets = translation_target + other_target + package_target
         with mock.patch.object(profile_setup, "_command", side_effect=[
                 (metadata.encode(), b""), (source_record.encode(), b""),
                 (index_targets.encode(), b"")]) as command:
@@ -1943,7 +2056,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         with self.assertRaisesRegex(profile_setup.SetupFailure,
                                     "apt_signed_release_target_unexpanded_format_variable"):
             profile_setup._validate_signed_apt_index_target(
-                synthetic_apt_index_target() + "$(SIGNED_BY)\n", source,
+                synthetic_apt_index_target(Architecture="$(SIGNED_BY)"), source,
                 synthetic_apt_transport())
         missing = synthetic_apt_transport()
         missing["ubuntu_archive_keyring_sha256"] = "unverified"
