@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: .node-version
@@ -26,10 +28,16 @@ jobs:
         run: |
           mkdir -p .runtime-artifacts
           npm test > .runtime-artifacts/runtime-foundation.tap
-      - name: Upload sanitized test trace
+      - name: Produce revision-bound JEV offline evidence
+        run: make verify CASE=ACV1-AH05 MODE=mock FIXTURE=jev-phase-b-offline
+      - name: Upload sanitized test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: runtime-foundation-node22
-          path: .runtime-artifacts/runtime-foundation.tap
+          name: runtime-foundation-and-jev-node22
+          path: |
+            .runtime-artifacts/runtime-foundation.tap
+            .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.tap
+            .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.json
+            .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.json.sha256
           if-no-files-found: warn

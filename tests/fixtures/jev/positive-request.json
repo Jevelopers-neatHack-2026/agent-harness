@@ -1,0 +1,42 @@
+{
+  "model": "jev-1.13.0",
+  "state": {
+    "ticket": "Synthetic fixture only: delivery was late and the customer asks for help.",
+    "channel": "email"
+  },
+  "questions": {
+    "routing": {
+      "type": "choice",
+      "instructions": "Which synthetic queue best matches the ticket?",
+      "criteria": {
+        "support": "Questions or a request for help",
+        "shipping": "Delivery status, delays, or missing packages",
+        "billing": "Charges, invoices, or payment problems"
+      }
+    },
+    "impact": {
+      "type": "score",
+      "instructions": {
+        "question": "Rate impact using only the synthetic ticket.",
+        "scale_note": "This rubric is fixture data, not a routing threshold."
+      },
+      "criteria": [
+        { "label": "low", "examples": ["minor inconvenience"] },
+        { "label": "medium", "examples": ["workaround exists"] },
+        { "label": "high", "examples": ["blocking issue"] }
+      ]
+    },
+    "noul_no": {
+      "type": "noul",
+      "instructions": "Is this synthetic ticket asking for a refund?"
+    },
+    "noul_uncertain": {
+      "type": "noul",
+      "instructions": "Does this synthetic ticket explicitly request an exchange?"
+    },
+    "noul_yes": {
+      "type": "noul",
+      "instructions": "Does this synthetic ticket ask for help?"
+    }
+  }
+}

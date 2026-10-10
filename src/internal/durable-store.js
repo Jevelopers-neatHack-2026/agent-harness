@@ -1,15 +1,27 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { types as utilTypes } from 'node:util';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { RuntimeError, runtimeError } from './errors.js';
 
-export const INTERNAL_SCHEMA_VERSION = 4;
+export const INTERNAL_SCHEMA_VERSION = 5;
 const CHECKPOINT_SCHEMA_VERSION = 2;
 const MAX_CHECKPOINT_DEPTH = 128;
 const MAX_CHECKPOINT_NODES = 10_000;
 const MAX_CHECKPOINT_SOURCE_UNITS = 256 * 1024;
 const MAX_CHECKPOINT_SERIALIZED_BYTES = 1024 * 1024;
+const MAX_JEV_OBSERVATION_PAGE_SIZE = 100;
+const JEV_MODEL_ID = 'jev-1.13.0';
+const SAFE_OPAQUE_REF = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const SAFE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const SAFE_PROVIDER_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const JEV_UNKNOWN_REASONS = new Set([
+  'not_dispatched',
+  'possible_dispatch',
+  'missing_or_invalid_usage',
+  'recovered_after_crash'
+]);
 const INVALID_CHECKPOINT_INPUT = Symbol('invalid checkpoint input');
 const STATES = new Set([
   'queued',
@@ -151,6 +163,191 @@ function serializeCheckpoint(data, operation) {
   } catch {
     fail(operation, 'INVALID_INPUT', 'Checkpoint data is invalid or exceeds the supported size and structure limits.');
   }
+}
+
+function readOwnDataRecord(value, allowedKeys, operation, requiredKeys = allowedKeys) {
+  if (value === null || typeof value !== 'object') {
+    fail(operation, 'INVALID_INPUT', 'The provider observation is invalid or exceeds its safety bounds.');
+  }
+  try {
+    if (utilTypes.isProxy(value) || Array.isArray(value)) {
+      fail(operation, 'INVALID_INPUT', 'The provider observation is invalid or exceeds its safety bounds.');
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      fail(operation, 'INVALID_INPUT', 'The provider observation is invalid or exceeds its safety bounds.');
+    }
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > allowedKeys.length
+        || keys.some(key => typeof key !== 'string' || !allowedKeys.includes(key))) {
+      fail(operation, 'INVALID_INPUT', 'The provider observation is invalid or exceeds its safety bounds.');
+    }
+    const result = Object.create(null);
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) {
+        fail(operation, 'INVALID_INPUT', 'The provider observation is invalid or exceeds its safety bounds.');
+      }
+      result[key] = descriptor.value;
+    }
+    if (requiredKeys.some(key => !Object.hasOwn(result, key))) {
+      fail(operation, 'INVALID_INPUT', 'The provider observation is invalid or exceeds its safety bounds.');
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof RuntimeError) throw error;
+    fail(operation, 'INVALID_INPUT', 'The provider observation is invalid or exceeds its safety bounds.');
+  }
+}
+
+function safeJevObservationInput(input, operation) {
+  const fields = readOwnDataRecord(input, [
+    'workflowId', 'attemptId', 'logicalOperationRef', 'transportAttemptId',
+    'sourceObservationRef', 'dispatchCertainty', 'requestedModel', 'resolvedModel',
+    'providerRequestId', 'decisionConformance', 'usage'
+  ], operation);
+  for (const key of [
+    'workflowId', 'attemptId', 'logicalOperationRef', 'transportAttemptId', 'sourceObservationRef'
+  ]) {
+    if (typeof fields[key] !== 'string' || !SAFE_OPAQUE_REF.test(fields[key])) {
+      fail(operation, 'INVALID_INPUT', 'A provider observation identity is invalid.');
+    }
+  }
+  if (fields.requestedModel !== JEV_MODEL_ID
+      || (fields.resolvedModel !== null
+        && (typeof fields.resolvedModel !== 'string' || !SAFE_MODEL_ID.test(fields.resolvedModel)))
+      || (fields.providerRequestId !== null
+        && (typeof fields.providerRequestId !== 'string' || !SAFE_PROVIDER_REQUEST_ID.test(fields.providerRequestId)))) {
+    fail(operation, 'INVALID_INPUT', 'A provider model or request identity is invalid.');
+  }
+  if (!['not_dispatched', 'possible', 'response_received'].includes(fields.dispatchCertainty)
+      || !['valid', 'invalid', 'unavailable'].includes(fields.decisionConformance)) {
+    fail(operation, 'INVALID_INPUT', 'The provider observation classification is invalid.');
+  }
+
+  const usageFields = readOwnDataRecord(
+    fields.usage,
+    ['kind', 'inputTokens', 'outputTokens', 'reason'],
+    operation,
+    ['kind']
+  );
+  let usage;
+  if (usageFields.kind === 'known') {
+    if (Object.keys(usageFields).length !== 3
+        || !Object.hasOwn(usageFields, 'inputTokens')
+        || !Object.hasOwn(usageFields, 'outputTokens')
+        || Object.hasOwn(usageFields, 'reason')
+        || !Number.isSafeInteger(usageFields.inputTokens) || usageFields.inputTokens < 0
+        || !Number.isSafeInteger(usageFields.outputTokens) || usageFields.outputTokens < 0
+        || fields.dispatchCertainty !== 'response_received') {
+      fail(operation, 'INVALID_INPUT', 'Known provider token usage is invalid.');
+    }
+    usage = Object.freeze({
+      kind: 'known',
+      inputTokens: usageFields.inputTokens,
+      outputTokens: usageFields.outputTokens
+    });
+  } else if (usageFields.kind === 'unknown') {
+    if (Object.keys(usageFields).length !== 2
+        || !Object.hasOwn(usageFields, 'reason')
+        || Object.hasOwn(usageFields, 'inputTokens')
+        || Object.hasOwn(usageFields, 'outputTokens')
+        || typeof usageFields.reason !== 'string'
+        || !JEV_UNKNOWN_REASONS.has(usageFields.reason)) {
+      fail(operation, 'INVALID_INPUT', 'Unknown provider token usage requires an explicit supported reason.');
+    }
+    const validUnknownReason = fields.dispatchCertainty === 'not_dispatched'
+      ? usageFields.reason === 'not_dispatched'
+      : fields.dispatchCertainty === 'possible'
+        ? ['possible_dispatch', 'recovered_after_crash'].includes(usageFields.reason)
+        : usageFields.reason === 'missing_or_invalid_usage';
+    if (!validUnknownReason) {
+      fail(operation, 'INVALID_INPUT', 'The unknown usage reason conflicts with the dispatch evidence.');
+    }
+    usage = Object.freeze({ kind: 'unknown', reason: usageFields.reason });
+  } else {
+    fail(operation, 'INVALID_INPUT', 'The provider usage classification is invalid.');
+  }
+
+  if (fields.decisionConformance === 'valid'
+      && (fields.dispatchCertainty !== 'response_received'
+        || usage.kind !== 'known'
+        || fields.resolvedModel !== fields.requestedModel)) {
+    fail(operation, 'INVALID_INPUT', 'A conforming provider decision requires a matching model and known usage.');
+  }
+  if (fields.dispatchCertainty === 'not_dispatched'
+      && fields.decisionConformance === 'valid') {
+    fail(operation, 'INVALID_INPUT', 'A non-dispatched provider attempt cannot contain a conforming decision.');
+  }
+
+  return Object.freeze({
+    workflowId: fields.workflowId,
+    attemptId: fields.attemptId,
+    logicalOperationRef: fields.logicalOperationRef,
+    transportAttemptId: fields.transportAttemptId,
+    sourceObservationRef: fields.sourceObservationRef,
+    dispatchCertainty: fields.dispatchCertainty,
+    requestedModel: fields.requestedModel,
+    resolvedModel: fields.resolvedModel,
+    providerRequestId: fields.providerRequestId,
+    decisionConformance: fields.decisionConformance,
+    usage
+  });
+}
+
+function observationFingerprint(observation) {
+  return digest(JSON.stringify([
+    observation.sourceObservationRef,
+    observation.workflowId,
+    observation.logicalOperationRef,
+    observation.attemptId,
+    observation.transportAttemptId,
+    observation.dispatchCertainty,
+    observation.requestedModel,
+    observation.resolvedModel,
+    observation.providerRequestId,
+    observation.decisionConformance,
+    observation.usage.kind,
+    observation.usage.kind === 'known'
+      ? observation.usage.inputTokens
+      : observation.usage.reason,
+    observation.usage.kind === 'known' ? observation.usage.outputTokens : null
+  ]));
+}
+
+function mapJevObservation(row) {
+  if (!row) return null;
+  const usage = row.usage_kind === 'known'
+    ? Object.freeze({
+        kind: 'known',
+        inputTokens: Number(row.input_tokens),
+        outputTokens: Number(row.output_tokens)
+      })
+    : Object.freeze({ kind: 'unknown', reason: row.unknown_reason });
+  const observation = {
+    schema: 'agent-harness.jev.local-usage-observation.v1',
+    sourceObservationRef: row.source_observation_ref,
+    workflowId: row.workflow_id,
+    logicalOperationRef: row.logical_operation_ref,
+    attemptId: row.attempt_id,
+    transportAttemptId: row.transport_attempt_id,
+    dispatchCertainty: row.dispatch_certainty,
+    requestedModel: row.requested_model,
+    resolvedModel: row.resolved_model,
+    providerRequestId: row.provider_request_id,
+    decisionConformance: row.decision_conformance,
+    usage,
+    eventId: row.event_id,
+    eventSequence: Number(row.event_sequence),
+    recordedAtMs: Number(row.recorded_at_ms)
+  };
+  if (observation.eventId !== 'jev-local-observation-v1:' + digest(observation.sourceObservationRef)
+      || observationFingerprint(observation) !== row.fingerprint
+      || !Number.isSafeInteger(observation.eventSequence)
+      || !Number.isSafeInteger(observation.recordedAtMs)) {
+    throw new Error('invalid provider observation row');
+  }
+  return Object.freeze(observation);
 }
 
 function digest(bytes) {
@@ -333,6 +530,133 @@ function createTelemetryCursorSchema(db) {
   `);
 }
 
+function createJevObservationSchema(db) {
+  db.exec(`
+    CREATE TABLE jev_dispatch_markers (
+      transport_attempt_id TEXT PRIMARY KEY REFERENCES transport_attempts(transport_attempt_id),
+      attempt_id TEXT NOT NULL REFERENCES operation_attempts(attempt_id),
+      workflow_id TEXT NOT NULL REFERENCES workflows(workflow_id),
+      logical_operation_ref TEXT NOT NULL,
+      event_id TEXT NOT NULL UNIQUE REFERENCES workflow_events(event_id),
+      event_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_events(sequence),
+      created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TRIGGER jev_dispatch_markers_validate_identity
+      BEFORE INSERT ON jev_dispatch_markers BEGIN
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1
+          FROM operation_attempts a
+          JOIN transport_attempts t ON t.attempt_id = a.attempt_id
+          JOIN workflows w ON w.workflow_id = a.workflow_id
+          WHERE a.attempt_id = NEW.attempt_id
+            AND t.transport_attempt_id = NEW.transport_attempt_id
+            AND a.workflow_id = NEW.workflow_id
+            AND a.logical_operation_ref = NEW.logical_operation_ref
+            AND a.state = 'intent'
+            AND w.state = 'awaiting_response'
+            AND w.cancellation_requested = 0
+        ) THEN RAISE(ABORT, 'JEV dispatch marker identity mismatch') END;
+      END;
+    CREATE TRIGGER jev_dispatch_markers_no_update
+      BEFORE UPDATE ON jev_dispatch_markers BEGIN SELECT RAISE(ABORT, 'JEV dispatch markers are immutable'); END;
+    CREATE TRIGGER jev_dispatch_markers_no_delete
+      BEFORE DELETE ON jev_dispatch_markers BEGIN SELECT RAISE(ABORT, 'JEV dispatch markers are immutable'); END;
+
+    CREATE TABLE jev_provider_observations (
+      source_observation_ref TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL REFERENCES workflows(workflow_id),
+      logical_operation_ref TEXT NOT NULL,
+      attempt_id TEXT NOT NULL REFERENCES operation_attempts(attempt_id),
+      transport_attempt_id TEXT NOT NULL REFERENCES transport_attempts(transport_attempt_id),
+      dispatch_certainty TEXT NOT NULL CHECK (dispatch_certainty IN ('not_dispatched','possible','response_received')),
+      requested_model TEXT NOT NULL CHECK (requested_model = 'jev-1.13.0'),
+      resolved_model TEXT,
+      provider_request_id TEXT,
+      decision_conformance TEXT NOT NULL CHECK (decision_conformance IN ('valid','invalid','unavailable')),
+      usage_kind TEXT NOT NULL CHECK (usage_kind IN ('known','unknown')),
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      unknown_reason TEXT,
+      event_id TEXT NOT NULL UNIQUE REFERENCES workflow_events(event_id),
+      event_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_events(sequence),
+      fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
+      recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+      CHECK (
+        (usage_kind = 'known' AND input_tokens IS NOT NULL AND input_tokens >= 0
+          AND output_tokens IS NOT NULL AND output_tokens >= 0 AND unknown_reason IS NULL
+          AND dispatch_certainty = 'response_received')
+        OR
+        (usage_kind = 'unknown' AND input_tokens IS NULL AND output_tokens IS NULL
+          AND unknown_reason IS NOT NULL
+          AND (
+            (dispatch_certainty = 'not_dispatched' AND unknown_reason = 'not_dispatched')
+            OR (dispatch_certainty = 'possible' AND unknown_reason IN ('possible_dispatch','recovered_after_crash'))
+            OR (dispatch_certainty = 'response_received' AND unknown_reason = 'missing_or_invalid_usage')
+          ))
+      ),
+      CHECK (decision_conformance != 'valid'
+        OR (dispatch_certainty = 'response_received' AND usage_kind = 'known'
+          AND resolved_model = requested_model))
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE INDEX jev_provider_observations_attempt_transport_idx
+      ON jev_provider_observations (attempt_id, transport_attempt_id, recorded_at_ms);
+
+    CREATE TRIGGER jev_provider_observations_validate_identity
+      BEFORE INSERT ON jev_provider_observations BEGIN
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1
+          FROM operation_attempts a
+          JOIN transport_attempts t ON t.attempt_id = a.attempt_id
+          WHERE a.attempt_id = NEW.attempt_id
+            AND t.transport_attempt_id = NEW.transport_attempt_id
+            AND a.workflow_id = NEW.workflow_id
+            AND a.logical_operation_ref = NEW.logical_operation_ref
+        ) THEN RAISE(ABORT, 'JEV provider observation identity mismatch') END;
+        SELECT CASE WHEN NEW.dispatch_certainty IN ('possible','response_received')
+          AND NOT EXISTS (
+            SELECT 1 FROM jev_dispatch_markers m
+            WHERE m.attempt_id = NEW.attempt_id
+              AND m.transport_attempt_id = NEW.transport_attempt_id
+              AND m.workflow_id = NEW.workflow_id
+          )
+          THEN RAISE(ABORT, 'JEV provider observation has no durable dispatch marker') END;
+      END;
+    CREATE TRIGGER jev_provider_observations_no_update
+      BEFORE UPDATE ON jev_provider_observations BEGIN SELECT RAISE(ABORT, 'JEV provider observations are immutable'); END;
+    CREATE TRIGGER jev_provider_observations_no_delete
+      BEFORE DELETE ON jev_provider_observations BEGIN SELECT RAISE(ABORT, 'JEV provider observations are immutable'); END;
+
+    CREATE TABLE jev_local_observation_outbox (
+      event_id TEXT PRIMARY KEY REFERENCES workflow_events(event_id),
+      event_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_events(sequence),
+      source_observation_ref TEXT NOT NULL UNIQUE REFERENCES jev_provider_observations(source_observation_ref),
+      delivered_at_ms INTEGER CHECK (delivered_at_ms IS NULL OR delivered_at_ms >= 0)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TRIGGER jev_local_observation_outbox_validate_identity
+      BEFORE INSERT ON jev_local_observation_outbox BEGIN
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM jev_provider_observations o
+          WHERE o.source_observation_ref = NEW.source_observation_ref
+            AND o.event_id = NEW.event_id
+            AND o.event_sequence = NEW.event_sequence
+        ) THEN RAISE(ABORT, 'JEV local outbox identity mismatch') END;
+      END;
+    CREATE TRIGGER jev_local_observation_outbox_no_identity_update
+      BEFORE UPDATE ON jev_local_observation_outbox
+      WHEN NEW.event_id != OLD.event_id
+        OR NEW.event_sequence != OLD.event_sequence
+        OR NEW.source_observation_ref != OLD.source_observation_ref
+        OR OLD.delivered_at_ms IS NOT NULL
+        OR NEW.delivered_at_ms IS NULL
+      BEGIN SELECT RAISE(ABORT, 'JEV local outbox identity is immutable'); END;
+    CREATE TRIGGER jev_local_observation_outbox_no_delete
+      BEFORE DELETE ON jev_local_observation_outbox BEGIN SELECT RAISE(ABORT, 'JEV local outbox is immutable'); END;
+  `);
+}
+
 function readUserVersion(db) {
   return Number(db.prepare('PRAGMA user_version').get().user_version);
 }
@@ -357,78 +681,77 @@ function appendMigrationEvent(db, workflowId, state, revision, occurredAtMs) {
 }
 
 function migrateV1ToV4(db) {
-  inTransaction(db, 'migrateV1ToV4', () => {
-    db.exec('ALTER TABLE workflows RENAME TO workflows_v1');
-    createSchemaV3(db);
-    const oldRows = db.prepare('SELECT * FROM workflows_v1 ORDER BY workflow_id').all();
-    const insertWorkflow = db.prepare(`
-      INSERT INTO workflows (
-        workflow_id, state, revision, fence_token, lease_owner, lease_expires_ms,
-        checkpoint_sequence, cancellation_requested, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, 0, NULL, NULL, 1, 0, ?, ?)
-    `);
-    const insertCheckpoint = db.prepare(`
-      INSERT INTO workflow_checkpoints (
-        workflow_id, sequence, schema_version, payload_json, sha256, revision, created_at_ms
-      ) VALUES (?, 1, ?, ?, ?, ?, ?)
-    `);
-    for (const row of oldRows) {
-      const workflowId = String(row.workflow_id);
-      const state = String(row.state);
-      const revision = Number(row.revision);
-      const createdAtMs = Number(row.created_at_ms);
-      const updatedAtMs = Number(row.updated_at_ms);
-      if (!STATES.has(state) || !Number.isSafeInteger(revision) || revision < 0) {
-        fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
-      }
-      if (
-        typeof row.checkpoint_json !== 'string'
-        || Buffer.byteLength(row.checkpoint_json, 'utf8') > MAX_CHECKPOINT_SERIALIZED_BYTES
-      ) {
-        fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
-      }
-      let parsed;
-      try {
-        parsed = JSON.parse(row.checkpoint_json);
-      } catch {
-        fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
-      }
-      if (!isRecord(parsed)) {
-        fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
-      }
-      let checkpointPayload;
-      try {
-        checkpointPayload = serializeCheckpoint(parsed, 'migrateV1ToV3');
-      } catch {
-        fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
-      }
-      const created = Number.isSafeInteger(createdAtMs) ? createdAtMs : updatedAtMs;
-      const updated = Number.isSafeInteger(updatedAtMs) ? updatedAtMs : created;
-      insertWorkflow.run(workflowId, state, revision, created, updated);
-      insertCheckpoint.run(workflowId, CHECKPOINT_SCHEMA_VERSION, checkpointPayload, digest(checkpointPayload), revision, updated);
-      appendMigrationEvent(db, workflowId, state, revision, updated);
+  db.exec('ALTER TABLE workflows RENAME TO workflows_v1');
+  createSchemaV3(db);
+  const oldRows = db.prepare('SELECT * FROM workflows_v1 ORDER BY workflow_id').all();
+  const insertWorkflow = db.prepare(`
+    INSERT INTO workflows (
+      workflow_id, state, revision, fence_token, lease_owner, lease_expires_ms,
+      checkpoint_sequence, cancellation_requested, created_at_ms, updated_at_ms
+    ) VALUES (?, ?, ?, 0, NULL, NULL, 1, 0, ?, ?)
+  `);
+  const insertCheckpoint = db.prepare(`
+    INSERT INTO workflow_checkpoints (
+      workflow_id, sequence, schema_version, payload_json, sha256, revision, created_at_ms
+    ) VALUES (?, 1, ?, ?, ?, ?, ?)
+  `);
+  for (const row of oldRows) {
+    const workflowId = String(row.workflow_id);
+    const state = String(row.state);
+    const revision = Number(row.revision);
+    const createdAtMs = Number(row.created_at_ms);
+    const updatedAtMs = Number(row.updated_at_ms);
+    if (!STATES.has(state) || !Number.isSafeInteger(revision) || revision < 0) {
+      fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
     }
-    db.exec('DROP TABLE workflows_v1');
-    createTelemetryCursorSchema(db);
-    db.exec('PRAGMA user_version = 4');
-  });
+    if (
+      typeof row.checkpoint_json !== 'string'
+      || Buffer.byteLength(row.checkpoint_json, 'utf8') > MAX_CHECKPOINT_SERIALIZED_BYTES
+    ) {
+      fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(row.checkpoint_json);
+    } catch {
+      fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
+    }
+    if (!isRecord(parsed)) {
+      fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
+    }
+    let checkpointPayload;
+    try {
+      checkpointPayload = serializeCheckpoint(parsed, 'migrateV1ToV3');
+    } catch {
+      fail('migrateV1ToV3', 'CHECKPOINT_CORRUPT', 'The legacy checkpoint cannot be migrated safely.');
+    }
+    const created = Number.isSafeInteger(createdAtMs) ? createdAtMs : updatedAtMs;
+    const updated = Number.isSafeInteger(updatedAtMs) ? updatedAtMs : created;
+    insertWorkflow.run(workflowId, state, revision, created, updated);
+    insertCheckpoint.run(workflowId, CHECKPOINT_SCHEMA_VERSION, checkpointPayload, digest(checkpointPayload), revision, updated);
+    appendMigrationEvent(db, workflowId, state, revision, updated);
+  }
+  db.exec('DROP TABLE workflows_v1');
+  createTelemetryCursorSchema(db);
+  db.exec('PRAGMA user_version = 4');
 }
 
 function migrateV2ToV4(db) {
-  inTransaction(db, 'migrateV2ToV4', () => {
-    // Existing receipts have no proof binding their proposed checkpoint bytes.
-    // Leave them NULL: they remain readable, but reconciliation fails closed.
-    db.exec('ALTER TABLE response_receipts ADD COLUMN next_checkpoint_sha256 TEXT');
-    createTelemetryCursorSchema(db);
-    db.exec('PRAGMA user_version = 4');
-  });
+  // Existing receipts have no proof binding their proposed checkpoint bytes.
+  // Leave them NULL: they remain readable, but reconciliation fails closed.
+  db.exec('ALTER TABLE response_receipts ADD COLUMN next_checkpoint_sha256 TEXT');
+  createTelemetryCursorSchema(db);
+  db.exec('PRAGMA user_version = 4');
 }
 
 function migrateV3ToV4(db) {
-  inTransaction(db, 'migrateV3ToV4', () => {
-    createTelemetryCursorSchema(db);
-    db.exec('PRAGMA user_version = 4');
-  });
+  createTelemetryCursorSchema(db);
+  db.exec('PRAGMA user_version = 4');
+}
+
+function migrateV4ToV5(db) {
+  createJevObservationSchema(db);
+  db.exec('PRAGMA user_version = 5');
 }
 
 function initializeDatabase(db) {
@@ -443,7 +766,8 @@ function initializeDatabase(db) {
     inTransaction(db, 'initializeDatabase', () => {
       createSchemaV3(db);
       createTelemetryCursorSchema(db);
-      db.exec('PRAGMA user_version = 4');
+      createJevObservationSchema(db);
+      db.exec('PRAGMA user_version = 5');
     });
     return;
   }
@@ -452,11 +776,17 @@ function initializeDatabase(db) {
       "SELECT name FROM sqlite_master WHERE type='table' AND name='workflows'"
     ).get();
     if (!table) fail('initializeDatabase', 'CHECKPOINT_CORRUPT', 'The legacy workflow table is missing.');
-    migrateV1ToV4(db);
-  } else if (version === 2) {
-    migrateV2ToV4(db);
-  } else if (version === 3) {
-    migrateV3ToV4(db);
+  }
+  if (version >= 1 && version <= 4) {
+    inTransaction(db, 'initializeDatabase', () => {
+      if (version === 1) migrateV1ToV4(db);
+      else if (version === 2) migrateV2ToV4(db);
+      else if (version === 3) migrateV3ToV4(db);
+      if (readUserVersion(db) === 4) migrateV4ToV5(db);
+      if (readUserVersion(db) !== INTERNAL_SCHEMA_VERSION) {
+        fail('initializeDatabase', 'UNSUPPORTED_SCHEMA_VERSION', 'The durable store schema could not be upgraded safely.');
+      }
+    });
   }
 }
 
@@ -1117,6 +1447,113 @@ export class DurableWorkflowStore {
     });
   }
 
+  recordJevDispatchMarker(input) {
+    const operation = 'recordJevDispatchMarker';
+    const fields = readOwnDataRecord(input, [
+      'workflowId', 'ownerId', 'fence', 'expectedRevision', 'attemptId', 'transportAttemptId'
+    ], operation);
+    for (const key of ['workflowId', 'attemptId', 'transportAttemptId']) {
+      if (typeof fields[key] !== 'string' || !SAFE_OPAQUE_REF.test(fields[key])) {
+        fail(operation, 'INVALID_INPUT', 'A provider dispatch identity is invalid.');
+      }
+    }
+    if (typeof fields.ownerId !== 'string' || !SAFE_OPAQUE_REF.test(fields.ownerId)) {
+      fail(operation, 'INVALID_INPUT', 'A provider dispatch identity is invalid.');
+    }
+    expectInteger(fields.fence, 'fence', operation, 1);
+    expectInteger(fields.expectedRevision, 'expectedRevision', operation);
+    this.#assertOpen(operation);
+    return inTransaction(this.#db, operation, () => {
+      const row = this.#workflow(fields.workflowId, operation);
+      const now = this.#assertLease(row, { ownerId: fields.ownerId, fence: fields.fence }, operation);
+      this.#assertMutable(row, operation);
+      this.#assertRevision(row, fields.expectedRevision, operation);
+      if (row.state !== 'awaiting_response' || row.cancellation_requested) {
+        fail(operation, 'ATTEMPT_STATE_INVALID', 'A cancelled or inactive workflow cannot start a provider transport.');
+      }
+      const attempt = this.#db.prepare(`
+        SELECT a.attempt_id, a.workflow_id, a.logical_operation_ref, a.state,
+               t.transport_attempt_id
+        FROM operation_attempts a
+        JOIN transport_attempts t ON t.attempt_id = a.attempt_id
+        WHERE a.attempt_id = ? AND a.workflow_id = ? AND t.transport_attempt_id = ?
+      `).get(fields.attemptId, fields.workflowId, fields.transportAttemptId);
+      if (!attempt || attempt.state !== 'intent') {
+        fail(operation, 'ATTEMPT_STATE_INVALID', 'The provider transport is not bound to an open durable intent.');
+      }
+      const existing = this.#db.prepare(`
+        SELECT attempt_id, workflow_id, logical_operation_ref, event_id, event_sequence, created_at_ms
+        FROM jev_dispatch_markers WHERE transport_attempt_id = ?
+      `).get(fields.transportAttemptId);
+      if (existing) {
+        if (existing.attempt_id !== fields.attemptId || existing.workflow_id !== fields.workflowId
+            || existing.logical_operation_ref !== attempt.logical_operation_ref) {
+          fail(operation, 'IDEMPOTENCY_CONFLICT', 'The provider transport identity conflicts with its durable dispatch marker.');
+        }
+        return {
+          duplicate: true,
+          transportAttemptId: fields.transportAttemptId,
+          eventId: existing.event_id,
+          eventSequence: Number(existing.event_sequence),
+          revision: Number(row.revision)
+        };
+      }
+      const eventId = 'jev-dispatch-may-have-started:' + digest(fields.transportAttemptId);
+      this.#assertEventAvailable(eventId, operation);
+      const eventSequence = this.#appendEvent({
+        eventId,
+        workflowId: fields.workflowId,
+        revision: Number(row.revision),
+        type: 'jev_dispatch_may_have_started',
+        fromState: row.state,
+        toState: row.state,
+        fence: fields.fence,
+        atMs: now
+      });
+      this.#db.prepare(`
+        INSERT INTO jev_dispatch_markers (
+          transport_attempt_id, attempt_id, workflow_id, logical_operation_ref,
+          event_id, event_sequence, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        fields.transportAttemptId,
+        fields.attemptId,
+        fields.workflowId,
+        attempt.logical_operation_ref,
+        eventId,
+        eventSequence,
+        now
+      );
+      return { duplicate: false, transportAttemptId: fields.transportAttemptId, eventId, eventSequence, revision: Number(row.revision) };
+    });
+  }
+
+  getJevDispatchMarker(transportAttemptId) {
+    const operation = 'getJevDispatchMarker';
+    if (typeof transportAttemptId !== 'string' || !SAFE_OPAQUE_REF.test(transportAttemptId)) {
+      fail(operation, 'INVALID_INPUT', 'A provider transport identity is invalid.');
+    }
+    this.#assertOpen(operation);
+    try {
+      const row = this.#db.prepare(`
+        SELECT transport_attempt_id, attempt_id, workflow_id, logical_operation_ref,
+               event_id, event_sequence, created_at_ms
+        FROM jev_dispatch_markers WHERE transport_attempt_id = ?
+      `).get(transportAttemptId);
+      return row ? Object.freeze({
+        transportAttemptId: row.transport_attempt_id,
+        attemptId: row.attempt_id,
+        workflowId: row.workflow_id,
+        logicalOperationRef: row.logical_operation_ref,
+        eventId: row.event_id,
+        eventSequence: Number(row.event_sequence),
+        markedAtMs: Number(row.created_at_ms)
+      }) : null;
+    } catch (error) {
+      throw mapStorageError(operation, error);
+    }
+  }
+
   recordResponseReceipt({
     workflowId,
     ownerId,
@@ -1367,6 +1804,187 @@ export class DurableWorkflowStore {
         SELECT COUNT(*) AS count FROM attempt_observations WHERE attempt_id = ?
       `).get(attemptId).count;
       return { duplicate: false, observationCount: Number(count) };
+    });
+  }
+
+  recordJevProviderObservation(input) {
+    const operation = 'recordJevProviderObservation';
+    const observation = safeJevObservationInput(input, operation);
+    const fingerprint = observationFingerprint(observation);
+    const eventId = 'jev-local-observation-v1:' + digest(observation.sourceObservationRef);
+    this.#assertOpen(operation);
+    return inTransaction(this.#db, operation, () => {
+      const attempt = this.#db.prepare(`
+        SELECT a.attempt_id, a.workflow_id, a.logical_operation_ref,
+               t.transport_attempt_id
+        FROM operation_attempts a
+        JOIN transport_attempts t ON t.attempt_id = a.attempt_id
+        WHERE a.attempt_id = ? AND t.transport_attempt_id = ?
+      `).get(observation.attemptId, observation.transportAttemptId);
+      if (!attempt) fail(operation, 'ATTEMPT_NOT_FOUND', 'The provider observation attempt or transport does not exist.');
+      if (attempt.workflow_id !== observation.workflowId
+          || attempt.logical_operation_ref !== observation.logicalOperationRef) {
+        fail(operation, 'OBSERVATION_IDENTITY_CONFLICT', 'The provider observation identity conflicts with its durable attempt.');
+      }
+      if (['possible', 'response_received'].includes(observation.dispatchCertainty)
+          && !this.#db.prepare(`
+            SELECT 1 FROM jev_dispatch_markers
+            WHERE attempt_id = ? AND transport_attempt_id = ? AND workflow_id = ?
+          `).get(observation.attemptId, observation.transportAttemptId, observation.workflowId)) {
+        fail(operation, 'ATTEMPT_STATE_INVALID', 'A possible provider dispatch requires a durable pre-send marker.');
+      }
+      const previous = this.#db.prepare(`
+        SELECT fingerprint, event_id, event_sequence
+        FROM jev_provider_observations WHERE source_observation_ref = ?
+      `).get(observation.sourceObservationRef);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) {
+          fail(operation, 'OBSERVATION_IDENTITY_CONFLICT', 'The provider observation source identity conflicts with its prior record.');
+        }
+        return {
+          duplicate: true,
+          sourceObservationRef: observation.sourceObservationRef,
+          eventId: previous.event_id,
+          eventSequence: Number(previous.event_sequence)
+        };
+      }
+      this.#assertEventAvailable(eventId, operation);
+      const workflow = this.#workflow(observation.workflowId, operation);
+      const now = this.#now(operation);
+      const eventSequence = this.#appendEvent({
+        eventId,
+        workflowId: observation.workflowId,
+        revision: Number(workflow.revision),
+        type: 'jev_local_observation_recorded',
+        fromState: workflow.state,
+        toState: workflow.state,
+        fence: Number(workflow.fence_token),
+        atMs: now
+      });
+      this.#db.prepare(`
+        INSERT INTO jev_provider_observations (
+          source_observation_ref, workflow_id, logical_operation_ref, attempt_id,
+          transport_attempt_id, dispatch_certainty, requested_model, resolved_model,
+          provider_request_id, decision_conformance, usage_kind, input_tokens,
+          output_tokens, unknown_reason, event_id, event_sequence, fingerprint, recorded_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        observation.sourceObservationRef,
+        observation.workflowId,
+        observation.logicalOperationRef,
+        observation.attemptId,
+        observation.transportAttemptId,
+        observation.dispatchCertainty,
+        observation.requestedModel,
+        observation.resolvedModel,
+        observation.providerRequestId,
+        observation.decisionConformance,
+        observation.usage.kind,
+        observation.usage.kind === 'known' ? observation.usage.inputTokens : null,
+        observation.usage.kind === 'known' ? observation.usage.outputTokens : null,
+        observation.usage.kind === 'unknown' ? observation.usage.reason : null,
+        eventId,
+        eventSequence,
+        fingerprint,
+        now
+      );
+      this.#db.prepare(`
+        INSERT INTO jev_local_observation_outbox (
+          event_id, event_sequence, source_observation_ref, delivered_at_ms
+        ) VALUES (?, ?, ?, NULL)
+      `).run(eventId, eventSequence, observation.sourceObservationRef);
+      return {
+        duplicate: false,
+        sourceObservationRef: observation.sourceObservationRef,
+        eventId,
+        eventSequence
+      };
+    });
+  }
+
+  getJevProviderObservation(sourceObservationRef) {
+    const operation = 'getJevProviderObservation';
+    if (typeof sourceObservationRef !== 'string' || !SAFE_OPAQUE_REF.test(sourceObservationRef)) {
+      fail(operation, 'INVALID_INPUT', 'A provider observation identity is invalid.');
+    }
+    this.#assertOpen(operation);
+    try {
+      const row = this.#db.prepare(`
+        SELECT * FROM jev_provider_observations WHERE source_observation_ref = ?
+      `).get(sourceObservationRef);
+      if (!row) return null;
+      try {
+        return mapJevObservation(row);
+      } catch {
+        fail(operation, 'CHECKPOINT_CORRUPT', 'A durable provider observation failed its integrity check.');
+      }
+    } catch (error) {
+      throw mapStorageError(operation, error);
+    }
+  }
+
+  readJevObservationDeliveryPage(input) {
+    const operation = 'readJevObservationDeliveryPage';
+    const fields = input === undefined
+      ? Object.create(null)
+      : readOwnDataRecord(input, ['afterSequence', 'limit'], operation, []);
+    const afterSequence = fields.afterSequence === undefined ? 0 : fields.afterSequence;
+    const limit = fields.limit === undefined ? 50 : fields.limit;
+    expectInteger(afterSequence, 'afterSequence', operation);
+    expectInteger(limit, 'limit', operation, 1);
+    if (limit > MAX_JEV_OBSERVATION_PAGE_SIZE) {
+      fail(operation, 'INVALID_INPUT', 'The local provider observation page exceeds its supported record limit.');
+    }
+    this.#assertOpen(operation);
+    try {
+      const rows = this.#db.prepare(`
+        SELECT o.*, d.delivered_at_ms
+        FROM jev_local_observation_outbox d
+        JOIN jev_provider_observations o ON o.source_observation_ref = d.source_observation_ref
+        WHERE d.event_sequence > ? AND d.delivered_at_ms IS NULL
+        ORDER BY d.event_sequence
+        LIMIT ?
+      `).all(afterSequence, limit + 1);
+      const hasMore = rows.length > limit;
+      if (hasMore) rows.pop();
+      const items = rows.map(row => {
+        try {
+          return Object.freeze({
+            ...mapJevObservation(row),
+            deliveryIntent: 'local_only_not_finance_acceptance'
+          });
+        } catch {
+          fail(operation, 'CHECKPOINT_CORRUPT', 'A local provider observation failed its integrity check.');
+        }
+      });
+      return Object.freeze({
+        items: Object.freeze(items),
+        hasMore,
+        nextAfterSequence: items.length === 0 ? afterSequence : items.at(-1).eventSequence
+      });
+    } catch (error) {
+      throw mapStorageError(operation, error);
+    }
+  }
+
+  acknowledgeJevObservationDelivery(eventId) {
+    const operation = 'acknowledgeJevObservationDelivery';
+    if (typeof eventId !== 'string' || !SAFE_OPAQUE_REF.test(eventId)) {
+      fail(operation, 'INVALID_INPUT', 'A local provider delivery identity is invalid.');
+    }
+    this.#assertOpen(operation);
+    return inTransaction(this.#db, operation, () => {
+      const now = this.#now(operation);
+      const result = this.#db.prepare(`
+        UPDATE jev_local_observation_outbox
+        SET delivered_at_ms = ?
+        WHERE event_id = ? AND delivered_at_ms IS NULL
+      `).run(now, eventId);
+      if (Number(result.changes) === 1) return { acknowledged: true, duplicate: false };
+      const exists = this.#db.prepare(
+        'SELECT 1 FROM jev_local_observation_outbox WHERE event_id = ?'
+      ).get(eventId);
+      return { acknowledged: Boolean(exists), duplicate: Boolean(exists) };
     });
   }
 

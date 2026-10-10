@@ -154,7 +154,7 @@ test('AH-10 bounded SQLite pages preserve strict sequence order and SQL record l
     return true;
   });
   assert.equal(store.getTelemetryCursor(), 0);
-  assert.equal(INTERNAL_SCHEMA_VERSION, 4);
+  assert.equal(INTERNAL_SCHEMA_VERSION, 5);
 });
 
 test('allowlisted projection tokenizes opaque identities and rejects nested, accessor, proxy, cycle, and size inputs without executing them', () => {
@@ -625,7 +625,7 @@ test('process restart replays stable identity after acceptance-before-cursor and
   store.close();
 });
 
-test('schema v3 upgrade adds only an isolated cursor table and v2 migration remains atomic', t => {
+test('schema v3 upgrade adds the v4 cursor and v5 JEV evidence tables; v2 migration remains atomic', t => {
   const temporary = temporaryDatabase('ah10-v3-migration-');
   t.after(() => temporary.cleanup());
   const store = openStore(temporary.databasePath);
@@ -633,13 +633,20 @@ test('schema v3 upgrade adds only an isolated cursor table and v2 migration rema
   const before = dataSnapshot(temporary.databasePath);
   store.close();
   const oldV3 = new DatabaseSync(temporary.databasePath);
-  oldV3.exec('DROP TABLE telemetry_cursors; PRAGMA user_version = 3;');
+  oldV3.exec(`
+    DROP TABLE jev_local_observation_outbox;
+    DROP TABLE jev_provider_observations;
+    DROP TABLE jev_dispatch_markers;
+    DROP TABLE telemetry_cursors;
+    PRAGMA user_version = 3;
+  `);
   oldV3.close();
   const migrated = openStore(temporary.databasePath);
-  assert.equal(INTERNAL_SCHEMA_VERSION, 4);
+  assert.equal(INTERNAL_SCHEMA_VERSION, 5);
   const raw = new DatabaseSync(temporary.databasePath, { readOnly: true });
-  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 4);
+  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 5);
   assert.equal(raw.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='telemetry_cursors'").get().count, 1);
+  assert.equal(raw.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name IN ('jev_dispatch_markers','jev_provider_observations','jev_local_observation_outbox')").get().count, 3);
   raw.close();
   assert.deepEqual(dataSnapshot(temporary.databasePath), before);
   assert.equal(migrated.getTelemetryCursor(), 0);

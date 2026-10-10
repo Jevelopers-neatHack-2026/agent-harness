@@ -14,11 +14,11 @@
     }
   },
   "scripts": {
-    "build": "node --check src/internal/errors.js && node --check src/internal/config.js && node --check src/internal/durable-store.js && node --check src/internal/telemetry.js && node --check src/internal/index.js && node --input-type=module -e \"import('@jevelopers/agent-harness-runtime')\" && npm run typecheck",
-    "typecheck": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext tests/runtime/public-api.typecheck.ts tests/observability/public-api.typecheck.ts",
+    "build": "node --check src/internal/errors.js && node --check src/internal/config.js && node --check src/internal/durable-store.js && node --check src/internal/telemetry.js && node --check src/internal/index.js && node --check src/adapters/jev/address-policy.js && node --check src/adapters/jev/attempt-recording.js && node --check src/adapters/jev/http-transport.js && node --check src/adapters/jev/request-validation.js && node --check src/adapters/jev/response-validation.js && node --check src/adapters/jev/retry-policy.js && node --check src/adapters/jev/safe-json.js && node --input-type=module -e \"import('@jevelopers/agent-harness-runtime')\" && npm run typecheck",
+    "typecheck": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext tests/runtime/public-api.typecheck.ts tests/observability/public-api.typecheck.ts tests/decisions/jev-adapter.contract/storage.typecheck.ts",
     "check": "npm run build",
-    "test": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/observability/*.test.js",
-    "test:internal": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/observability/*.test.js"
+    "test": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/observability/*.test.js tests/decisions/jev-adapter.contract/*.test.js",
+    "test:internal": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/observability/*.test.js tests/decisions/jev-adapter.contract/*.test.js"
   },
   "devDependencies": {
     "typescript": "5.9.3"

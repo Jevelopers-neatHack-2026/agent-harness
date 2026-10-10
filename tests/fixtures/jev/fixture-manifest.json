@@ -1,0 +1,11 @@
+{
+  "schema": "agent-harness.jev-offline-fixtures.v1",
+  "dependencyMode": "synthetic_offline",
+  "providerBytesAreSynthetic": true,
+  "externalProviderCalls": 0,
+  "selectedModelFixture": "jev-1.13.0",
+  "notes": [
+    "The fixture model is an explicit wire identity and does not approve product selection or account eligibility.",
+    "The usage values are synthetic and are not cost, billing, reservation, or finance evidence."
+  ]
+}

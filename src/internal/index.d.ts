@@ -97,7 +97,7 @@ export interface RuntimeConfig {
 export function parseRuntimeConfig(env: Record<string, string | undefined>): RuntimeConfig;
 export function assertExecutionModeAvailable(config: RuntimeConfig): true;
 
-export const INTERNAL_SCHEMA_VERSION: 4;
+export const INTERNAL_SCHEMA_VERSION: 5;
 export interface StoreOptions {
   databasePath: string;
   clock?: () => number;
@@ -123,6 +123,42 @@ export interface DurableWorkflowEvent {
   toState: WorkflowState | null;
   fence: number;
   occurredAtMs: number;
+}
+
+export type LocalJevUsage =
+  | { readonly kind: 'known'; readonly inputTokens: number; readonly outputTokens: number }
+  | {
+      readonly kind: 'unknown';
+      readonly reason: 'not_dispatched' | 'possible_dispatch' | 'missing_or_invalid_usage' | 'recovered_after_crash';
+    };
+
+export interface LocalJevObservationInput {
+  workflowId: string;
+  logicalOperationRef: string;
+  attemptId: string;
+  transportAttemptId: string;
+  sourceObservationRef: string;
+  dispatchCertainty: 'not_dispatched' | 'possible' | 'response_received';
+  requestedModel: 'jev-1.13.0';
+  resolvedModel: string | null;
+  providerRequestId: string | null;
+  decisionConformance: 'valid' | 'invalid' | 'unavailable';
+  usage: LocalJevUsage;
+}
+
+export interface LocalJevObservation extends LocalJevObservationInput {
+  readonly schema: 'agent-harness.jev.local-usage-observation.v1';
+  readonly eventId: string;
+  readonly eventSequence: number;
+  readonly recordedAtMs: number;
+}
+
+export interface LocalJevObservationDeliveryPage {
+  readonly items: ReadonlyArray<LocalJevObservation & {
+    readonly deliveryIntent: 'local_only_not_finance_acceptance';
+  }>;
+  readonly hasMore: boolean;
+  readonly nextAfterSequence: number;
 }
 
 export class DurableWorkflowStore {
@@ -176,6 +212,26 @@ export class DurableWorkflowStore {
     transportAttemptId: string;
     eventId?: string;
   }): { transportAttemptId: string; revision: number; eventSequence: number | null; duplicate: boolean };
+  recordJevDispatchMarker(input: Pick<Lease, 'workflowId' | 'ownerId' | 'fence'> & {
+    expectedRevision: number;
+    attemptId: string;
+    transportAttemptId: string;
+  }): {
+    duplicate: boolean;
+    transportAttemptId: string;
+    eventId: string;
+    eventSequence: number;
+    revision: number;
+  };
+  getJevDispatchMarker(transportAttemptId: string): {
+    transportAttemptId: string;
+    attemptId: string;
+    workflowId: string;
+    logicalOperationRef: string;
+    eventId: string;
+    eventSequence: number;
+    markedAtMs: number;
+  } | null;
   recordResponseReceipt(input: Lease & {
     expectedRevision: number;
     attemptId: string;
@@ -201,6 +257,21 @@ export class DurableWorkflowStore {
     sourceObservationRef: string;
     kind: 'known' | 'unknown';
   }): { duplicate: boolean; observationCount: number };
+  recordJevProviderObservation(input: LocalJevObservationInput): {
+    duplicate: boolean;
+    sourceObservationRef: string;
+    eventId: string;
+    eventSequence: number;
+  };
+  getJevProviderObservation(sourceObservationRef: string): LocalJevObservation | null;
+  readJevObservationDeliveryPage(input?: {
+    afterSequence?: number;
+    limit?: number;
+  }): LocalJevObservationDeliveryPage;
+  acknowledgeJevObservationDelivery(eventId: string): {
+    acknowledged: boolean;
+    duplicate: boolean;
+  };
   getAttempt(attemptId: string): Record<string, unknown>;
   getReceipt(attemptId: string): Record<string, unknown>;
   getArtifact(workflowId: string, artifactId: string): {

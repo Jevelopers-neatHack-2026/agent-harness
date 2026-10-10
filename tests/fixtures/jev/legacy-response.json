@@ -1,0 +1,7 @@
+{
+  "model": "jev-1.12.0",
+  "results": {
+    "routing": { "type": "choice", "value": "support" }
+  },
+  "usage": { "input_tokens": 83, "output_tokens": 19 }
+}
