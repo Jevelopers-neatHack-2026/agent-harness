@@ -2029,20 +2029,71 @@ def _check_local_overrides() -> list[str]:
     return states
 
 
+def _stop_and_reap_extractor_processes(processes: list[subprocess.Popen[bytes]]) -> None:
+    """Boundedly stop and reap only the extractor children owned by this call."""
+    for process in reversed(processes):
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=1)
+            except Exception:
+                pass
+        except Exception:
+            # Cleanup must not replace the sanitized extraction failure.
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=1)
+            except Exception:
+                pass
+
+
 def _extract_profile(deb: Path, destination: Path) -> None:
+    processes: list[subprocess.Popen[bytes]] = []
+    pipes: list[Any] = []
     try:
         producer = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", str(deb)],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, close_fds=True)
-        assert producer.stdout is not None
+        processes.append(producer)
+        if producer.stdout is None:
+            raise OSError("profile extractor pipe was not created")
+        pipes.append(producer.stdout)
         consumer = subprocess.Popen(["tar", "-xOf", "-", PROFILE_MEMBER],
                                     stdin=producer.stdout, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, close_fds=True)
+        processes.append(consumer)
+        if consumer.stdout is not None:
+            pipes.append(consumer.stdout)
         producer.stdout.close()
         output, _ = consumer.communicate(timeout=20)
         producer_code = producer.wait(timeout=5)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except Exception as exc:
+        for pipe in pipes:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+        _stop_and_reap_extractor_processes(processes)
         raise SetupFailure("profile_only_package_extraction_failed") from exc
+    finally:
+        for pipe in pipes:
+            try:
+                pipe.close()
+            except Exception:
+                pass
     if consumer.returncode != 0 or producer_code != 0 or len(output) > 256 * 1024:
         raise SetupFailure("profile_only_package_extraction_failed")
     if hashlib.sha256(output).hexdigest() != PROFILE_SHA256:

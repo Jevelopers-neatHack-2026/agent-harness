@@ -36,8 +36,9 @@ SANDBOX_OBSERVATION_KEYS = (
     "python_reexec_capabilities_zero", "python_reexec_no_new_privs", "other_exec_stack_verified",
     "other_exec_capabilities_zero", "other_exec_no_new_privs", "nested_userns_created",
     "nested_userns_setup_complete", "nested_userns_stack_verified", "nested_userns_no_new_privs",
+    "nested_userns_mapping_requested", "nested_userns_mapping_completed", "nested_userns_payload_reached",
     "nested_capability_sets_observed", "nested_mount_attempted", "nested_mount_namespace_denied",
-    "nested_bwrap_denied",
+    "nested_bwrap_denied", "host_canary_unchanged",
     "child_isolated", "child_capabilities_dropped",
 )
 EXPECTED_CONTRACT_CODES = {
@@ -318,7 +319,8 @@ def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
     if type(nested_exit) is int and -255 <= nested_exit <= 255:
         result["nested_userns_process_exit_code"] = nested_exit
     nested_stderr = observed.get("nested_userns_stderr_class")
-    if nested_stderr in ("empty", "operation_not_permitted", "permission_denied", "missing_file", "other"):
+    if nested_stderr in ("empty", "operation_not_permitted", "permission_denied", "missing_file", "other",
+                         "mapping_setup_failure"):
         result["nested_userns_stderr_class"] = nested_stderr
     nested_errno = observed.get("nested_mount_errno_category")
     if nested_errno in ("operation_not_permitted", "permission_denied", "other", "unavailable"):
@@ -338,7 +340,42 @@ def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
     nested_cap_eff = observed.get("nested_cap_eff")
     if isinstance(nested_cap_eff, str) and len(nested_cap_eff) <= 32 and re.fullmatch(r"[0-9a-fA-F]+", nested_cap_eff):
         result["nested_cap_eff"] = nested_cap_eff
-    result["host_canary_unchanged"] = observed.get("host_canary_unchanged") is True
+    if type(observed.get("host_canary_unchanged")) is bool:
+        result["host_canary_unchanged"] = observed["host_canary_unchanged"]
+    enum_fields = {
+        "host_canary_observation": {"unchanged", "changed", "unavailable", "unstable",
+                                    "not_regular", "outside_size_bound"},
+        "nested_userns_setup_stage": {"not_run", "tool_unavailable", "setup_before_payload",
+                                      "mapping_setup_failed", "payload_setup_incomplete", "mount_attempted",
+                                      "timeout_or_output_limit"},
+        "nested_userns_creation_observation": {"confirmed", "not_observed"},
+        "nested_userns_mapping_observation": {"completed", "failed", "not_observed"},
+        "nested_bwrap_setup_stage": {"not_run", "payload_reached", "loopback_setup_denied",
+                                     "setup_or_exec_failed", "timeout_or_output_limit",
+                                     "not_observed"},
+        "nested_bwrap_stderr_class": {"empty", "operation_not_permitted", "permission_denied",
+                                       "network_namespace_loopback_setup_denied", "other"},
+    }
+    for key, allowed in enum_fields.items():
+        value = observed.get(key)
+        if isinstance(value, str) and value in allowed:
+            result[key] = value
+    for key in ("nested_userns_utility_version", "nested_bwrap_utility_version"):
+        version = observed.get(key)
+        if isinstance(version, str) and re.fullmatch(r"[0-9A-Za-z.+~-]{1,48}", version):
+            result[key] = version
+    for key in ("nested_bwrap_payload_reached", "nested_userns_process_bounded"):
+        if type(observed.get(key)) is bool:
+            result[key] = observed[key]
+    for key in ("nested_bwrap_exit_code", "nested_userns_utility_version_exit_code",
+                "nested_bwrap_utility_version_exit_code"):
+        value = observed.get(key)
+        if type(value) is int and -255 <= value <= 255:
+            result[key] = value
+    for key in ("nested_userns_stderr_bytes", "nested_bwrap_stderr_bytes"):
+        value = observed.get(key)
+        if type(value) is int and 0 <= value <= 2048:
+            result[key] = value
     return result
 
 
@@ -400,6 +437,12 @@ def classify_sandbox() -> Tuple[Dict[str, Any], List[str]]:
                 missing.append("host_canary_unchanged")
             if evidence["canary"]["observations"].get("nested_mount_namespace_created") is not False:
                 missing.append("nested_mount_namespace_created_false")
+            if evidence["canary"]["observations"].get("host_canary_observation") != "unchanged":
+                missing.append("host_canary_read_not_confirmed")
+            if evidence["canary"]["observations"].get("nested_userns_setup_stage") != "mount_attempted":
+                missing.append("nested_userns_stage_not_confirmed")
+            if evidence["canary"]["observations"].get("nested_bwrap_setup_stage") != "loopback_setup_denied":
+                missing.append("nested_bwrap_denial_stage_not_confirmed")
             if missing:
                 problems.append("bubblewrap_canary_evidence_incomplete")
                 evidence["canary"]["status"] = "failed"

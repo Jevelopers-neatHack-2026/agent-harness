@@ -19,6 +19,7 @@ import platform
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -1590,7 +1591,7 @@ r={'outside_read_blocked':outside_blocked,'private_shadow_visible':private_shado
 print(json.dumps(r,sort_keys=True,separators=(',',':')))
 sys.exit(0 if all((outside_blocked,private_shadow_visible,network_blocked,netns,c['stack'],c['no_new_privs'],c['caps_zero'])) else 7)
 '''
-    parent_code = r'''import ctypes,errno,json,os,selectors,signal,socket,subprocess,sys,time
+    parent_code = r'''import ctypes,errno,json,os,re,selectors,signal,socket,subprocess,sys,time
 CAPS=('CapInh','CapPrm','CapEff','CapBnd','CapAmb')
 def context():
  try:
@@ -1656,10 +1657,20 @@ r={'outside_read_blocked':False,'private_shadow_visible':False,
    'other_exec_no_new_privs':False,'nested_userns_created':False,'nested_userns_setup_complete':False,
    'nested_userns_stack_verified':False,'nested_userns_label':'unverified','nested_userns_no_new_privs':False,
    'nested_userns_process_exit_code':None,'nested_userns_stderr_class':'not_run',
+   'nested_userns_setup_stage':'not_run','nested_userns_payload_reached':False,
+   'nested_userns_mapping_requested':False,'nested_userns_mapping_completed':False,
+   'nested_userns_creation_observation':'not_observed','nested_userns_mapping_observation':'not_observed',
+   'nested_userns_utility_version':'unavailable','nested_userns_utility_version_exit_code':None,
+   'nested_userns_stderr_bytes':0,
+   'nested_userns_process_bounded':False,
    'nested_capability_sets_observed':False,'nested_capability_sets':{},
    'nested_mount_attempted':False,'nested_mount_namespace_denied':False,
    'nested_mount_namespace_created':False,'nested_mount_errno_category':'unavailable',
-   'nested_cap_eff':'','nested_bwrap_denied':False,
+   'nested_cap_eff':'','nested_bwrap_denied':False,'nested_bwrap_setup_stage':'not_run',
+   'nested_bwrap_payload_reached':False,'nested_bwrap_exit_code':None,
+   'nested_bwrap_utility_version':'unavailable','nested_bwrap_utility_version_exit_code':None,
+   'nested_bwrap_stderr_bytes':0,
+   'nested_bwrap_stderr_class':'not_run',
    'child_isolated':False,'child_capabilities_dropped':False,'child_exit_code':None,
    'child_stderr_present':False,'child_stderr_class':'not_run'}
 try:
@@ -1735,7 +1746,8 @@ try:
  denied=result<0 and error in (errno.EPERM,errno.EACCES)
  errno_category=('operation_not_permitted' if error==errno.EPERM else
                  'permission_denied' if error==errno.EACCES else 'other' if result<0 else 'unavailable')
- report={'created':True,'label':label if stacked else 'unverified','stack':stacked,
+ report={'created':True,'mapping_completed':True,'payload_reached':True,
+         'label':label if stacked else 'unverified','stack':stacked,
          'no_new_privs':s.get('NoNewPrivs')=='1','capabilities':capabilities,
          'cap_eff':capabilities['CapEff'],'mount_attempted':True,
          'mount_namespace_created':result==0,'mount_denied':denied,
@@ -1743,12 +1755,35 @@ try:
  print(json.dumps(report,sort_keys=True,separators=(',',':')))
  sys.exit(0 if stacked and report['no_new_privs'] and denied else 9)
 except (OSError,ValueError,KeyError):
- print('{}');sys.exit(10)
+ print('{"created":true,"mapping_completed":true,"payload_reached":true,'
+       '"diagnostic_stage":"payload_setup_incomplete"}');sys.exit(10)
 """
 unshare=__import__('shutil').which('unshare')
 if unshare:
+ version_run=run_child([unshare,'--version'],timeout=2)
+ version_text=version_run['stdout'].decode('ascii','ignore').strip()
+ version_match=re.fullmatch(r'unshare from util-linux ([0-9A-Za-z.+~-]{1,48})',version_text)
+ r['nested_userns_utility_version_exit_code']=version_run['code']
+ if version_run['bounded'] and version_run['code']==0 and version_match and not version_run['stderr']:
+  r['nested_userns_utility_version']=version_match.group(1)
+ r['nested_userns_mapping_requested']=True
  nested=run_child([unshare,'--user','--map-root-user',sys.executable,'-I','-B','-S','-c',nested_code],timeout=4)
  nested_report=parse_object(nested['stdout'])
+ payload_reached=(nested_report.get('payload_reached') is True or nested_report.get('created') is True)
+ r['nested_userns_process_bounded']=nested['bounded'] is True
+ r['nested_userns_payload_reached']=payload_reached
+ r['nested_userns_mapping_completed']=nested_report.get('mapping_completed') is True
+ r['nested_userns_creation_observation']=('confirmed' if nested_report.get('created') is True else 'not_observed')
+ r['nested_userns_mapping_observation']=('completed' if nested_report.get('mapping_completed') is True else 'not_observed')
+ r['nested_userns_stderr_bytes']=len(nested.get('stderr',b''))
+ if nested_report.get('created') is True and nested_report.get('mount_attempted') is True:
+  r['nested_userns_setup_stage']='mount_attempted'
+ elif payload_reached:
+  r['nested_userns_setup_stage']='payload_setup_incomplete'
+ elif not nested['bounded']:
+  r['nested_userns_setup_stage']='timeout_or_output_limit'
+ else:
+  r['nested_userns_setup_stage']='setup_before_payload'
  r['nested_userns_created']=nested_report.get('created') is True and nested['bounded']
  r['nested_userns_setup_complete']=(nested_report.get('created') is True
   and nested_report.get('mount_attempted') is True and isinstance(nested_report.get('capabilities'),dict)
@@ -1771,14 +1806,47 @@ if unshare:
   r['nested_mount_errno_category']=nested_report['mount_errno_category']
  r['nested_userns_process_exit_code']=nested.get('code') if type(nested.get('code')) is int else None
  nested_error=nested.get('stderr',b'').decode('utf-8','replace').lower()
- r['nested_userns_stderr_class']=('operation_not_permitted' if 'operation not permitted' in nested_error else
+ r['nested_userns_stderr_class']=('mapping_setup_failure' if any(term in nested_error for term in ('uid map','gid map','setgroups')) else
+  'operation_not_permitted' if 'operation not permitted' in nested_error else
   'permission_denied' if 'permission denied' in nested_error else 'missing_file' if 'no such file or directory' in nested_error else
   'other' if nested_error else 'empty')
+ if r['nested_userns_stderr_class']=='mapping_setup_failure':
+  r['nested_userns_setup_stage']='mapping_setup_failed'
+  r['nested_userns_mapping_observation']='failed'
+else:
+ r['nested_userns_setup_stage']='tool_unavailable'
 
-inner=run_child([bwrap,'--die-with-parent','--new-session','--unshare-all','--cap-drop','ALL','/usr/bin/true'],timeout=4)
+version_run=run_child([bwrap,'--version'],timeout=2)
+version_text=version_run['stdout'].decode('ascii','ignore').strip()
+version_match=re.fullmatch(r'bubblewrap ([0-9A-Za-z.+~-]{1,48})',version_text)
+r['nested_bwrap_utility_version_exit_code']=version_run['code']
+if version_run['bounded'] and version_run['code']==0 and version_match and not version_run['stderr']:
+ r['nested_bwrap_utility_version']=version_match.group(1)
+payload_code="import os;os.write(1,b'ACV1_NESTED_PAYLOAD_REACHED\\n')"
+inner=run_child([bwrap,'--die-with-parent','--new-session','--unshare-all','--cap-drop','ALL',
+                 sys.executable,'-I','-B','-S','-c',payload_code],timeout=4)
 inner_error=inner['stderr'].decode('utf-8','replace').lower()
+inner_output=inner['stdout']
+r['nested_bwrap_payload_reached']=b'ACV1_NESTED_PAYLOAD_REACHED' in inner_output
+r['nested_bwrap_exit_code']=inner['code'] if type(inner.get('code')) is int else None
+r['nested_bwrap_stderr_bytes']=len(inner.get('stderr',b''))
+r['nested_bwrap_stderr_class']=('network_namespace_loopback_setup_denied'
+ if 'bwrap: loopback: failed rtm_newaddr: operation not permitted' in inner_error else
+ 'operation_not_permitted' if 'operation not permitted' in inner_error else
+ 'permission_denied' if 'permission denied' in inner_error else
+ 'other' if inner_error else 'empty')
+if r['nested_bwrap_payload_reached']:
+ r['nested_bwrap_setup_stage']='payload_reached'
+elif not inner['bounded']:
+ r['nested_bwrap_setup_stage']='timeout_or_output_limit'
+elif r['nested_bwrap_stderr_class']=='network_namespace_loopback_setup_denied':
+ r['nested_bwrap_setup_stage']='loopback_setup_denied'
+elif inner['code'] is not None and inner['code']!=0:
+ r['nested_bwrap_setup_stage']='setup_or_exec_failed'
+else:
+ r['nested_bwrap_setup_stage']='not_observed'
 r['nested_bwrap_denied']=(inner['bounded'] and inner['code'] is not None and inner['code']!=0
- and 'bwrap: loopback: failed rtm_newaddr: operation not permitted' in inner_error)
+ and r['nested_bwrap_setup_stage']=='loopback_setup_denied')
 print(json.dumps(r,sort_keys=True,separators=(',',':')))
 required=('outside_read_blocked','sandbox_shadow_write_succeeded','network_blocked','network_namespace_isolated',
  'private_shadow_visible',
@@ -1786,6 +1854,7 @@ required=('outside_read_blocked','sandbox_shadow_write_succeeded','network_block
  'python_reexec_stack_verified','python_reexec_capabilities_zero','python_reexec_no_new_privs',
  'other_exec_stack_verified','other_exec_capabilities_zero','other_exec_no_new_privs','nested_userns_created',
  'nested_userns_setup_complete','nested_userns_stack_verified','nested_userns_no_new_privs',
+ 'nested_userns_mapping_requested','nested_userns_mapping_completed','nested_userns_payload_reached',
  'nested_capability_sets_observed','nested_mount_attempted','nested_mount_namespace_denied',
  'nested_bwrap_denied','child_isolated','child_capabilities_dropped')
 sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_errno_category'] in ('operation_not_permitted','permission_denied')
@@ -1821,10 +1890,18 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
                 "other_exec_no_new_privs", "nested_userns_created", "nested_userns_stack_verified",
                 "nested_userns_no_new_privs", "nested_userns_setup_complete", "nested_cap_eff",
                 "nested_userns_process_exit_code", "nested_userns_stderr_class",
+                "nested_userns_setup_stage", "nested_userns_payload_reached",
+                "nested_userns_mapping_requested", "nested_userns_mapping_completed",
+                "nested_userns_creation_observation", "nested_userns_mapping_observation",
+                "nested_userns_utility_version", "nested_userns_utility_version_exit_code",
+                "nested_userns_stderr_bytes", "nested_userns_process_bounded",
                 "nested_capability_sets_observed", "nested_capability_sets",
                 "nested_mount_attempted", "nested_mount_namespace_denied", "nested_mount_namespace_created",
                 "nested_mount_errno_category",
-                "nested_bwrap_denied", "child_isolated",
+                "nested_bwrap_denied", "nested_bwrap_setup_stage", "nested_bwrap_payload_reached",
+                "nested_bwrap_exit_code", "nested_bwrap_utility_version",
+                "nested_bwrap_utility_version_exit_code", "nested_bwrap_stderr_bytes",
+                "nested_bwrap_stderr_class", "child_isolated",
                 "child_capabilities_dropped", "child_exit_code", "child_stderr_present", "child_stderr_class",
             }
             observed.update({key: report[key] for key in allowed if key in report})
@@ -1851,6 +1928,11 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
             or report.get("nested_userns_setup_complete") is not True
             or report.get("nested_userns_stack_verified") is not True
             or report.get("nested_userns_no_new_privs") is not True
+            or report.get("nested_userns_mapping_requested") is not True
+            or report.get("nested_userns_mapping_completed") is not True
+            or report.get("nested_userns_payload_reached") is not True
+            or report.get("nested_userns_setup_stage") != "mount_attempted"
+            or report.get("nested_userns_utility_version") == "unavailable"
             or report.get("nested_capability_sets_observed") is not True
             or report.get("nested_mount_attempted") is not True
             or report.get("nested_mount_namespace_denied") is not True
@@ -1859,12 +1941,69 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
             or report.get("nested_userns_process_exit_code") != 0
             or report.get("nested_userns_stderr_class") != "empty"
             or report.get("nested_bwrap_denied") is not True
+            or report.get("nested_bwrap_setup_stage") != "loopback_setup_denied"
+            or report.get("nested_bwrap_utility_version") == "unavailable"
+            or type(report.get("nested_bwrap_exit_code")) is not int
+            or report.get("nested_bwrap_stderr_class") != "network_namespace_loopback_setup_denied"
             or report.get("child_isolated") is not True
             or report.get("child_capabilities_dropped") is not True
             or type(report.get("child_exit_code")) is not int or report.get("child_exit_code") != 0
             or report.get("child_stderr_present") is not False or report.get("child_stderr_class") != "empty"):
         return _sandbox_process_failure({"code": "adapter_nonzero_exit", "returncode": 0, "stderr": b""}, report)
     return None
+
+
+def _observe_host_canary(path: Path, expected: bytes,
+                         observed: dict[str, Any]) -> None:
+    """Read the synthetic host canary independently of sandbox-canary success."""
+    observed.pop("host_canary_unchanged", None)
+    observed["host_canary_observation"] = "unavailable"
+    descriptor: int | None = None
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            observed["host_canary_observation"] = "not_regular"
+            return
+        if before.st_size < 0 or before.st_size > 256:
+            observed["host_canary_observation"] = "outside_size_bound"
+            return
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow == 0:
+            return
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow)
+        opened = os.fstat(descriptor)
+        identity_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size",
+                           "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, key) != getattr(opened, key) for key in identity_fields):
+            observed["host_canary_observation"] = "unstable"
+            return
+        data = bytearray()
+        while len(data) <= 256:
+            chunk = os.read(descriptor, 257 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (any(getattr(before, key) != getattr(after, key) for key in identity_fields)
+                or any(getattr(before, key) != getattr(current, key) for key in identity_fields)
+                or len(data) > 256 or len(data) != before.st_size):
+            observed["host_canary_observation"] = "unstable"
+            return
+        if bytes(data) == expected:
+            observed["host_canary_observation"] = "unchanged"
+            observed["host_canary_unchanged"] = True
+        else:
+            observed["host_canary_observation"] = "changed"
+            observed["host_canary_unchanged"] = False
+    except OSError:
+        observed["host_canary_observation"] = "unavailable"
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def probe_sandbox(package_root: Path, observed: dict[str, Any] | None = None) -> str | None:
@@ -1878,16 +2017,18 @@ def probe_sandbox(package_root: Path, observed: dict[str, Any] | None = None) ->
         import tempfile
         with tempfile.TemporaryDirectory(prefix="acv1-sandbox-canary-") as temp:
             outside = Path(temp) / "host-canary.txt"
-            outside.write_text("synthetic-host-canary", encoding="utf-8")
-            reason = _run_sandbox_canary(package_root, outside, observed)
+            host_canary = b"synthetic-host-canary"
+            outside.write_bytes(host_canary)
+            canary_observations = observed if observed is not None else {}
+            reason = None
+            try:
+                reason = _run_sandbox_canary(package_root, outside, canary_observations)
+            finally:
+                _observe_host_canary(outside, host_canary, canary_observations)
             if reason is not None:
                 return reason
-            if outside.read_text(encoding="utf-8") != "synthetic-host-canary":
-                if observed is not None:
-                    observed["host_canary_unchanged"] = False
-                return "bubblewrap isolation canary changed the host canary file; the owner adapter is not executed."
-            if observed is not None:
-                observed["host_canary_unchanged"] = True
+            if canary_observations.get("host_canary_unchanged") is not True:
+                return "bubblewrap host-canary preservation was not verified; the owner adapter is not executed."
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return "bubblewrap isolation prerequisite could not be verified with synthetic canaries; the owner adapter is not executed."
     return None

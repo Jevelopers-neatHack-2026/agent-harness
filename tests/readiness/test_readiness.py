@@ -392,6 +392,154 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             cwd=ROOT, env=env, text=True, capture_output=True, check=False, timeout=10,
         )
 
+    def test_profile_extraction_reaps_owned_processes_on_launch_and_timeout_failures(self) -> None:
+        class OwnedProcess:
+            def __init__(self, *, stdout: Any = None, communicate: Any = None,
+                         wait: Any = None, returncode: int | None = None) -> None:
+                self.stdout = stdout
+                self.returncode = returncode
+                self.communicate_result = communicate
+                self.wait_result = wait
+                self.terminate_calls = 0
+                self.kill_calls = 0
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+                self.returncode = -15
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.returncode = -9
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.assert_timeout(timeout, 20)
+                if isinstance(self.communicate_result, BaseException):
+                    raise self.communicate_result
+                return self.communicate_result
+
+            def wait(self, *, timeout: float) -> int:
+                self.wait_calls += 1
+                if isinstance(self.wait_result, BaseException):
+                    if self.wait_calls == 1:
+                        raise self.wait_result
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+            @staticmethod
+            def assert_timeout(actual: float, expected: float) -> None:
+                if actual != expected:
+                    raise AssertionError("unexpected process wait bound")
+
+        cases = ("producer_launch", "consumer_launch", "consumer_timeout",
+                 "consumer_timeout_kill", "producer_timeout")
+        for case in cases:
+            with self.subTest(case=case):
+                producer_pipe = mock.Mock()
+                consumer_pipe = mock.Mock()
+                producer = OwnedProcess(stdout=producer_pipe, wait=0)
+                consumer = OwnedProcess(
+                    stdout=consumer_pipe,
+                    communicate=(subprocess.TimeoutExpired("tar", 20)
+                                 if case == "consumer_timeout" else (b"profile", b"")),
+                    wait=(subprocess.TimeoutExpired("tar", 1)
+                          if case == "consumer_timeout_kill" else None),
+                    returncode=None if case in ("consumer_timeout", "consumer_timeout_kill") else 0,
+                )
+                if case == "producer_launch":
+                    popen = mock.Mock(side_effect=OSError("synthetic producer launch failure"))
+                    owned = []
+                elif case == "consumer_launch":
+                    popen = mock.Mock(side_effect=[producer, OSError("synthetic consumer launch failure")])
+                    owned = [producer]
+                elif case == "consumer_timeout":
+                    popen = mock.Mock(side_effect=[producer, consumer])
+                    owned = [producer, consumer]
+                else:
+                    producer.wait_result = subprocess.TimeoutExpired("dpkg-deb", 5)
+                    popen = mock.Mock(side_effect=[producer, consumer])
+                    owned = [producer, consumer]
+
+                with mock.patch.object(profile_setup.subprocess, "Popen", popen), \
+                        self.assertRaises(profile_setup.SetupFailure) as raised:
+                    profile_setup._extract_profile(Path("synthetic.deb"), Path("unused.profile"))
+
+                self.assertEqual(raised.exception.code, "profile_only_package_extraction_failed")
+                self.assertEqual(popen.call_count, 1 if case == "producer_launch" else 2)
+                for process in owned:
+                    self.assertGreaterEqual(process.wait_calls, 1)
+                    self.assertTrue(process.returncode is not None)
+                if case != "producer_launch":
+                    self.assertGreaterEqual(producer.terminate_calls, 1)
+                    self.assertTrue(producer_pipe.close.called)
+                if case in ("consumer_timeout", "consumer_timeout_kill"):
+                    self.assertGreaterEqual(consumer.terminate_calls, 1)
+                    self.assertTrue(consumer_pipe.close.called)
+                if case == "consumer_timeout_kill":
+                    self.assertGreaterEqual(consumer.kill_calls, 1)
+
+    def test_profile_extraction_success_reaps_both_children_and_keeps_digest_limit_checks(self) -> None:
+        payload = b"synthetic pinned profile bytes"
+        producer_pipe = mock.Mock()
+        consumer_pipe = mock.Mock()
+
+        class Completed:
+            def __init__(self, *, stdout: Any = None, output: bytes = b"") -> None:
+                self.stdout = stdout
+                self.returncode = 0
+                self.output = output
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.assertEqual(timeout, 20)
+                return self.output, b""
+
+            def wait(self, *, timeout: float) -> int:
+                self.assertEqual(timeout, 5)
+                self.wait_calls += 1
+                return self.returncode
+
+            @staticmethod
+            def assertEqual(actual: Any, expected: Any) -> None:
+                if actual != expected:
+                    raise AssertionError("unexpected extraction timeout")
+
+        producer = Completed(stdout=producer_pipe)
+        consumer = Completed(stdout=consumer_pipe, output=payload)
+        with tempfile.TemporaryDirectory(prefix="acv1-profile-extract-") as temp, \
+                mock.patch.object(profile_setup.subprocess, "Popen", side_effect=[producer, consumer]), \
+                mock.patch.object(profile_setup, "PROFILE_SHA256", sha(payload)):
+            destination = Path(temp) / "profile"
+            profile_setup._extract_profile(Path("synthetic.deb"), destination)
+            self.assertEqual(destination.read_bytes(), payload)
+        self.assertEqual(producer.wait_calls, 1)
+        self.assertTrue(producer_pipe.close.called)
+        self.assertTrue(consumer_pipe.close.called)
+
+        for bad_payload, expected_hash, expected_code in (
+                (b"different authenticated profile bytes", sha(b"approved profile"),
+                 "extracted_profile_digest_mismatch"),
+                (b"x" * (256 * 1024 + 1), sha(b"x" * (256 * 1024 + 1)),
+                 "profile_only_package_extraction_failed")):
+            with self.subTest(expected_code=expected_code), \
+                    tempfile.TemporaryDirectory(prefix="acv1-profile-extract-negative-") as temp:
+                producer = Completed(stdout=mock.Mock())
+                consumer = Completed(stdout=mock.Mock(), output=bad_payload)
+                with mock.patch.object(profile_setup.subprocess, "Popen",
+                                       side_effect=[producer, consumer]), \
+                        mock.patch.object(profile_setup, "PROFILE_SHA256", expected_hash), \
+                        self.assertRaises(profile_setup.SetupFailure) as raised:
+                    profile_setup._extract_profile(Path("synthetic.deb"), Path(temp) / "profile")
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(producer.wait_calls, 1)
+
     def test_pending_release_preserves_all_owner_actions_and_fails_closed_without_trusted_index(self) -> None:
         result = self.run_contract("--manifest", "fixtures/contracts/release.json", "--offline")
         self.assertEqual(result.returncode, 2)
@@ -1358,6 +1506,9 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("--unshare-all", command)
         self.assertIn("--cap-drop", command)
         self.assertIn("nested_userns_setup_complete", parent_code)
+        self.assertIn("nested_userns_setup_stage", parent_code)
+        self.assertIn("nested_userns_mapping_observation", parent_code)
+        self.assertIn("nested_userns_utility_version", parent_code)
         self.assertIn("nested_mount_attempted", parent_code)
         self.assertIn("nested_mount_namespace_denied", parent_code)
         self.assertNotIn("nested_cap_sys_admin_available", parent_code)
@@ -1365,6 +1516,8 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("libc.unshare(0x00020000)", parent_code)
         self.assertIn("private_shadow_visible", child_code)
         self.assertIn("loopback: failed rtm_newaddr: operation not permitted", parent_code)
+        self.assertIn("nested_bwrap_setup_stage", parent_code)
+        self.assertIn("ACV1_NESTED_PAYLOAD_REACHED", parent_code)
         self.assertNotIn("--share-net", command)
         self.assertEqual(mocked_run.call_args.kwargs["timeout"], 20)
         self.assertIsNotNone(reason)
@@ -1696,13 +1849,14 @@ class ContractReleaseReadinessTests(unittest.TestCase):
 
     def test_pinned_keyring_capture_accepts_observed_writable_parents_and_leaf_for_pinned_bytes(self) -> None:
         approved = b"synthetic approved archive keyring"
-        uid, gid = os.geteuid(), os.getegid()
         for writable_component in ("share", "keyrings"):
             for writable_leaf in (False, True):
                 with self.subTest(writable_component=writable_component,
                                   writable_leaf=writable_leaf), \
                         tempfile.TemporaryDirectory(prefix="acv1-pinned-keyring-") as temporary:
                     root = Path(temporary)
+                    root_owner = root.stat()
+                    uid, gid = root_owner.st_uid, root_owner.st_gid
                     path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
                     path.parent.mkdir(parents=True)
                     os.chmod(root / "usr", 0o755)
@@ -1744,9 +1898,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
 
     def test_pinned_keyring_capture_rejects_digest_changes(self) -> None:
         approved = b"synthetic approved archive keyring"
-        uid, gid = os.geteuid(), os.getegid()
         with tempfile.TemporaryDirectory(prefix="acv1-keyring-negative-") as temporary:
             root = Path(temporary)
+            root_owner = root.stat()
+            uid, gid = root_owner.st_uid, root_owner.st_gid
             parent = root / "usr" / "share" / "keyrings"
             parent.mkdir(parents=True)
             os.chmod(root / "usr", 0o755)
@@ -1767,9 +1922,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
 
     def test_pinned_keyring_capture_keeps_leaf_owner_and_group_binding(self) -> None:
         approved = b"synthetic approved archive keyring"
-        uid, gid = os.geteuid(), os.getegid()
         with tempfile.TemporaryDirectory(prefix="acv1-keyring-owner-") as temporary:
             root = Path(temporary)
+            root_owner = root.stat()
+            uid, gid = root_owner.st_uid, root_owner.st_gid
             parent = root / "usr" / "share" / "keyrings"
             parent.mkdir(parents=True)
             os.chmod(root / "usr", 0o755)
@@ -1807,9 +1963,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
 
     def test_pinned_keyring_capture_still_rejects_unreviewed_writable_parent_and_keyrings_symlink(self) -> None:
         approved = b"synthetic approved archive keyring"
-        uid, gid = os.geteuid(), os.getegid()
         with tempfile.TemporaryDirectory(prefix="acv1-keyring-parent-boundary-") as temporary:
             root = Path(temporary)
+            root_owner = root.stat()
+            uid, gid = root_owner.st_uid, root_owner.st_gid
             path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
             path.parent.mkdir(parents=True)
             path.write_bytes(approved)
@@ -1839,13 +1996,13 @@ class ContractReleaseReadinessTests(unittest.TestCase):
 
     def test_pinned_keyring_capture_rejects_writable_parent_and_leaf_replacement_races(self) -> None:
         approved = b"synthetic approved archive keyring"
-        uid, gid = os.geteuid(), os.getegid()
-
         for replacement in ("keyrings_parent", "leaf_before_open", "leaf_during_read",
                             "leaf_mode_before_open", "leaf_mode_during_read"):
             with self.subTest(replacement=replacement), \
                     tempfile.TemporaryDirectory(prefix="acv1-keyring-race-") as temporary:
                 root = Path(temporary)
+                root_owner = root.stat()
+                uid, gid = root_owner.st_uid, root_owner.st_gid
                 path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
                 path.parent.mkdir(parents=True)
                 path.write_bytes(approved)

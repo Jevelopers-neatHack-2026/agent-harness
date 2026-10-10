@@ -1,6 +1,8 @@
 """Direct tests for CI's expected-pending classifier behavior."""
 
 import unittest
+import tempfile
+from pathlib import Path
 from unittest import mock
 
 import classify_ci_gates as ci
@@ -40,7 +42,21 @@ class CICheckerClassificationTests(unittest.TestCase):
                              "nested_userns_label": "bwrap//unpriv_bwrap (enforce)",
                              "nested_cap_eff": "000001ffffffffff", "nested_userns_process_exit_code": 0,
                              "nested_userns_stderr_class": "empty",
+                             "nested_userns_setup_stage": "mount_attempted",
+                             "nested_userns_creation_observation": "confirmed",
+                             "nested_userns_mapping_observation": "completed",
+                             "nested_userns_utility_version": "2.39.3",
+                             "nested_userns_utility_version_exit_code": 0,
+                             "nested_userns_stderr_bytes": 0,
+                             "nested_userns_process_bounded": True,
                              "nested_mount_errno_category": "operation_not_permitted",
+                             "nested_bwrap_setup_stage": "loopback_setup_denied",
+                             "nested_bwrap_utility_version": "0.9.0",
+                             "nested_bwrap_utility_version_exit_code": 0,
+                             "nested_bwrap_exit_code": 1,
+                             "nested_bwrap_stderr_bytes": 55,
+                             "nested_bwrap_stderr_class": "network_namespace_loopback_setup_denied",
+                             "host_canary_observation": "unchanged",
                              "nested_capability_sets": {name: "000001ffffffffff" for name in
                                                         ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")},
                              "nested_mount_namespace_created": False,
@@ -101,6 +117,69 @@ class CICheckerClassificationTests(unittest.TestCase):
 
         self.assertIn("bubblewrap_canary_evidence_incomplete", problems)
         self.assertEqual(evidence["canary"]["status"], "failed")
+
+    def test_missing_host_canary_read_stays_unobserved_and_is_not_reported_as_changed(self):
+        safe = ci._safe_sandbox_observations({
+            "host_canary_observation": "unavailable",
+            "nested_userns_setup_stage": "setup_before_payload",
+            "nested_userns_utility_version": "2.39.3",
+            "nested_userns_process_exit_code": 1,
+            "nested_userns_stderr_bytes": 29,
+            "nested_userns_stderr_class": "operation_not_permitted",
+            "nested_userns_payload_reached": False,
+            "nested_userns_mapping_observation": "not_observed",
+            "raw_stderr": "/private/path and sensitive bytes",
+        })
+        self.assertNotIn("host_canary_unchanged", safe)
+        self.assertEqual(safe["host_canary_observation"], "unavailable")
+        self.assertEqual(safe["nested_userns_setup_stage"], "setup_before_payload")
+        self.assertEqual(safe["nested_userns_process_exit_code"], 1)
+        self.assertNotIn("raw_stderr", safe)
+
+    def test_sandbox_probe_reads_synthetic_host_canary_after_canary_failure(self):
+        with tempfile.TemporaryDirectory(prefix="acv1-host-canary-observation-") as temp:
+            root = Path(temp)
+            observed = {}
+            with mock.patch.object(contracts.platform, "system", return_value="Linux"), \
+                    mock.patch.object(contracts, "_sandbox_prerequisite_error", return_value=None), \
+                    mock.patch.object(contracts, "_run_sandbox_canary", return_value="synthetic failure"):
+                reason = contracts.probe_sandbox(root, observed)
+        self.assertEqual(reason, "synthetic failure")
+        self.assertTrue(observed["host_canary_unchanged"])
+        self.assertEqual(observed["host_canary_observation"], "unchanged")
+
+    def test_sandbox_probe_distinguishes_observed_host_change_from_unavailable_read(self):
+        with tempfile.TemporaryDirectory(prefix="acv1-host-canary-change-") as temp:
+            root = Path(temp)
+            observed = {}
+
+            def changed_canary(_package_root, outside, _observed):
+                outside.write_bytes(b"changed synthetic bytes")
+                return "synthetic failure"
+
+            with mock.patch.object(contracts.platform, "system", return_value="Linux"), \
+                    mock.patch.object(contracts, "_sandbox_prerequisite_error", return_value=None), \
+                    mock.patch.object(contracts, "_run_sandbox_canary", side_effect=changed_canary):
+                reason = contracts.probe_sandbox(root, observed)
+        self.assertEqual(reason, "synthetic failure")
+        self.assertFalse(observed["host_canary_unchanged"])
+        self.assertEqual(observed["host_canary_observation"], "changed")
+
+        with tempfile.TemporaryDirectory(prefix="acv1-host-canary-unavailable-") as temp:
+            root = Path(temp)
+            observed = {}
+
+            def removes_canary(_package_root, outside, _observed):
+                outside.unlink()
+                return "synthetic failure"
+
+            with mock.patch.object(contracts.platform, "system", return_value="Linux"), \
+                    mock.patch.object(contracts, "_sandbox_prerequisite_error", return_value=None), \
+                    mock.patch.object(contracts, "_run_sandbox_canary", side_effect=removes_canary):
+                reason = contracts.probe_sandbox(root, observed)
+        self.assertEqual(reason, "synthetic failure")
+        self.assertNotIn("host_canary_unchanged", observed)
+        self.assertEqual(observed["host_canary_observation"], "unavailable")
 
     def test_checked_in_release_is_classified_blocked_with_exit_two(self):
         observed = ci._run_checker("contracts")
