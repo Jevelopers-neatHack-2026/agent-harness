@@ -1,0 +1,332 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.agent-harness.invalid/config/provider-profile-1.1.schema.json",
+  "title": "Agent Harness local provider access profile schemas 1.0 and 1.1",
+  "description": "Repository-local readiness input. This is not a shared domain contract or evidence of account access.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "environment",
+    "development_execution",
+    "live_test_authorization",
+    "capabilities"
+  ],
+  "properties": {
+    "schema_version": { "enum": ["1.0", "1.1"] },
+    "profile_id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+    "environment": { "enum": ["development", "test", "production"] },
+    "development_execution": { "$ref": "#/$defs/developmentExecution" },
+    "live_test_authorization": { "$ref": "#/$defs/liveAuthorization" },
+    "capabilities": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": { "$ref": "#/$defs/capability" }
+    }
+  },
+  "$defs": {
+    "nullableString": { "type": ["string", "null"], "minLength": 1 },
+    "nullableRef": {
+      "type": ["string", "null"],
+      "pattern": "^(https://[^\\s?#@]+|evidence:[A-Za-z0-9._/-]+|urn:[A-Za-z0-9][A-Za-z0-9._:/-]*)$"
+    },
+    "dateOrNull": { "type": ["string", "null"], "format": "date" },
+    "developmentExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["access_preference", "surface", "model", "status", "source_url", "inspected_on", "scope"],
+      "properties": {
+        "access_preference": { "const": "codex_subscription" },
+        "surface": { "const": "codex_builtin_image_generation" },
+        "model": { "const": "gpt-image-2" },
+        "status": { "const": "documented_preference_not_live_tested" },
+        "source_url": { "const": "https://learn.chatgpt.com/docs/image-generation" },
+        "inspected_on": { "type": "string", "format": "date" },
+        "scope": { "const": "development_execution_only" }
+      }
+    },
+    "liveAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "owner_role", "reservation_ref", "evidence_ref", "authorized_capabilities"],
+      "properties": {
+        "status": { "enum": ["pending", "approved", "denied"] },
+        "owner_role": { "type": "string", "minLength": 1 },
+        "reservation_ref": { "$ref": "#/$defs/nullableRef" },
+        "evidence_ref": { "$ref": "#/$defs/nullableRef" },
+        "authorized_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["jev", "gpt_image", "planner_reasoning", "generative_baseline", "neatlogs", "entire"] }
+        }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "required", "provider", "owner_role", "next_action", "blocked_consumers", "configuration", "eligibility", "metadata", "live", "future_usage_authorization", "sponsor_integration"],
+      "properties": {
+        "id": { "enum": ["jev", "gpt_image", "planner_reasoning", "generative_baseline", "neatlogs", "entire"] },
+        "required": { "const": true },
+        "provider": { "enum": ["typesafe", "openai", "neatlogs", "entire", null] },
+        "owner_role": { "type": "string", "minLength": 1 },
+        "next_action": { "type": "string", "minLength": 1 },
+        "blocked_consumers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9:-]{0,63}$" }
+        },
+        "configuration": { "$ref": "#/$defs/configuration" },
+        "eligibility": { "$ref": "#/$defs/eligibility" },
+        "metadata": { "$ref": "#/$defs/metadata" },
+        "live": { "$ref": "#/$defs/live" },
+        "future_usage_authorization": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/futureUsageAuthorization" }
+          ]
+        },
+        "sponsor_integration": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/sponsorIntegration" }
+          ]
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "environment", "billing_mode", "api_family", "endpoint", "sdk", "model", "credential_env", "account_ref", "project_ref", "quota_status", "quota_summary", "quota_evidence_ref"],
+      "properties": {
+        "provider": { "enum": ["typesafe", "openai", "neatlogs", "entire", null] },
+        "environment": { "enum": ["development", "test", "production"] },
+        "billing_mode": { "enum": ["unknown", "api_metered", "sandbox", "simulated", "not_applicable"] },
+        "api_family": {
+          "type": ["string", "null"],
+          "enum": [null, "systemone_v1", "images", "responses", "chat_completions", "public_api", "trace_ingest"]
+        },
+        "endpoint": { "$ref": "#/$defs/nullableString" },
+        "sdk": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "version", "source_revision"],
+              "properties": {
+                "name": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,63}$" },
+                "version": {
+                  "type": "string",
+                  "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                },
+                "source_revision": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" }
+              }
+            }
+          ]
+        },
+        "client_selection": { "$ref": "#/$defs/clientSelection" },
+        "model": { "$ref": "#/$defs/model" },
+        "credential_env": { "$ref": "#/$defs/nullableString" },
+        "account_ref": { "$ref": "#/$defs/nullableRef" },
+        "project_ref": { "$ref": "#/$defs/nullableRef" },
+        "quota_status": { "enum": ["unknown", "recorded"] },
+        "quota_summary": { "$ref": "#/$defs/nullableString" },
+        "quota_evidence_ref": { "$ref": "#/$defs/nullableRef" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "client_selection": { "properties": { "mode": { "const": "sdk" } } } },
+            "required": ["client_selection"]
+          },
+          "then": { "properties": { "sdk": { "type": "object" } } }
+        },
+        {
+          "if": {
+            "properties": { "client_selection": { "properties": { "mode": { "const": "direct_http" } } } },
+            "required": ["client_selection"]
+          },
+          "then": { "properties": { "sdk": { "type": "null" } } }
+        },
+        {
+          "if": {
+            "properties": { "client_selection": { "properties": { "mode": { "const": "unselected" } } } },
+            "required": ["client_selection"]
+          },
+          "then": { "properties": { "sdk": { "type": "null" } } }
+        }
+      ]
+    },
+    "model": {
+      "type": "object",
+      "description": "Local requested/resolved provider model identity. Accepted pins, documented aliases, exact alias targets, and capability/API mappings are bounded by docs/runbooks/provider-access.md; profile records still require owner approval and do not prove account access.",
+      "additionalProperties": false,
+      "required": ["requested", "resolved", "identity_kind", "policy_status", "approved_model", "expected_resolved", "approval_ref", "approved_by_role", "approved_at", "revalidate_by"],
+      "properties": {
+        "requested": {
+          "$ref": "#/$defs/nullableString",
+          "description": "Exact supported model pin or documented alias for this capability and API surface. Unknown model identifiers remain unsupported."
+        },
+        "resolved": {
+          "$ref": "#/$defs/nullableString",
+          "description": "Recorded resolved identity when known. For successful observed responses, presence follows the documented response surface."
+        },
+        "identity_kind": { "enum": ["unselected", "pinned", "alias"] },
+        "policy_status": { "enum": ["pending", "approved"] },
+        "approved_model": { "$ref": "#/$defs/nullableString" },
+        "expected_resolved": {
+          "$ref": "#/$defs/nullableString",
+          "description": "Required exact documented pinned target for an approved alias; must be absent for a pinned request."
+        },
+        "approval_ref": { "$ref": "#/$defs/nullableRef" },
+        "approved_by_role": { "$ref": "#/$defs/nullableString" },
+        "approved_at": { "$ref": "#/$defs/dateOrNull" },
+        "revalidate_by": { "$ref": "#/$defs/dateOrNull" }
+      }
+    },
+    "clientSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "api_version", "policy_ref"],
+      "properties": {
+        "mode": { "enum": ["unselected", "sdk", "direct_http"] },
+        "api_version": { "type": ["string", "null"], "pattern": "^v[1-9][0-9]*$" },
+        "policy_ref": { "$ref": "#/$defs/nullableRef" }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": { "const": "unselected" },
+            "api_version": { "type": "null" },
+            "policy_ref": { "type": "null" }
+          }
+        },
+        {
+          "properties": {
+            "mode": { "const": "sdk" },
+            "api_version": { "type": "null" },
+            "policy_ref": { "type": "null" }
+          }
+        },
+        {
+          "properties": {
+            "mode": { "const": "direct_http" },
+            "api_version": { "type": "string", "pattern": "^v[1-9][0-9]*$" },
+            "policy_ref": { "type": "string", "pattern": "^(https://[^\\s?#@]+|evidence:[A-Za-z0-9._/-]+|urn:[A-Za-z0-9][A-Za-z0-9._:/-]*)$" }
+          }
+        }
+      ]
+    },
+    "futureUsageAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "owner_role", "live_test_owner_role", "budget_ref", "reservation_protocol_ref"],
+      "properties": {
+        "status": { "enum": ["pending", "approved"] },
+        "owner_role": { "const": "Agent and research" },
+        "live_test_owner_role": { "const": "Agent and research" },
+        "budget_ref": { "$ref": "#/$defs/nullableRef" },
+        "reservation_protocol_ref": { "$ref": "#/$defs/nullableRef" }
+      }
+    },
+    "sponsorIntegration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applicability", "status", "tool_version", "workspace_ref", "artifact_plan_ref"],
+      "properties": {
+        "applicability": { "const": "required" },
+        "status": { "enum": ["pending", "configured"] },
+        "tool_version": { "$ref": "#/$defs/nullableString" },
+        "workspace_ref": { "$ref": "#/$defs/nullableRef" },
+        "artifact_plan_ref": { "$ref": "#/$defs/nullableRef" }
+      }
+    },
+    "eligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "checked_at", "valid_until", "account_ref", "project_ref", "evidence_ref"],
+      "properties": {
+        "status": { "enum": ["unknown", "pending", "eligible", "denied"] },
+        "checked_at": { "$ref": "#/$defs/dateOrNull" },
+        "valid_until": { "$ref": "#/$defs/dateOrNull" },
+        "account_ref": { "$ref": "#/$defs/nullableRef" },
+        "project_ref": { "$ref": "#/$defs/nullableRef" },
+        "evidence_ref": { "$ref": "#/$defs/nullableRef" }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "kind", "checked_at", "valid_until", "endpoint", "account_ref", "project_ref", "requested_model", "resolved_model", "evidence_ref"],
+      "properties": {
+        "status": { "enum": ["not_run", "observed", "denied", "unsupported"] },
+        "kind": { "enum": ["none", "auth", "model_list"] },
+        "checked_at": { "$ref": "#/$defs/dateOrNull" },
+        "valid_until": { "$ref": "#/$defs/dateOrNull" },
+        "endpoint": { "$ref": "#/$defs/nullableString" },
+        "account_ref": { "$ref": "#/$defs/nullableRef" },
+        "project_ref": { "$ref": "#/$defs/nullableRef" },
+        "requested_model": { "$ref": "#/$defs/nullableString" },
+        "resolved_model": { "$ref": "#/$defs/nullableString" },
+        "evidence_ref": { "$ref": "#/$defs/nullableRef" }
+      }
+    },
+    "live": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "dependency_mode", "checked_at", "valid_until", "endpoint", "account_ref", "project_ref", "requested_model", "resolved_model", "evidence_ref"],
+      "properties": {
+        "status": { "enum": ["pending", "observed", "denied"] },
+        "dependency_mode": { "enum": ["not_run", "mock", "recorded", "sandbox", "live"] },
+        "checked_at": { "$ref": "#/$defs/dateOrNull" },
+        "valid_until": { "$ref": "#/$defs/dateOrNull" },
+        "endpoint": { "$ref": "#/$defs/nullableString" },
+        "account_ref": { "$ref": "#/$defs/nullableRef" },
+        "project_ref": { "$ref": "#/$defs/nullableRef" },
+        "requested_model": { "$ref": "#/$defs/nullableString" },
+        "resolved_model": { "$ref": "#/$defs/nullableString" },
+        "evidence_ref": { "$ref": "#/$defs/nullableRef" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "schema_version": { "const": "1.1" } },
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "capabilities": {
+            "items": {
+              "properties": {
+                "configuration": { "required": ["client_selection"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "schema_version": { "const": "1.0" } },
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "capabilities": {
+            "items": {
+              "properties": {
+                "configuration": { "not": { "required": ["client_selection"] } }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

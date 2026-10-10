@@ -1,0 +1,56 @@
+name: Provider profile readiness
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "launch/**"
+
+permissions:
+  contents: read
+
+jobs:
+  offline-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.9"
+
+      - name: Run offline adversarial checks
+        run: python -B -m unittest discover -s tests/config/provider-profile -p 'test_*.py' -v
+
+      - name: Confirm the sample profile stays pending
+        shell: bash
+        run: |
+          set +e
+          python3 -B tools/verify_provider_readiness.py --profile fixtures/provider-profile.json --mode offline > "$RUNNER_TEMP/provider-readiness.json"
+          readiness_exit_code=$?
+          set -e
+          if [ "$readiness_exit_code" -ne 2 ]; then
+            echo "Expected pending profile exit 2; got $readiness_exit_code"
+            exit 1
+          fi
+          python3 -B - "$RUNNER_TEMP/provider-readiness.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as report_file:
+              report = json.load(report_file)
+          assert report["status"] == "pending"
+          assert report["network_accessed"] is False
+          assert len(report["capabilities"]) == 6
+          assert all(cell["live_capability"] in {"pending", "observed", "stale", "denied"} for cell in report["capabilities"])
+          assert report["development_execution"]["engine_api_integration"] == "pending"
+          assert report["development_execution"]["provider_metering"] == "not_established"
+          PY
+
+      - name: Upload sanitized readiness report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-readiness-report
+          path: ${{ runner.temp }}/provider-readiness.json
+          if-no-files-found: error
+          retention-days: 7
