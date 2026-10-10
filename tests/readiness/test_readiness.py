@@ -17,9 +17,11 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tools import validate_jev_targets as jev  # noqa: E402
 from tools import verify_contract_release as contracts  # noqa: E402
+from synthetic_contract import write_complete_synthetic_contract  # noqa: E402
 
 
 def sha(raw: bytes) -> str:
@@ -285,6 +287,14 @@ def complete_synthetic_plan() -> tuple[dict, dict]:
 
 
 class ContractReleaseReadinessTests(unittest.TestCase):
+    def require_native_sandbox(self) -> None:
+        reason = "native Linux bubblewrap is unavailable; local result is not sandbox evidence"
+        if platform.system() == "Linux" and shutil.which("bwrap"):
+            return
+        if os.environ.get("ACV1_REQUIRE_BWRAP") == "1":
+            self.fail("CI requires real Linux bubblewrap sandbox coverage: " + reason)
+        self.skipTest(reason)
+
     def run_contract(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONDONTWRITEBYTECODE": "1",
                "LC_ALL": "C.UTF-8", "PYTHONHASHSEED": "0"}
@@ -448,6 +458,71 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("untrusted_coverage_tags_forbidden", codes)
         self.assertIn("actual_provider_primitive_inventory_missing", codes)
 
+    def test_assembled_release_rejects_uninventoried_schema_missing_tuple_and_missing_field_case(self) -> None:
+        def assembled(root: Path) -> dict:
+            manifest_path, _, _ = write_complete_synthetic_contract(root)
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        def inspect(root: Path, manifest: dict) -> set[str]:
+            errors: list[dict[str, str]] = []
+            contracts.validate_and_run(manifest, root / "package/release.json", errors, evidence=None)
+            return {item["code"] for item in errors}
+
+        with tempfile.TemporaryDirectory(prefix="acv1-uninventoried-schema-") as temp:
+            root = Path(temp)
+            manifest = assembled(root)
+            schema_id = "SYNTH-score"
+            inventory_path = root / "package/field-inventory.json"
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+            inventory["schemas"] = [row for row in inventory["schemas"] if row["schema_id"] != schema_id]
+            mutated_raw = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+            (root / "package/field-inventory-mutated.json").write_bytes(mutated_raw)
+            manifest["canonical_release"]["field_inventory"].update(
+                path="field-inventory-mutated.json", sha256=sha(mutated_raw))
+            manifest["field_crosswalk"] = [row for row in manifest["field_crosswalk"] if row["schema_id"] != schema_id]
+            manifest["fixtures"] = [row for row in manifest["fixtures"] if row["schema_id"] != schema_id]
+            manifest["fixture_crosswalk"] = [row for row in manifest["fixture_crosswalk"] if row["schema_id"] != schema_id]
+            self.assertIn("canonical_schema_inventory_tuple_missing", inspect(root, manifest))
+
+        with tempfile.TemporaryDirectory(prefix="acv1-unmapped-schema-tuple-") as temp:
+            root = Path(temp)
+            manifest = assembled(root)
+            inventory_path = root / "package/field-inventory.json"
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+            untested_tuple = copy.deepcopy(inventory["schemas"][0])
+            untested_tuple["contract_id"] = "SYNTH-CONTRACT-WITHOUT-FIXTURE"
+            inventory["schemas"].append(untested_tuple)
+            mutated_raw = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+            (root / "package/field-inventory-mutated.json").write_bytes(mutated_raw)
+            manifest["canonical_release"]["field_inventory"].update(
+                path="field-inventory-mutated.json", sha256=sha(mutated_raw))
+            self.assertIn("schema_contract_primitive_fixture_missing", inspect(root, manifest))
+
+        with tempfile.TemporaryDirectory(prefix="acv1-missing-schema-field-case-") as temp:
+            root = Path(temp)
+            manifest = assembled(root)
+            inventory_path = root / "package/field-inventory.json"
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+            for row in inventory["schemas"]:
+                if row["schema_id"] == "SYNTH-none":
+                    row["field_paths"] = ["/decision"]
+            mutated_raw = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+            (root / "package/field-inventory-mutated.json").write_bytes(mutated_raw)
+            manifest["canonical_release"]["field_inventory"].update(
+                path="field-inventory-mutated.json", sha256=sha(mutated_raw))
+            manifest["field_crosswalk"] = [
+                row for row in manifest["field_crosswalk"]
+                if not (row["schema_id"] == "SYNTH-none" and row["field_path"] == "/value")
+            ]
+            for row in manifest["field_crosswalk"]:
+                row["coverage_tags"] = ["synthetic-tag-does-not-cover-fields"]
+            manifest["fixture_crosswalk"] = [
+                row for row in manifest["fixture_crosswalk"] if row["case_id"] != "current_valid"
+            ]
+            codes = inspect(root, manifest)
+            self.assertIn("schema_inventory_field_set_mismatch", codes)
+            self.assertIn("fixture_crosswalk_case_missing", codes)
+
     def test_fixture_adapter_echo_without_observed_bytes_is_rejected(self) -> None:
         fixture = {"schema_id": "SYNTH-SCHEMA", "sha256": "b" * 64, "contract_id": "SYNTH-CONTRACT",
                    "primitive": "none", "expected_outcome": "accepted", "serialized_sha256": "c" * 64}
@@ -541,6 +616,15 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(contracts.adapter_provenance_verified(adapter, "f" * 64, evidence))
         self.assertFalse(contracts.adapter_provenance_verified(adapter, "e" * 64, evidence))
 
+    def test_synthetic_evidence_index_is_rejected_by_owner_readiness_mode(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-synthetic-evidence-index-") as temp:
+            _, evidence_path, evidence_sha = write_complete_synthetic_contract(Path(temp))
+            errors: list[dict[str, str]] = []
+            evidence = contracts.load_trusted_evidence_index(
+                str(evidence_path), evidence_sha, ROOT, errors)
+        self.assertIsNone(evidence)
+        self.assertIn("owner_evidence_index_classification_invalid", {item["code"] for item in errors})
+
     def test_local_accepted_owner_url_and_revision_do_not_authenticate_release_decision(self) -> None:
         decision = {
             "status": "accepted", "owner": "shared-contracts",
@@ -575,14 +659,114 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             self.assertFalse(marker.exists())
 
     def test_bubblewrap_sandbox_canaries_when_supported(self) -> None:
-        if platform.system() != "Linux" or not shutil.which("bwrap"):
-            reason = "bubblewrap with namespaces is not available on this platform; local readiness stays blocked"
-            if os.environ.get("ACV1_REQUIRE_BWRAP") == "1":
-                self.fail("CI requires the real bubblewrap filesystem, socket, and child-process canaries: " + reason)
-            self.skipTest(reason)
+        self.require_native_sandbox()
         with tempfile.TemporaryDirectory(prefix="acv1-bwrap-probe-") as temp:
             reason = contracts.probe_sandbox(Path(temp))
         self.assertIsNone(reason)
+
+    def test_bubblewrap_shadow_write_is_private_and_host_canary_unchanged(self) -> None:
+        self.require_native_sandbox()
+        with tempfile.TemporaryDirectory(prefix="acv1-bwrap-shadow-write-") as temp:
+            root = Path(temp)
+            outside = root / "hidden-host-parent" / "host-canary.txt"
+            outside.parent.mkdir()
+            outside.write_bytes(b"original synthetic host canary")
+            reason = contracts._run_sandbox_canary(root, outside)
+            self.assertIsNone(reason)
+            self.assertEqual(outside.read_bytes(), b"original synthetic host canary")
+
+    def test_native_cli_runs_complete_multischema_synthetic_release_through_sealed_sandbox(self) -> None:
+        self.require_native_sandbox()
+        with tempfile.TemporaryDirectory(prefix="acv1-contract-cli-sandbox-") as temp:
+            manifest_path, evidence_path, evidence_sha = write_complete_synthetic_contract(Path(temp))
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "tools/verify_contract_release.py"),
+                 "--manifest", str(manifest_path), "--offline", "--test-only-synthetic",
+                 "--owner-evidence-index", str(evidence_path), "--owner-evidence-sha256", evidence_sha],
+                cwd=ROOT,
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONDONTWRITEBYTECODE": "1",
+                     "LC_ALL": "C.UTF-8", "PYTHONHASHSEED": "0"},
+                text=True, capture_output=True, check=False, timeout=90,
+            )
+        self.assertEqual(result.returncode, 0, "synthetic runner CLI failed with sanitized status: " + result.stdout[:2000])
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "synthetic_test_only_validation_passed")
+        self.assertFalse(report["ready"])
+        self.assertFalse(report["owner_evidence_verified"])
+        self.assertFalse(report["result"]["owner_evidence_verified"])
+        self.assertIn("TEST ONLY", report["result"]["scope"])
+        self.assertEqual(report["result"]["validated_fixture_cases"], len(contracts.REQUIRED_CASES))
+        self.assertEqual(len(report["result"]["schema_sha256"]), 4)
+        self.assertEqual(report["result"]["execution_binding"],
+                         "sealed memfd snapshot exposed through read-only bubblewrap binds")
+
+    def test_native_sandbox_executes_sealed_adapter_schema_fixture_and_dependency_after_path_swaps(self) -> None:
+        self.require_native_sandbox()
+        with tempfile.TemporaryDirectory(prefix="acv1-sealed-snapshot-race-") as temp:
+            root = Path(temp)
+            originals = {
+                "schema.json": b'{"type":"object","properties":{"value":{"type":"integer"}}}',
+                "fixture.json": b'{"value":7}',
+                "snapshot_dep.py": (
+                    b"import hashlib\nfrom pathlib import Path\n"
+                    b"def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()\n"
+                    b"def observe():\n"
+                    b" root=Path(__file__).parent\n"
+                    b" return {'dependency':digest(__file__),'adapter':digest(root/'adapter.py'),"
+                    b"'schema':digest(root/'schema.json'),'fixture':digest(root/'fixture.json)}\n"
+                ),
+                "adapter.py": (
+                    b"import json\nfrom snapshot_dep import observe\n"
+                    b"print(json.dumps(observe(),sort_keys=True,separators=(',',':')))\n"
+                ),
+            }
+            for name, raw in originals.items():
+                (root / name).write_bytes(raw)
+            expected_observation = {
+                "dependency": sha(originals["snapshot_dep.py"]),
+                "adapter": sha(originals["adapter.py"]),
+                "schema": sha(originals["schema.json"]),
+                "fixture": sha(originals["fixture.json"]),
+            }
+            replacements = {
+                "adapter.py": (b"print('replacement adapter executed')\n", False),
+                "schema.json": (b'{"type":"object","properties":{"wrong":{"type":"string"}}}', True),
+                "fixture.json": (b'{"value":999}', True),
+            }
+            for name, (replacement, use_symlink) in replacements.items():
+                snapshot_inputs = {path: (raw, sha(raw)) for path, raw in originals.items()}
+                snapshot, snapshot_error = contracts._make_sealed_snapshot(snapshot_inputs)
+                self.assertIsNone(snapshot_error)
+                self.assertIsNotNone(snapshot)
+                assert snapshot is not None
+                target = root / name
+                backup = root / (name + ".authentic")
+                evil = root / (name + ".replacement")
+                command, command_error = contracts._sandbox_command(root, root / "adapter.py", b"{}", snapshot)
+                self.assertIsNotNone(command)
+                self.assertIsNone(command_error)
+                try:
+                    os.replace(target, backup)
+                    evil.write_bytes(replacement)
+                    if use_symlink:
+                        target.symlink_to(evil.name)
+                    else:
+                        target.write_bytes(replacement)
+                    run = contracts.run_bounded(
+                        command or [], cwd=Path("/"),
+                        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C.UTF-8"},
+                        input_bytes=b"", timeout=10, stdout_limit=4096, stderr_limit=4096,
+                        pass_fds=snapshot.pass_fds)
+                finally:
+                    if target.is_symlink() or target.exists():
+                        target.unlink()
+                    if backup.exists():
+                        os.replace(backup, target)
+                    snapshot.close()
+                self.assertTrue(run["ok"], "native sandbox rejected sealed input snapshot")
+                self.assertEqual(json.loads(run["stdout"].decode("utf-8")), expected_observation)
+                self.assertEqual(target.read_bytes(), originals[name])
+                self.assertTrue(evil.exists())
 
     def test_bounded_runner_limits_stdout_and_stderr(self) -> None:
         with tempfile.TemporaryDirectory(prefix="acv1-output-bound-") as temp:
@@ -759,6 +943,61 @@ class JevTargetReadinessTests(unittest.TestCase):
                 approval.update({"subject_id": subject_id, "subject_sha256": digest})
         report = self.validate_synthetic(targets, dataset)
         self.assertIn("dataset_sample_count_below_owner_target", {item["code"] for item in report["errors"]})
+
+    def test_extra_ground_truth_key_and_label_cannot_pad_sample_or_stratum_coverage(self) -> None:
+        targets, dataset = complete_synthetic_plan()
+        question = targets["questions"][0]
+        question_id = question["question_id"]
+        question["ground_truth"]["unexpected_extra_outcome"] = "fifth-label"
+        question["coverage"]["minimum_samples_by_split"] = {split: 10 for split in jev.SPLITS}
+        question["coverage"]["required_strata"]["malicious_source"] = {
+            "applicability": "required",
+            "minimum_by_value_by_split": {"synthetic-attack": {split: 6 for split in jev.SPLITS}},
+        }
+        for split in jev.SPLITS:
+            rows = dataset["splits"][split]["examples"]
+            for index in range(6):
+                sample_id = f"SYNTH-EXTRA-LABEL-{split}-{index}"
+                rows.append({
+                    "sample_id": sample_id,
+                    "sample_sha256": sha(sample_id.encode()),
+                    "labels": {question_id: "fifth-label"},
+                    "eligible_question_ids": [question_id],
+                    "strata": {question_id: {"malicious_source": "synthetic-attack"}},
+                })
+            rows.sort(key=lambda row: row["sample_id"])
+            dataset["splits"][split]["sha256"] = jev.canonical_hash(rows)
+
+        hashes = {split: dataset["splits"][split]["sha256"] for split in jev.SPLITS}
+        targets["dataset_split_sha256"] = dict(hashes)
+        examples = {split: dataset["splits"][split]["examples"] for split in jev.SPLITS}
+        for item in targets["questions"]:
+            item["dataset_split_sha256"] = dict(hashes)
+            input_hash, eligibility_hash = jev.dataset_scope_hashes(item["question_id"], examples)
+            item["candidate_comparison"].update(
+                dataset_split_sha256=dict(hashes), input_set_sha256=input_hash,
+                eligibility_sha256=eligibility_hash)
+            for baseline in item["baselines"].values():
+                baseline.update(dataset_split_sha256=dict(hashes), input_set_sha256=input_hash,
+                                eligibility_sha256=eligibility_hash)
+        for _, approval, _, _, subject_id, digest in jev.approval_subjects(targets, dataset):
+            if isinstance(approval, dict):
+                approval.update(subject_id=subject_id, subject_sha256=digest)
+
+        report = self.validate_synthetic(targets, dataset)
+        errors = report["errors"]
+        paths = {item["path"] for item in errors}
+        self.assertIn("ground_truth_keys_unsupported", {item["code"] for item in errors})
+        self.assertIn("unsupported_question_ground_truth_label", {item["code"] for item in errors})
+        self.assertEqual(
+            {path for path in paths if path.startswith("$.questions[0].coverage.minimum_samples_by_split.")},
+            {f"$.questions[0].coverage.minimum_samples_by_split.{split}" for split in jev.SPLITS},
+        )
+        self.assertEqual(
+            {path for path in paths if path.startswith("$.questions[0].coverage.required_strata.malicious_source.synthetic-attack.")},
+            {f"$.questions[0].coverage.required_strata.malicious_source.synthetic-attack.{split}" for split in jev.SPLITS},
+        )
+        self.assertFalse(any(item["code"] == "dataset_label_coverage_below_owner_target" for item in errors))
 
     def test_only_question_eligible_valid_labels_count_for_strata(self) -> None:
         targets, dataset = complete_synthetic_plan()

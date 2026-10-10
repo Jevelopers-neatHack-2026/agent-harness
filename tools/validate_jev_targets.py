@@ -611,6 +611,10 @@ def validate_question(question: Any, index: int, dataset_hashes: dict[str, str],
         gt = {}
     gt_keys = ("positive_label", "negative_label", "unknown_label", "review_label")
     gt_values: list[str] = []
+    unsupported_gt_keys = [key for key in gt if key not in gt_keys]
+    if unsupported_gt_keys:
+        add_error(errors, "ground_truth_keys_unsupported", path + ".ground_truth", expected_role,
+                  "Keep ground_truth limited to the four owner-defined positive, negative, unknown, and review outcomes.")
     for key in gt_keys:
         value = gt.get(key)
         if isinstance(value, str) and value.strip() and value.strip().lower() not in {"tbd", "todo", "pending"}:
@@ -640,7 +644,9 @@ def validate_question(question: Any, index: int, dataset_hashes: dict[str, str],
     mins = coverage.get("minimum_samples_by_split")
     if not isinstance(mins, dict):
         mins = {}
-    accepted_labels = set(value for value in gt.values() if isinstance(value, str))
+    # Only the four explicitly validated outcomes may contribute to sample,
+    # label, or stratum coverage. Extra metadata never creates a new outcome.
+    accepted_labels = set(gt_values)
     eligible_counts: dict[str, int] = {}
     valid_rows_by_split: dict[str, list[dict[str, Any]]] = {}
     for split in SPLITS:
@@ -652,7 +658,8 @@ def validate_question(question: Any, index: int, dataset_hashes: dict[str, str],
             sample_id = row.get("sample_id") if isinstance(row, dict) else None
             label = labels.get(question_id) if isinstance(labels, dict) and isinstance(question_id, str) else None
             if isinstance(label, str) and label not in accepted_labels:
-                add_error(errors, "unsupported_question_ground_truth_label", path + ".ground_truth", expected_role,
+                add_error(errors, "unsupported_question_ground_truth_label",
+                          path + f".dataset_splits.{split}.examples", expected_role,
                           "Use only this question's exact owner-approved positive, negative, unknown, or review label values.")
             if isinstance(label, str) and isinstance(eligible, list) and question_id not in eligible:
                 add_error(errors, "question_label_outside_eligibility", path + ".ground_truth", expected_role,
@@ -686,7 +693,8 @@ def validate_question(question: Any, index: int, dataset_hashes: dict[str, str],
             count = sum(1 for row in valid_rows_by_split.get(split, [])
                         if isinstance(row.get("labels"), dict) and row["labels"].get(question_id) == label)
             if valid_target and count < target:
-                add_error(errors, "dataset_label_coverage_below_owner_target", path + ".coverage.minimum_per_label_by_split", expected_role,
+                add_error(errors, "dataset_label_coverage_below_owner_target",
+                          path + f".coverage.minimum_per_label_by_split.{label}.{split}", expected_role,
                           "Add independently reviewed examples until this label meets the owner-approved per-split minimum.")
     strata_plan = coverage.get("required_strata")
     if not isinstance(strata_plan, dict):
@@ -722,7 +730,8 @@ def validate_question(question: Any, index: int, dataset_hashes: dict[str, str],
                                 and isinstance(row["strata"].get(question_id), dict)
                                 and row["strata"][question_id].get(stratum) == bucket)
                     if valid_target and count < target:
-                        add_error(errors, "dataset_stratum_coverage_below_owner_target", spath, expected_role,
+                        add_error(errors, "dataset_stratum_coverage_below_owner_target",
+                                  spath + f".{bucket}.{split}", expected_role,
                                   "Add independently reviewed examples until this stratum meets the owner-approved minimum.")
         else:
             add_error(errors, "stratum_applicability_invalid", spath + ".applicability", expected_role,

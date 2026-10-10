@@ -23,7 +23,7 @@ import subprocess
 import sys
 import sysconfig
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -34,6 +34,8 @@ OWNER_EVIDENCE_FORMAT = "agent-creative.owner-evidence/v1"
 ADAPTER_PROTOCOL = "agent-creative.contract-fixture-adapter/v2"
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+MAX_SEALED_SNAPSHOT_BYTES = 128 * 1024 * 1024
+MAX_SEALED_SNAPSHOT_FILES = 512
 MAX_ADAPTER_STDOUT = 2 * 1024 * 1024
 MAX_ADAPTER_STDERR = 64 * 1024
 ADAPTER_TIMEOUT_SECONDS = 60
@@ -137,6 +139,84 @@ class InputProblem(Exception):
         self.item = {"code": code, "path": path, "owner": owner, "action": action}
 
 
+class SealedSnapshot:
+    """Immutable memfd copies of exact, hash-verified execution artifacts."""
+
+    def __init__(self, files: dict[str, int]):
+        self.files = files
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        return tuple(self.files[path] for path in sorted(self.files))
+
+    def close(self) -> None:
+        for descriptor in self.files.values():
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self.files.clear()
+
+
+def _make_sealed_snapshot(artifacts: dict[str, tuple[bytes, str]]) -> tuple[SealedSnapshot | None, str | None]:
+    """Seal the exact bytes whose expected hashes came from the release manifest."""
+    if not hasattr(os, "memfd_create"):
+        return None, "The Linux runtime lacks sealed in-memory file support; provision Linux memfd sealing before adapter execution."
+    try:
+        import fcntl
+        allow_sealing = getattr(os, "MFD_ALLOW_SEALING", None)
+        required_seals = (getattr(fcntl, "F_SEAL_SEAL", None), getattr(fcntl, "F_SEAL_SHRINK", None),
+                          getattr(fcntl, "F_SEAL_GROW", None), getattr(fcntl, "F_SEAL_WRITE", None))
+        add_seals = getattr(fcntl, "F_ADD_SEALS", None)
+        get_seals = getattr(fcntl, "F_GET_SEALS", None)
+        if (not isinstance(allow_sealing, int) or add_seals is None or get_seals is None
+                or any(not isinstance(value, int) for value in required_seals)):
+            return None, "The Linux runtime lacks required memfd seals; provision sealed immutable execution snapshots."
+        if len(artifacts) > MAX_SEALED_SNAPSHOT_FILES:
+            raise ValueError("snapshot file count limit")
+        total_size = sum(len(raw) for raw, _ in artifacts.values() if isinstance(raw, bytes))
+        if total_size > MAX_SEALED_SNAPSHOT_BYTES:
+            raise ValueError("snapshot byte limit")
+        sealed_bits = 0
+        for value in required_seals:
+            sealed_bits |= value
+        files: dict[str, int] = {}
+        for relative, (raw, expected_sha) in sorted(artifacts.items()):
+            path = PurePosixPath(relative)
+            if (path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts)
+                    or not isinstance(raw, bytes) or not raw or len(raw) > MAX_ARTIFACT_BYTES
+                    or not digest_ok(expected_sha) or sha256_bytes(raw) != expected_sha):
+                raise ValueError("snapshot artifact identity or bytes invalid")
+            normalized = path.as_posix()
+            if normalized in files:
+                raise ValueError("snapshot path duplicate")
+            for existing in files:
+                existing_path = PurePosixPath(existing)
+                if existing_path in path.parents or path in existing_path.parents:
+                    raise ValueError("snapshot path parent collision")
+            descriptor = os.memfd_create("acv1-release-artifact",
+                                         allow_sealing | getattr(os, "MFD_CLOEXEC", 0))
+            files[normalized] = descriptor
+            offset = 0
+            while offset < len(raw):
+                count = os.write(descriptor, raw[offset:])
+                if count <= 0:
+                    raise OSError("short memfd write")
+                offset += count
+            fcntl.fcntl(descriptor, add_seals, sealed_bits)
+            if fcntl.fcntl(descriptor, get_seals) & sealed_bits != sealed_bits:
+                raise OSError("memfd seals did not hold")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+        return SealedSnapshot(files), None
+    except (OSError, ValueError, TypeError):
+        for descriptor in locals().get("files", {}).values():
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        return None, "Pinned execution artifacts could not be copied into immutable sealed files; the adapter is not executed."
+
+
 def _pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -205,21 +285,6 @@ def read_bounded_file(path: Path, limit: int = MAX_ARTIFACT_BYTES) -> bytes:
     if len(raw) > limit:
         raise OSError("artifact exceeds size bound")
     return raw
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        total = 0
-        while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_ARTIFACT_BYTES:
-                raise OSError("artifact exceeds size bound")
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def canonical_hash(value: Any) -> str:
@@ -308,6 +373,44 @@ def check_artifact(base: Path, item: Any, json_path: str, owner: str,
     return path, None
 
 
+def _read_execution_artifacts(base: Path,
+                              artifacts: list[tuple[Path | None, str | None, str]],
+                              errors: list[dict[str, str]]) -> dict[str, tuple[bytes, str]] | None:
+    """Read each execution input once more, require its pinned hash, and key by sandbox path."""
+    result: dict[str, tuple[bytes, str]] = {}
+    total_size = 0
+    for path, expected_sha, label in artifacts:
+        if path is None or not digest_ok(expected_sha):
+            add_error(errors, "execution_snapshot_input_unavailable", "$.canonical_release", "shared-contracts",
+                      f"Publish and pin the {label} bytes before isolated execution.")
+            continue
+        try:
+            relative = path.relative_to(base).as_posix()
+            raw = read_bounded_file(path)
+        except (OSError, ValueError):
+            add_error(errors, "execution_snapshot_input_unavailable", "$.canonical_release", "shared-contracts",
+                      f"Keep the pinned {label} readable inside the canonical release package.")
+            continue
+        if sha256_bytes(raw) != expected_sha:
+            add_error(errors, "execution_snapshot_pin_mismatch", "$.canonical_release", "shared-contracts",
+                      f"Restore the exact pinned {label} bytes before execution; changed package paths are never used.")
+            continue
+        total_size += len(raw)
+        if total_size > MAX_SEALED_SNAPSHOT_BYTES or len(result) >= MAX_SEALED_SNAPSHOT_FILES:
+            add_error(errors, "execution_snapshot_limit_exceeded", "$.canonical_release", "shared-contracts",
+                      "Reduce the published runtime adapter/schema/fixture set to the standalone verifier's fixed snapshot resource bound.")
+            continue
+        previous = result.get(relative)
+        if previous is not None and previous[1] != expected_sha:
+            add_error(errors, "execution_snapshot_path_collision", "$.canonical_release", "shared-contracts",
+                      "Give each distinct adapter, dependency, schema, inventory, and fixture artifact a unique relative package path.")
+            continue
+        result[relative] = (raw, expected_sha)
+    if errors:
+        return None
+    return result
+
+
 def _repo_for_role(role: Any, leaf: Any) -> str | None:
     if not isinstance(role, str) or not isinstance(leaf, str):
         return None
@@ -325,7 +428,8 @@ def _valid_issue_ref(value: Any, repository: str) -> bool:
 
 
 def load_trusted_evidence_index(path_value: str | None, expected_sha: str | None,
-                                workspace_root: Path, errors: list[dict[str, str]]) -> dict[str, Any] | None:
+                                workspace_root: Path, errors: list[dict[str, str]], *,
+                                allow_test_only: bool = False) -> dict[str, Any] | None:
     owner_action = "Provision the independently verified owner-evidence index outside the repository and pin its exact SHA-256 in trusted runner configuration; local manifest assertions are not approval evidence."
     if not path_value or not digest_ok(expected_sha):
         add_error(errors, "owner_evidence_index_unavailable", "$.owner_evidence_index", "Agent and research", owner_action)
@@ -355,6 +459,11 @@ def load_trusted_evidence_index(path_value: str | None, expected_sha: str | None
         return None
     if not isinstance(index, dict) or index.get("format") != OWNER_EVIDENCE_INDEX_FORMAT:
         add_error(errors, "owner_evidence_index_format_invalid", "$.owner_evidence_index.format", "Agent and research", owner_action)
+        return None
+    classification = index.get("classification")
+    if (classification == "synthetic_test_only") != allow_test_only:
+        add_error(errors, "owner_evidence_index_classification_invalid", "$.owner_evidence_index.classification", "Agent and research",
+                  "Production readiness requires an independently trusted owner index; test-only evidence is accepted only by the explicit synthetic execution mode and never establishes readiness.")
         return None
     records = index.get("evidence")
     if not isinstance(records, list) or not records:
@@ -412,7 +521,8 @@ def load_trusted_evidence_index(path_value: str | None, expected_sha: str | None
         by_id[evidence_id] = dict(identity, evidence_sha256=evidence_sha)
     if errors:
         return None
-    return {"sha256": expected_sha, "records": by_id}
+    return {"sha256": expected_sha, "records": by_id,
+            "classification": "synthetic_test_only" if allow_test_only else "owner_evidence_unverified_origin"}
 
 
 def validate_approval(approval: Any, *, path: str, owner_role: str, subject_id: str,
@@ -503,6 +613,113 @@ def _read_inventory(base: Path, descriptor: Any, errors: list[dict[str, str]]) -
     return data, digest, path
 
 
+def _schema_field_paths(document: Any) -> set[str]:
+    """Return the statically declared JSON Schema property paths.
+
+    Paths use JSON Pointer escaping. Internal references and composed schemas
+    are followed; schemas whose property names cannot be enumerated statically
+    are rejected so an inventory cannot claim incomplete coverage.
+    """
+    from urllib.parse import unquote
+
+    if not isinstance(document, dict):
+        raise ValueError("schema root is not an object")
+    paths: set[str] = set()
+    root_fields: set[str] = set()
+    root_required: set[str] = set()
+    visited: set[tuple[int, str]] = set()
+
+    def decode_pointer_part(part: str) -> str:
+        decoded = unquote(part)
+        index = 0
+        while index < len(decoded):
+            if decoded[index] == "~":
+                if index + 1 >= len(decoded) or decoded[index + 1] not in "01":
+                    raise ValueError("invalid schema reference pointer")
+                index += 2
+            else:
+                index += 1
+        return decoded.replace("~1", "/").replace("~0", "~")
+
+    def resolve_local_ref(reference: Any) -> Any:
+        if not isinstance(reference, str) or not reference.startswith("#"):
+            raise ValueError("external schema reference requires an explicitly published dependency")
+        if reference == "#":
+            return document
+        if not reference.startswith("#/"):
+            raise ValueError("unsupported schema reference")
+        target: Any = document
+        for segment in reference[2:].split("/"):
+            key = decode_pointer_part(segment)
+            if not isinstance(target, dict) or key not in target:
+                raise ValueError("unresolved schema reference")
+            target = target[key]
+        return target
+
+    def walk(node: Any, prefix: str) -> None:
+        if isinstance(node, bool):
+            return
+        if not isinstance(node, dict):
+            raise ValueError("schema node is not an object")
+        marker = (id(node), prefix)
+        if marker in visited:
+            return
+        visited.add(marker)
+        if "$ref" in node:
+            walk(resolve_local_ref(node["$ref"]), prefix)
+        properties = node.get("properties", {})
+        if not isinstance(properties, dict):
+            raise ValueError("schema properties is not an object")
+        for name, child in properties.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("schema property name is invalid")
+            escaped = name.replace("~", "~0").replace("/", "~1")
+            property_path = prefix + "/" + escaped
+            paths.add(property_path)
+            if not prefix:
+                root_fields.add(property_path)
+            walk(child, property_path)
+        if node.get("patternProperties"):
+            raise ValueError("patternProperties cannot be inventoried as exact field paths")
+        additional = node.get("additionalProperties")
+        if isinstance(additional, dict):
+            raise ValueError("schema allows dynamically named additional properties")
+        required = node.get("required", [])
+        if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
+            raise ValueError("schema required list is malformed")
+        if not prefix:
+            root_required.update("/" + item.replace("~", "~0").replace("/", "~1") for item in required)
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            branches = node.get(keyword, [])
+            if not isinstance(branches, list):
+                raise ValueError("schema composition is malformed")
+            for branch in branches:
+                walk(branch, prefix)
+        for keyword in ("not", "if", "then", "else"):
+            if keyword in node:
+                walk(node[keyword], prefix)
+        dependent = node.get("dependentSchemas", {})
+        if not isinstance(dependent, dict):
+            raise ValueError("schema dependentSchemas is malformed")
+        for branch in dependent.values():
+            walk(branch, prefix)
+        items = node.get("items")
+        if isinstance(items, dict) or isinstance(items, bool):
+            walk(items, prefix + "/*")
+        elif isinstance(items, list):
+            for index, item in enumerate(items):
+                walk(item, prefix + "/" + str(index))
+        elif items is not None:
+            raise ValueError("schema items is malformed")
+
+    walk(document, "")
+    if not root_required.issubset(root_fields):
+        raise ValueError("root required property is not declared")
+    if not paths:
+        raise ValueError("schema declares no runtime fields")
+    return paths
+
+
 def validate_crosswalk(manifest: dict[str, Any], schemas: dict[str, dict[str, Any]],
                        inventory: dict[str, Any] | None, evidence: dict[str, Any] | None,
                        errors: list[dict[str, str]]) -> None:
@@ -513,6 +730,8 @@ def validate_crosswalk(manifest: dict[str, Any], schemas: dict[str, dict[str, An
                   "Publish a nonempty exact field inventory per canonical schema, contract, and primitive; the harness will not infer field names.")
         inventory_schemas = []
     seen_inventory_keys: set[tuple[str, str, str]] = set()
+    schema_inventory_keys: set[tuple[str, str]] = set()
+    inventory_tuple_keys: set[tuple[str, str, str, str]] = set()
     all_primitives: set[str] = set()
     for index, item in enumerate(inventory_schemas):
         path = f"$.canonical_release.field_inventory.schemas[{index}]"
@@ -533,6 +752,8 @@ def validate_crosswalk(manifest: dict[str, Any], schemas: dict[str, dict[str, An
             add_error(errors, "schema_inventory_duplicate", path, "shared-contracts",
                       "Publish one field inventory per exact schema SHA, contract ID, and primitive.")
         seen_inventory_keys.add(key)
+        schema_inventory_keys.add((schema_id, schema_sha))
+        inventory_tuple_keys.add((schema_id, schema_sha, contract_id, primitive))
         if not isinstance(fields, list) or not fields or any(not isinstance(field, str) or not field.strip() for field in fields):
             add_error(errors, "schema_field_inventory_empty_or_invalid", path + ".field_paths", "shared-contracts",
                       "Publish every exact serialized field path from the owner schema; empty schemas cannot satisfy the gate.")
@@ -540,6 +761,13 @@ def validate_crosswalk(manifest: dict[str, Any], schemas: dict[str, dict[str, An
         if len(fields) != len(set(field for field in fields if isinstance(field, str))):
             add_error(errors, "schema_field_inventory_duplicate", path + ".field_paths", "shared-contracts",
                       "Remove duplicate field paths from the owner-generated schema inventory.")
+        actual_schema_fields = schemas.get(schema_id, {}).get("field_paths")
+        if isinstance(actual_schema_fields, set) and set(field for field in fields if isinstance(field, str)) != actual_schema_fields:
+            add_error(errors, "schema_inventory_field_set_mismatch", path + ".field_paths", "shared-contracts",
+                      "Inventory every property declared by the exact pinned runtime schema; extra fields, omissions, and aliases do not count as schema coverage.")
+        elif not isinstance(actual_schema_fields, set):
+            add_error(errors, "schema_inventory_source_unavailable", path + ".field_paths", "shared-contracts",
+                      "Publish an enumerable JSON schema with exact declared fields; the harness will not infer field names from tags or aliases.")
         if not isinstance(aliases, list) or any(not isinstance(alias, str) or not alias.strip() for alias in aliases):
             add_error(errors, "schema_alias_inventory_invalid", path + ".aliases", "shared-contracts",
                       "Publish an explicit owner-reviewed alias list; aliases cannot substitute for canonical field paths.")
@@ -597,6 +825,11 @@ def validate_crosswalk(manifest: dict[str, Any], schemas: dict[str, dict[str, An
                 continue
             validate_approval(review, path=path + "." + side, owner_role=row[role_key], subject_id=subject_id,
                               subject_sha256=subject_hash, leaf=row[leaf_key], evidence=evidence, errors=errors)
+    for schema_id, schema in schemas.items():
+        schema_identity = (schema_id, schema.get("sha256"))
+        if schema_identity not in schema_inventory_keys:
+            add_error(errors, "canonical_schema_inventory_tuple_missing", "$.canonical_release.field_inventory.schemas", "shared-contracts",
+                      "Add owner-published field inventory rows for every declared runtime schema artifact; schemas are not auxiliary unless separately modeled.")
     for missing in sorted(expected - actual):
         add_error(errors, "crosswalk_field_missing", "$.field_crosswalk", "shared-contracts",
                   "Add the exact schema/contract/primitive/field-path row missing from the pinned inventory.")
@@ -617,7 +850,10 @@ def _validate_fixture_map(manifest: dict[str, Any], schemas: dict[str, dict[str,
         (item.get("schema_id"), item.get("schema_sha256"), item.get("contract_id"), item.get("primitive"))
         for item in schema_entries if isinstance(item, dict)
         and all(isinstance(item.get(key), str) for key in ("schema_id", "schema_sha256", "contract_id", "primitive"))
+        and isinstance(schemas.get(item.get("schema_id")), dict)
+        and schemas[item.get("schema_id")].get("sha256") == item.get("schema_sha256")
     }
+    fixture_tuple_keys: set[tuple[str, str, str, str]] = set()
     for index, fixture in enumerate(fixture_rows):
         path = f"$.fixtures[{index}]"
         if not isinstance(fixture, dict):
@@ -644,6 +880,8 @@ def _validate_fixture_map(manifest: dict[str, Any], schemas: dict[str, dict[str,
         if not mapped_identity or not isinstance(schema_record, dict) or schema_record.get("sha256") != schema_sha:
             add_error(errors, "fixture_schema_contract_primitive_unmapped", path, "shared-contracts",
                       "Map each fixture to the exact pinned schema, owner contract, and primitive inventory entry it exercises.")
+        else:
+            fixture_tuple_keys.add((schema_id, schema_sha, contract_id, primitive))
         if fixture.get("expected_outcome") != REQUIRED_CASES[case_id]:
             add_error(errors, "fixture_expected_outcome_invalid", path + ".expected_outcome", "shared-contracts",
                       "Publish the owner-approved semantic expected outcome for this issue acceptance case.")
@@ -681,6 +919,9 @@ def _validate_fixture_map(manifest: dict[str, Any], schemas: dict[str, dict[str,
         if not isinstance(fixture, dict) or fixture.get("primitive") != primitive:
             add_error(errors, "provider_primitive_fixture_missing", "$.fixtures", "creative-engine",
                       f"Provide the actual owner fixture for provider primitive {primitive!r}; do not infer provider payload or confidence semantics.")
+    for missing_tuple in sorted(inventory_keys - fixture_tuple_keys):
+        add_error(errors, "schema_contract_primitive_fixture_missing", "$.fixtures", "shared-contracts",
+                  "Map at least one owner-published fixture to every exact runtime schema/contract/primitive inventory tuple.")
     crosswalk = manifest.get("fixture_crosswalk")
     expected_mapping = {
         (case_id, fixture.get("schema_id"), fixture.get("schema_sha256"), fixture.get("contract_id"), fixture.get("primitive"), fixture.get("sha256"))
@@ -719,38 +960,7 @@ def _validate_fixture_map(manifest: dict[str, Any], schemas: dict[str, dict[str,
     return fixtures, fixture_paths
 
 
-def _sandbox_command(package_root: Path, adapter: Path, request_bytes: bytes) -> tuple[list[str] | None, str | None]:
-    if platform.system() != "Linux":
-        return None, "The current platform has no accepted supported no-network filesystem sandbox backend; macOS sandbox-exec is deprecated and is not used as a security boundary. Provision reviewed bubblewrap on a supported Linux runner or another audited OS sandbox."
-    bwrap = shutil.which("bwrap")
-    if not bwrap:
-        return None, "bubblewrap is unavailable. Provision a supported bubblewrap runtime with user, network, and PID namespaces; adapters are not executed without an enforceable OS sandbox."
-    if not request_bytes or len(request_bytes) > 512 * 1024:
-        return None, "The adapter request exceeds the fixed offline execution input bound."
-    python_exe = os.path.realpath(sys.executable)
-    if not python_exe.startswith("/usr/"):
-        return None, "The Python runtime is outside the isolated /usr system tree; provision the approved Python runtime under /usr."
-    if not adapter.is_file() or not package_root.is_dir():
-        return None, "The pinned adapter or owner package is unavailable; republish them within the canonical package."
-    command = [
-        bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
-        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-        "--dir", "/usr", "--ro-bind", "/usr", "/usr",
-    ]
-    for system_dir in ("/lib", "/lib64", "/bin", "/sbin"):
-        if os.path.exists(system_dir):
-            command.extend(["--dir", system_dir, "--ro-bind", system_dir, system_dir])
-    command.extend([
-        "--dir", "/release", "--ro-bind", str(package_root.resolve()), "/release",
-        "--chdir", "/release", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
-        "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8",
-        python_exe, "-I", "-B", "-S", "/release/" + adapter.relative_to(package_root).as_posix(),
-    ])
-    return command, None
-
-
-def probe_sandbox(package_root: Path) -> str | None:
-    """Require an offline canary proving host paths and host networking are isolated."""
+def _sandbox_prerequisite_error() -> str | None:
     if platform.system() != "Linux":
         return "The current platform has no accepted supported no-network filesystem sandbox backend; macOS sandbox-exec is deprecated and is not used as a security boundary. Provision reviewed bubblewrap on a supported Linux runner or another audited OS sandbox."
     bwrap = shutil.which("bwrap")
@@ -759,60 +969,137 @@ def probe_sandbox(package_root: Path) -> str | None:
     python_exe = os.path.realpath(sys.executable)
     if not python_exe.startswith("/usr/"):
         return "The Python runtime is outside the isolated /usr system tree; provision the approved Python runtime under /usr."
+    return None
+
+
+def _sandbox_command(package_root: Path, adapter: Path, request_bytes: bytes,
+                     snapshot: SealedSnapshot | None = None) -> tuple[list[str] | None, str | None]:
+    prerequisite = _sandbox_prerequisite_error()
+    if prerequisite is not None:
+        return None, prerequisite
+    if not request_bytes or len(request_bytes) > 512 * 1024:
+        return None, "The adapter request exceeds the fixed offline execution input bound."
+    python_exe = os.path.realpath(sys.executable)
+    if snapshot is None:
+        return None, "A sealed hash-verified execution snapshot is required; mutable package paths are never mounted."
+    if not package_root.is_dir():
+        return None, "The canonical package root is unavailable; republish its verified artifacts."
+    try:
+        adapter_relative = adapter.relative_to(package_root).as_posix()
+    except ValueError:
+        return None, "The pinned adapter path is outside the canonical package."
+    if adapter_relative not in snapshot.files:
+        return None, "The pinned adapter is absent from the sealed execution snapshot."
+    bwrap = shutil.which("bwrap")
+    assert bwrap is not None
+    command = [
+        bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+        "--dir", "/usr", "--ro-bind", "/usr", "/usr",
+    ]
+    for system_dir in ("/lib", "/lib64", "/bin", "/sbin"):
+        if os.path.exists(system_dir):
+            command.extend(["--dir", system_dir, "--ro-bind", system_dir, system_dir])
+    command.extend(["--dir", "/release", "--tmpfs", "/release"])
+    directories: set[str] = set()
+    for relative in snapshot.files:
+        path = PurePosixPath(relative)
+        for depth in range(1, len(path.parts)):
+            directories.add("/release/" + "/".join(path.parts[:depth]))
+    for directory in sorted(directories, key=lambda value: (value.count("/"), value)):
+        command.extend(["--dir", directory])
+    for relative in sorted(snapshot.files):
+        command.extend(["--ro-bind-data", str(snapshot.files[relative]), "/release/" + relative])
+    command.extend([
+        "--remount-ro", "/release", "--chdir", "/release", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
+        "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8",
+        python_exe, "-I", "-B", "-S", "/release/" + adapter_relative,
+    ])
+    return command, None
+
+
+def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
+    """Exercise the real filesystem, network namespace, and descendant boundaries."""
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        return "bubblewrap is unavailable. Provision a supported bubblewrap runtime with user, network, and PID namespaces; adapters are not executed without an enforceable OS sandbox."
+    python_exe = os.path.realpath(sys.executable)
+    if not python_exe.startswith("/usr/"):
+        return "The Python runtime is outside the isolated /usr system tree; provision the approved Python runtime under /usr."
+    prefix = [bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
+              "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+              "--dir", "/usr", "--ro-bind", "/usr", "/usr"]
+    for system_dir in ("/lib", "/lib64", "/bin", "/sbin"):
+        if os.path.exists(system_dir):
+            prefix.extend(["--dir", system_dir, "--ro-bind", system_dir, system_dir])
+    prefix.extend(["--dir", "/release", "--ro-bind", str(package_root.resolve()), "/release",
+                   "--chdir", "/release", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
+                   "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8"])
+    child_code = (
+        "import socket,sys\n"
+        "read_blocked=False\n"
+        "try: open(sys.argv[1],'rb').read()\n"
+        "except OSError: read_blocked=True\n"
+        "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2)\n"
+        "try: s.connect(('198.18.0.1',9)); net_blocked=False\n"
+        "except OSError: net_blocked=True\n"
+        "print('child-read-blocked='+str(read_blocked)+' child-network-blocked='+str(net_blocked))\n"
+        "sys.exit(0 if read_blocked and net_blocked else 7)\n"
+    )
+    parent_code = (
+        "import json,os,socket,subprocess,sys\n"
+        "r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_blocked':False,'child_isolated':False}\n"
+        "try: open(sys.argv[1],'rb').read()\n"
+        "except OSError: r['outside_read_blocked']=True\n"
+        "try:\n"
+        " s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2); s.connect(('198.18.0.1',9))\n"
+        "except OSError: r['network_blocked']=True\n"
+        "p=subprocess.run([sys.executable,'-I','-B','-S','-c',sys.argv[2],sys.argv[1]],capture_output=True,timeout=2)\n"
+        "r['child_isolated']=(p.returncode==0 and b'child-read-blocked=True child-network-blocked=True' in p.stdout)\n"
+        "try:\n"
+        " os.makedirs(os.path.dirname(sys.argv[1]),exist_ok=True)\n"
+        " with open(sys.argv[1],'wb') as f: f.write(b'sandbox-shadow-write')\n"
+        " with open(sys.argv[1],'rb') as f: r['sandbox_shadow_write_succeeded']=(f.read()==b'sandbox-shadow-write')\n"
+        "except OSError: pass\n"
+        "print(json.dumps(r,sort_keys=True,separators=(',',':')))\n"
+        "sys.exit(0 if all(r.values()) else 8)\n"
+    )
+    command = prefix + [python_exe, "-I", "-B", "-S", "-c", parent_code,
+                        str(outside), child_code]
+    run = run_bounded(command, cwd=package_root,
+                      env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
+                           "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"},
+                      input_bytes=b"", timeout=5, stdout_limit=4096, stderr_limit=4096)
+    if not run.get("ok"):
+        return "bubblewrap isolation canary failed; host path, host-write, child containment, or network namespace policy did not hold."
+    try:
+        report = parse_json_bytes(run["stdout"])
+    except (ValueError, UnicodeError, json.JSONDecodeError, RecursionError):
+        return "bubblewrap isolation canary returned invalid diagnostics; the owner adapter is not executed."
+    if (not isinstance(report, dict) or report.get("outside_read_blocked") is not True
+            or report.get("sandbox_shadow_write_succeeded") is not True
+            or report.get("network_blocked") is not True or report.get("child_isolated") is not True):
+        return "bubblewrap isolation canary did not prove read, shadow-write, socket, and descendant boundaries; the owner adapter is not executed."
+    return None
+
+
+def probe_sandbox(package_root: Path) -> str | None:
+    """Require an offline canary proving host paths and host networking are isolated."""
+    if platform.system() != "Linux":
+        return "The current platform has no accepted supported no-network filesystem sandbox backend; macOS sandbox-exec is deprecated and is not used as a security boundary. Provision reviewed bubblewrap on a supported Linux runner or another audited OS sandbox."
+    prerequisite = _sandbox_prerequisite_error()
+    if prerequisite is not None:
+        return prerequisite
     try:
         import tempfile
         with tempfile.TemporaryDirectory(prefix="acv1-sandbox-canary-") as temp:
             outside = Path(temp) / "host-canary.txt"
             outside.write_text("synthetic-host-canary", encoding="utf-8")
-            prefix = [bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
-                      "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-                      "--dir", "/usr", "--ro-bind", "/usr", "/usr"]
-            for system_dir in ("/lib", "/lib64", "/bin", "/sbin"):
-                if os.path.exists(system_dir):
-                    prefix.extend(["--dir", system_dir, "--ro-bind", system_dir, system_dir])
-            prefix.extend(["--dir", "/release", "--ro-bind", str(package_root.resolve()), "/release",
-                           "--chdir", "/release", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
-                           "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8"])
-            child_code = (
-                "import socket,sys\n"
-                "read_blocked=False\n"
-                "try: open(sys.argv[1],'rb').read()\n"
-                "except OSError: read_blocked=True\n"
-                "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2)\n"
-                "try: s.connect(('198.18.0.1',9)); net_blocked=False\n"
-                "except OSError: net_blocked=True\n"
-                "print('child-read-blocked='+str(read_blocked)+' child-network-blocked='+str(net_blocked))\n"
-                "sys.exit(0 if read_blocked and net_blocked else 7)\n"
-            )
-            parent_code = (
-                "import json,socket,subprocess,sys\n"
-                "r={'outside_read_blocked':False,'network_blocked':False,'child_isolated':False}\n"
-                "try: open(sys.argv[1],'rb').read()\n"
-                "except OSError: r['outside_read_blocked']=True\n"
-                "try:\n"
-                " s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2); s.connect(('198.18.0.1',9))\n"
-                "except OSError: r['network_blocked']=True\n"
-                "p=subprocess.run([sys.executable,'-I','-B','-S','-c',sys.argv[2],sys.argv[1]],capture_output=True,timeout=2)\n"
-                "r['child_isolated']=(p.returncode==0 and b'child-read-blocked=True child-network-blocked=True' in p.stdout)\n"
-                "open(sys.argv[1],'wb').write(b'sandbox-shadow-write')\n"
-                "print(json.dumps(r,sort_keys=True,separators=(',',':')))\n"
-                "sys.exit(0 if all(r.values()) else 8)\n"
-            )
-            command = prefix + [python_exe, "-I", "-B", "-S", "-c", parent_code,
-                                str(outside), child_code]
-            run = run_bounded(command, cwd=package_root,
-                              env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
-                                   "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"},
-                              input_bytes=b"", timeout=5, stdout_limit=4096, stderr_limit=4096)
-            if not run.get("ok") or outside.read_text(encoding="utf-8") != "synthetic-host-canary":
-                return "bubblewrap isolation canary failed; host path, host-write, child containment, or network namespace policy did not hold."
-            try:
-                report = parse_json_bytes(run["stdout"])
-            except (ValueError, UnicodeError, json.JSONDecodeError, RecursionError):
-                return "bubblewrap isolation canary returned invalid diagnostics; the owner adapter is not executed."
-            if (not isinstance(report, dict) or report.get("outside_read_blocked") is not True
-                    or report.get("network_blocked") is not True or report.get("child_isolated") is not True):
-                return "bubblewrap isolation canary did not prove read, socket, and descendant boundaries; the owner adapter is not executed."
+            reason = _run_sandbox_canary(package_root, outside)
+            if reason is not None:
+                return reason
+            if outside.read_text(encoding="utf-8") != "synthetic-host-canary":
+                return "bubblewrap isolation canary changed the host canary file; the owner adapter is not executed."
     except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return "bubblewrap isolation prerequisite could not be verified with synthetic canaries; the owner adapter is not executed."
     return None
@@ -829,12 +1116,13 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def run_bounded(command: list[str], *, cwd: Path, env: dict[str, str], input_bytes: bytes,
-                timeout: float, stdout_limit: int, stderr_limit: int) -> dict[str, Any]:
+                timeout: float, stdout_limit: int, stderr_limit: int,
+                pass_fds: tuple[int, ...] = ()) -> dict[str, Any]:
     """Run a synthetic or sandboxed child with bounded pipes and group cleanup."""
     try:
         process = subprocess.Popen(command, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   start_new_session=True, close_fds=True)
+                                   start_new_session=True, close_fds=True, pass_fds=pass_fds)
     except (OSError, ValueError):
         return {"ok": False, "code": "execution_start_failed", "stdout": b"", "stderr": b""}
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
@@ -1063,16 +1351,25 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
             continue
         if artifact_path is not None and digest is not None:
             media_type = artifact.get("media_type") if isinstance(artifact, dict) else None
-            if isinstance(media_type, str) and "json" in media_type or artifact_path.suffix.lower() == ".json":
+            is_json = ((isinstance(media_type, str) and "json" in media_type)
+                       or artifact_path.suffix.lower() == ".json")
+            field_paths = None
+            if not is_json:
+                add_error(errors, "canonical_schema_format_unsupported", path + ".media_type", "shared-contracts",
+                          "Publish runtime schemas in a supported enumerable JSON Schema format so exact owner field inventory can be checked.")
+            else:
                 try:
                     schema_content = parse_json_bytes(read_bounded_file(artifact_path))
-                    if not isinstance(schema_content, (dict, list)) or not schema_content:
+                    if not isinstance(schema_content, dict) or not schema_content:
                         add_error(errors, "canonical_schema_empty", path + ".path", "shared-contracts",
                                   "Publish nonempty actual canonical schema bytes; an empty object/array cannot describe a contract.")
+                    else:
+                        field_paths = _schema_field_paths(schema_content)
                 except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
                     add_error(errors, "canonical_schema_json_invalid", path + ".path", "shared-contracts",
-                              "Publish valid bounded JSON schema bytes for artifacts classified as JSON.")
-            schemas[schema_id] = {"path": artifact_path, "sha256": digest, "descriptor": artifact}
+                              "Publish valid bounded JSON Schema bytes whose declared runtime fields can be enumerated without external references or dynamic field names.")
+            schemas[schema_id] = {"path": artifact_path, "sha256": digest, "descriptor": artifact,
+                                  "field_paths": field_paths}
             schema_hashes[schema_id] = digest
 
     inventory, inventory_sha, inventory_path = _read_inventory(base, release.get("field_inventory"), errors)
@@ -1089,9 +1386,19 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
                   "Record the owner-approved behavior for additive unknown fields.")
     adapter = release.get("validator_adapter")
     adapter_path, adapter_sha = check_artifact(base, adapter, "$.canonical_release.validator_adapter", "shared-contracts", errors)
+    dependency_paths: list[tuple[Path | None, str | None]] = []
     if not isinstance(adapter, dict) or adapter.get("protocol") != ADAPTER_PROTOCOL:
         add_error(errors, "validator_adapter_protocol_missing", "$.canonical_release.validator_adapter.protocol", "shared-contracts",
                   f"Publish the independently reviewed offline fixture adapter implementing {ADAPTER_PROTOCOL}.")
+    dependency_rows = adapter.get("dependencies", []) if isinstance(adapter, dict) else []
+    if not isinstance(dependency_rows, list):
+        add_error(errors, "validator_adapter_dependencies_invalid", "$.canonical_release.validator_adapter.dependencies", "shared-contracts",
+                  "List each required adapter dependency as an exact relative path and SHA-256; undeclared package files are not mounted.")
+    else:
+        for index, dependency in enumerate(dependency_rows):
+            dependency_path, dependency_sha = check_artifact(
+                base, dependency, f"$.canonical_release.validator_adapter.dependencies[{index}]", "shared-contracts", errors)
+            dependency_paths.append((dependency_path, dependency_sha))
     if adapter_path is not None and adapter_sha is not None:
         if not adapter_provenance_verified(adapter, adapter_sha, evidence):
             add_error(errors, "validator_adapter_provenance_unverified", "$.canonical_release.validator_adapter", "shared-contracts",
@@ -1161,22 +1468,56 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
     request = {"protocol": ADAPTER_PROTOCOL, "release_revision": release["revision"],
                "release_version": release["version"], "field_inventory_sha256": inventory_sha,
                "fixtures": request_fixtures}
+    request["dependencies"] = [
+        {"path": "/release/" + path.relative_to(base).as_posix(), "sha256": digest}
+        for path, digest in dependency_paths if path is not None and digest_ok(digest)
+    ]
     if adapter_path is None:
         return None
-    command, sandbox_error = _sandbox_command(base, adapter_path, json.dumps(request).encode("utf-8"))
+    sandbox_prerequisite = _sandbox_prerequisite_error()
+    if sandbox_prerequisite is not None:
+        add_error(errors, "execution_sandbox_unavailable", "$.canonical_release.validator_adapter", "shared-contracts",
+                  sandbox_prerequisite)
+        return None
+    snapshot_inputs = [(adapter_path, adapter_sha, "validator adapter"),
+                       (inventory_path, inventory_sha, "canonical field inventory")]
+    snapshot_inputs.extend((schema["path"], schema["sha256"], "runtime schema")
+                           for schema in schemas.values())
+    seen_fixture_paths: set[Path] = set()
+    for case_id, fixture_path in fixture_paths.items():
+        if fixture_path not in seen_fixture_paths:
+            snapshot_inputs.append((fixture_path, fixtures[case_id].get("sha256"), "owner fixture"))
+            seen_fixture_paths.add(fixture_path)
+    snapshot_inputs.extend((path, digest, "declared adapter dependency")
+                           for path, digest in dependency_paths)
+    artifact_bytes = _read_execution_artifacts(base, snapshot_inputs, errors)
+    if artifact_bytes is None:
+        return None
+    snapshot, snapshot_error = _make_sealed_snapshot(artifact_bytes)
+    if snapshot is None:
+        add_error(errors, "execution_snapshot_unavailable", "$.canonical_release.validator_adapter", "shared-contracts",
+                  snapshot_error or "Provision Linux immutable sealed snapshots before executing owner bytes.")
+        return None
+    command, sandbox_error = _sandbox_command(base, adapter_path, json.dumps(request).encode("utf-8"), snapshot)
     if command is None:
+        snapshot.close()
         add_error(errors, "execution_sandbox_unavailable", "$.canonical_release.validator_adapter", "shared-contracts",
                   sandbox_error or "Provision a reviewed supported offline OS sandbox; never execute an owner adapter unsandboxed.")
         return None
     sandbox_error = probe_sandbox(base)
     if sandbox_error is not None:
+        snapshot.close()
         add_error(errors, "execution_sandbox_unverified", "$.canonical_release.validator_adapter", "shared-contracts", sandbox_error)
         return None
     env = {"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"}
-    run = run_bounded(command, cwd=base, env=env,
-                      input_bytes=json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
-                      timeout=ADAPTER_TIMEOUT_SECONDS, stdout_limit=MAX_ADAPTER_STDOUT, stderr_limit=MAX_ADAPTER_STDERR)
+    try:
+        run = run_bounded(command, cwd=Path("/"), env=env,
+                          input_bytes=json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+                          timeout=ADAPTER_TIMEOUT_SECONDS, stdout_limit=MAX_ADAPTER_STDOUT, stderr_limit=MAX_ADAPTER_STDERR,
+                          pass_fds=snapshot.pass_fds)
+    finally:
+        snapshot.close()
     if not run["ok"]:
         add_error(errors, run.get("code", "canonical_validator_execution_failed"), "$.canonical_release.validator_adapter", "shared-contracts",
                   "Repair the trusted adapter or provision the supported isolated runtime; bounded private diagnostics are not echoed.")
@@ -1184,35 +1525,12 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
     observed = _validate_adapter_result(run["stdout"], request, fixtures, schema_hashes, errors)
     if observed is None or errors:
         return None
-    # Re-hash all fixture and schema bytes after execution. The sandbox is
-    # read-only; this also catches substitutions between validation and use.
-    for schema_id, schema in schemas.items():
-        if sha256_file(schema["path"]) != schema["sha256"]:
-            add_error(errors, "schema_bytes_changed_during_execution", "$.canonical_release.schema_artifacts", "shared-contracts",
-                      "Keep pinned schema bytes immutable throughout fixture validation.")
-    for case_id, fixture in fixtures.items():
-        if sha256_file(fixture_paths[case_id]) != fixture.get("sha256"):
-            add_error(errors, "fixture_bytes_changed_during_execution", "$.fixtures", "shared-contracts",
-                      "Keep pinned fixture bytes immutable throughout fixture validation.")
-    for artifact_path, expected_hash, artifact_name in (
-        (inventory_path, inventory_sha, "field inventory"),
-        (adapter_path, adapter_sha, "validator adapter"),
-    ):
-        try:
-            artifact_unchanged = (artifact_path is not None and digest_ok(expected_hash)
-                                  and sha256_file(artifact_path) == expected_hash)
-        except OSError:
-            artifact_unchanged = False
-        if not artifact_unchanged:
-            add_error(errors, "trusted_release_artifact_changed_during_execution", "$.canonical_release", "shared-contracts",
-                      f"Keep the pinned {artifact_name} bytes immutable throughout fixture validation.")
-    if errors:
-        return None
     return {"canonical_revision": release["revision"], "canonical_version": release["version"],
             "schema_sha256": dict(sorted(schema_hashes.items())),
             "fixture_sha256": {case_id: fixtures[case_id]["sha256"] for case_id in REQUIRED_CASES},
             "serialized_output_sha256": observed["serialized_output_sha256"],
             "validated_fixture_cases": len(REQUIRED_CASES),
+            "execution_binding": "sealed memfd snapshot exposed through read-only bubblewrap binds",
             "scope": "owner-evidence-verified offline fixture conformance only; no producer/consumer runtime, live provider, or global acceptance claim"}
 
 
@@ -1222,6 +1540,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--offline", action="store_true", help="Require the verified offline owner fixture gate; live/provider execution is forbidden.")
     parser.add_argument("--owner-evidence-index", type=Path, default=os.environ.get("ACV1_OWNER_EVIDENCE_INDEX"))
     parser.add_argument("--owner-evidence-sha256", default=os.environ.get("ACV1_OWNER_EVIDENCE_SHA256"))
+    parser.add_argument("--test-only-synthetic", action="store_true",
+                         help="Run a fully synthetic sealed-sandbox fixture solely to exercise tooling; output is always not ready.")
     args = parser.parse_args(argv)
     errors: list[dict[str, str]] = []
     output = None
@@ -1230,7 +1550,14 @@ def main(argv: list[str] | None = None) -> int:
         workspace_root = Path(__file__).resolve().parents[1]
         evidence = load_trusted_evidence_index(
             str(args.owner_evidence_index) if args.owner_evidence_index else None,
-            args.owner_evidence_sha256, workspace_root, errors)
+            args.owner_evidence_sha256, workspace_root, errors,
+            allow_test_only=args.test_only_synthetic)
+        if args.test_only_synthetic and (not isinstance(manifest, dict) or manifest.get("test_only") is not True):
+            add_error(errors, "synthetic_manifest_marker_missing", "$.test_only", "Agent and research",
+                      "The synthetic execution mode requires an explicitly TEST ONLY manifest and never represents owner approval or release readiness.")
+        if not args.test_only_synthetic and isinstance(manifest, dict) and manifest.get("test_only") is True:
+            add_error(errors, "test_only_manifest_not_release_evidence", "$.test_only", "Agent and research",
+                      "Synthetic test manifests cannot enter the owner release readiness path.")
         if not args.offline:
             add_error(errors, "offline_mode_required", "$", "Agent and research",
                       "Run only the verified offline fixture gate with --offline; live/provider execution is out of scope.")
@@ -1254,8 +1581,16 @@ def main(argv: list[str] | None = None) -> int:
                   "dependency_mode": "offline", "errors": sorted(errors, key=lambda item: (item["path"], item["code"], item["owner"]))}
         print(json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
         return 2
-    report = {"tool": "verify_contract_release", "status": "offline_conformance_passed", "ready": True,
-              "dependency_mode": "offline", "result": output}
+    if args.test_only_synthetic:
+        output["owner_evidence_verified"] = False
+        output["scope"] = "TEST ONLY synthetic sealed-sandbox exercise; no canonical owner approval, release readiness, producer/consumer conformance, or global acceptance is established"
+        report = {"tool": "verify_contract_release", "status": "synthetic_test_only_validation_passed",
+                  "ready": False, "owner_evidence_verified": False, "dependency_mode": "offline",
+                  "scope": "TEST ONLY synthetic fixtures and local synthetic evidence; real owner approval and release readiness remain unverified",
+                  "result": output}
+    else:
+        report = {"tool": "verify_contract_release", "status": "offline_conformance_passed", "ready": True,
+                  "dependency_mode": "offline", "result": output}
     print(json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
     return 0
 
