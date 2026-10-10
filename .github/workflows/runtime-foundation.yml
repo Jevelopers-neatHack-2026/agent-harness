@@ -28,6 +28,8 @@ jobs:
         run: |
           mkdir -p .runtime-artifacts
           npm test > .runtime-artifacts/runtime-foundation.tap
+      - name: Run isolated Neatlogs SDK local-capture conformance
+        run: npm run test:neatlogs-sdk > .runtime-artifacts/neatlogs-sdk-local.tap
       - name: Produce revision-bound JEV offline evidence
         run: make verify CASE=ACV1-AH05 MODE=mock FIXTURE=jev-phase-b-offline
       - name: Upload sanitized test evidence
@@ -40,4 +42,6 @@ jobs:
             .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.tap
             .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.json
             .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.json.sha256
+            .runtime-artifacts/neatlogs-sdk-local.tap
+            .runtime-artifacts/neatlogs-sdk-local-capture.json
           if-no-files-found: warn
