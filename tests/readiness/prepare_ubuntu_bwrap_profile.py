@@ -82,6 +82,7 @@ APT_INDEXTARGETS_FORMAT = (
     "Repo-URI: $(REPO_URI)\n"
     "URI: $(URI)\n\n"
 )
+APPARMOR_PARSER_PACKAGE_PATH = "/sbin/apparmor_parser"
 APT_INDEX_TARGET_FIELDS = frozenset({
     "identifier", "metakey", "target-of", "architecture", "component", "suite",
     "codename", "origin", "label", "trusted", "repo-uri", "uri",
@@ -2103,14 +2104,88 @@ def _apt_toolchain_evidence() -> dict[str, str]:
     }
 
 
-def _owner_of(path: str, *, diagnostic_id: str | None = None) -> str:
+def _owner_of(path: str, *, diagnostic_id: str | None = None,
+              require_unique: bool = False) -> str:
     output, _ = _command(["dpkg-query", "-S", path], limit=8192,
                          diagnostic_id=diagnostic_id)
-    line = output.decode("utf-8", errors="strict").splitlines()[0]
+    lines = output.decode("utf-8", errors="strict").splitlines()
+    if not lines:
+        raise SetupFailure("system_binary_package_owner_unverified")
+    if require_unique and len(lines) != 1:
+        raise SetupFailure("system_binary_package_owner_ambiguous")
+    line = lines[0]
     owner, separator, _ = line.partition(": ")
     if not separator:
         raise SetupFailure("system_binary_package_owner_unverified")
+    if require_unique and len(owner.split(", ")) != 1:
+        raise SetupFailure("system_binary_package_owner_ambiguous")
     return owner
+
+
+def _root_owned_regular_file_identity(path: str, *, follow_symlinks: bool) -> tuple[int, ...]:
+    try:
+        info = os.stat(path, follow_symlinks=follow_symlinks)
+    except OSError as exc:
+        raise SetupFailure("apparmor_parser_file_custody_unverified") from exc
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+            or info.st_mode & 0o777 != 0o755):
+        raise SetupFailure("apparmor_parser_file_custody_untrusted")
+    return (
+        info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode & 0o777,
+        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _verify_apparmor_parser_package_path(found_path: str) -> tuple[str, str]:
+    """Bind the selected parser to Ubuntu's exact dpkg-recorded package path.
+
+    Noble's apparmor package stores the executable as /sbin/apparmor_parser.
+    On merged-/usr hosts that pathname resolves below /usr, while dpkg-query
+    indexes the package's recorded /sbin pathname. Verify both spellings name
+    the same root-owned mode-0755 regular file, then query only the exact
+    package manifest path. Require the package's root-owned 0755 regular file,
+    unique package ownership, and unchanged file identities around that query.
+    """
+    if not os.path.isabs(found_path):
+        raise SetupFailure("apparmor_parser_is_not_a_system_binary")
+    package_path = APPARMOR_PARSER_PACKAGE_PATH
+    parser_realpath = os.path.realpath(found_path)
+    package_realpath = os.path.realpath(package_path)
+    if (not parser_realpath.startswith("/usr/") or package_realpath != parser_realpath):
+        raise SetupFailure("apparmor_parser_package_path_mismatch")
+
+    package_entry_before = _root_owned_regular_file_identity(
+        package_path, follow_symlinks=False)
+    package_target_before = _root_owned_regular_file_identity(
+        package_path, follow_symlinks=True)
+    found_target_before = _root_owned_regular_file_identity(
+        found_path, follow_symlinks=True)
+    resolved_target_before = _root_owned_regular_file_identity(
+        parser_realpath, follow_symlinks=True)
+    if not (package_entry_before == package_target_before == found_target_before
+            == resolved_target_before):
+        raise SetupFailure("apparmor_parser_package_path_mismatch")
+
+    owner = _owner_of(
+        package_path, diagnostic_id="apparmor_parser_package_owner", require_unique=True)
+    if owner != "apparmor":
+        raise SetupFailure("apparmor_parser_package_owner_mismatch")
+
+    if (os.path.realpath(found_path) != parser_realpath
+            or os.path.realpath(package_path) != parser_realpath):
+        raise SetupFailure("apparmor_parser_file_changed_during_owner_check")
+    package_entry_after = _root_owned_regular_file_identity(
+        package_path, follow_symlinks=False)
+    package_target_after = _root_owned_regular_file_identity(
+        package_path, follow_symlinks=True)
+    found_target_after = _root_owned_regular_file_identity(
+        found_path, follow_symlinks=True)
+    resolved_target_after = _root_owned_regular_file_identity(
+        parser_realpath, follow_symlinks=True)
+    if not (package_entry_before == package_entry_after
+            == package_target_after == found_target_after == resolved_target_after):
+        raise SetupFailure("apparmor_parser_file_changed_during_owner_check")
+    return parser_realpath, owner
 
 
 def _verify_package(name: str, *, diagnostic_id: str | None = None) -> None:
@@ -2259,13 +2334,7 @@ def prepare(evidence_path: Path) -> int:
             parser_path = shutil.which("apparmor_parser")
             if not parser_path:
                 raise SetupFailure("compatible_installed_apparmor_parser_unavailable")
-            parser_realpath = os.path.realpath(parser_path)
-            if not parser_realpath.startswith("/usr/"):
-                raise SetupFailure("apparmor_parser_is_not_a_system_binary")
-            parser_owner = _owner_of(
-                parser_realpath, diagnostic_id="apparmor_parser_package_owner")
-            if parser_owner != "apparmor":
-                raise SetupFailure("apparmor_parser_package_owner_mismatch")
+            parser_realpath, parser_owner = _verify_apparmor_parser_package_path(parser_path)
             parser_version = _version(
                 [parser_realpath, "--version"], r"AppArmor parser version ([0-9.]+)",
                 diagnostic_id="apparmor_parser_version")
@@ -2286,7 +2355,9 @@ def prepare(evidence_path: Path) -> int:
             if any(state != "absent" for state in overrides):
                 raise SetupFailure("local_override_state_not_approved")
             report["parser"] = {
-                "path": parser_realpath, "package_owner": parser_owner,
+                "path": parser_realpath, "package_path": APPARMOR_PARSER_PACKAGE_PATH,
+                "package_path_binding": "same_root_owned_regular_file",
+                "package_owner": parser_owner,
                 "version": parser_version, "package_version": parser_package_version,
                 "sha256": _sha256(Path(parser_realpath)), "dpkg_verify": "clean",
                 "local_overrides": overrides,

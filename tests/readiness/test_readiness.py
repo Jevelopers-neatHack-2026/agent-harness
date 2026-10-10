@@ -2336,6 +2336,124 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             self.assertNotIn("mirror.invalid", serialized)
             self.assertNotIn(stderr.decode(), serialized)
 
+    def test_native_profile_setup_binds_parser_to_exact_ubuntu_package_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-parser-path-") as temporary:
+            root = Path(temporary)
+            usr_sbin = root / "usr" / "sbin"
+            usr_sbin.mkdir(parents=True)
+            package_alias = root / "sbin"
+            package_alias.symlink_to("usr/sbin", target_is_directory=True)
+            parser_path = usr_sbin / "apparmor_parser"
+            package_path = package_alias / "apparmor_parser"
+            original_stat = profile_setup.os.stat
+            original_realpath = profile_setup.os.path.realpath
+            guarded_paths = {
+                str(parser_path), str(package_path), "/usr/sbin/apparmor_parser",
+            }
+            file_mode = 0o755
+            found_realpath = "/usr/sbin/apparmor_parser"
+            package_leaf_symlink = False
+
+            def reset_parser() -> None:
+                if parser_path.is_symlink() or parser_path.exists():
+                    parser_path.unlink()
+                parser_path.write_bytes(b"test-only parser executable")
+                parser_path.chmod(0o755)
+                if package_leaf_symlink:
+                    target = usr_sbin / "parser-target"
+                    target.write_bytes(parser_path.read_bytes())
+                    target.chmod(0o755)
+                    parser_path.unlink()
+                    parser_path.symlink_to(target.name)
+
+            def package_stat(path, *args, **kwargs):
+                path_value = os.fspath(path)
+                stat_path = parser_path if path_value == "/usr/sbin/apparmor_parser" else path
+                info = original_stat(stat_path, *args, **kwargs)
+                if path_value not in guarded_paths:
+                    return info
+                follow = kwargs.get("follow_symlinks", True)
+                mode = info.st_mode if not follow else profile_setup.stat.S_IFREG | file_mode
+                return SimpleNamespace(
+                    st_dev=info.st_dev, st_ino=info.st_ino, st_uid=0, st_gid=0,
+                    st_mode=mode, st_size=info.st_size,
+                    st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns,
+                )
+
+            def package_realpath(path, *args, **kwargs):
+                value = os.fspath(path)
+                if value == str(parser_path):
+                    return found_realpath
+                if value == str(package_path):
+                    return "/usr/sbin/apparmor_parser"
+                return original_realpath(path, *args, **kwargs)
+
+            def verify(*, owner="apparmor", replace_during_owner=False):
+                reset_parser()
+
+                def owner_lookup(path, **kwargs):
+                    self.assertEqual(path, str(package_path))
+                    self.assertEqual(kwargs, {
+                        "diagnostic_id": "apparmor_parser_package_owner", "require_unique": True,
+                    })
+                    if replace_during_owner:
+                        os.link(parser_path, root / "retained-original")
+                        replacement = root / "replacement"
+                        replacement.write_bytes(b"replacement parser")
+                        replacement.chmod(0o755)
+                        os.replace(replacement, parser_path)
+                    return owner
+
+                with mock.patch.object(profile_setup, "APPARMOR_PARSER_PACKAGE_PATH", str(package_path)), \
+                        mock.patch.object(profile_setup.os, "stat", side_effect=package_stat), \
+                        mock.patch.object(profile_setup.os.path, "realpath", side_effect=package_realpath), \
+                        mock.patch.object(profile_setup, "_owner_of", side_effect=owner_lookup):
+                    return profile_setup._verify_apparmor_parser_package_path(str(parser_path))
+
+            self.assertEqual(verify(), ("/usr/sbin/apparmor_parser", "apparmor"))
+
+            with self.subTest("wrong package owner"), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "apparmor_parser_package_owner_mismatch"):
+                verify(owner="apparmor-profiles")
+
+            found_realpath = "/usr/bin/apparmor_parser"
+            with self.subTest("canonical path is not the package path"), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "apparmor_parser_package_path_mismatch"):
+                verify()
+            found_realpath = "/usr/sbin/apparmor_parser"
+
+            file_mode = 0o775
+            with self.subTest("group writable parser"), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "apparmor_parser_file_custody_untrusted"):
+                verify()
+            file_mode = 0o700
+            with self.subTest("non-package executable mode"), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "apparmor_parser_file_custody_untrusted"):
+                verify()
+            file_mode = 0o755
+
+            package_leaf_symlink = True
+            with self.subTest("package manifest leaf replaced by symlink"), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "apparmor_parser_file_custody_untrusted"):
+                verify()
+            package_leaf_symlink = False
+
+            with self.subTest("inode replacement during owner query"), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "apparmor_parser_file_changed_during_owner_check"):
+                verify(replace_during_owner=True)
+
+    def test_native_profile_setup_rejects_ambiguous_parser_package_ownership(self) -> None:
+        output = b"apparmor, apparmor-profiles: /sbin/apparmor_parser\n"
+        with mock.patch.object(profile_setup, "_command", return_value=(output, b"")) as command:
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "system_binary_package_owner_ambiguous"):
+                profile_setup._owner_of(
+                    profile_setup.APPARMOR_PARSER_PACKAGE_PATH,
+                    diagnostic_id="apparmor_parser_package_owner", require_unique=True)
+        command.assert_called_once_with(
+            ["dpkg-query", "-S", profile_setup.APPARMOR_PARSER_PACKAGE_PATH],
+            limit=8192, diagnostic_id="apparmor_parser_package_owner")
+
     def test_native_profile_setup_tags_allowlisted_system_command_failures_without_output(self) -> None:
         private_stdout = b"private parser output"
         private_stderr = b"private parser diagnostic"
