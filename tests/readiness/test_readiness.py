@@ -85,9 +85,18 @@ def append_synthetic_dependencies(manifest_path: Path, count: int,
 
 
 SYNTHETIC_UBUNTU_SOURCES = (
+    # TEST ONLY. This models the pinned runner's mirror+file substitution over
+    # the two Noble archive/security deb822 stanzas. Native setup independently
+    # validates the live root-owned source bytes before trusting APT metadata.
     "Types: deb\n"
     "URIs: mirror+file:/etc/apt/apt-mirrors.txt\n"
-    "Suites: noble noble-updates noble-backports noble-security\n"
+    "Suites: noble noble-updates noble-backports\n"
+    "Components: main restricted universe multiverse\n"
+    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+    "\n"
+    "Types: deb\n"
+    "URIs: mirror+file:/etc/apt/apt-mirrors.txt\n"
+    "Suites: noble-security\n"
     "Components: main restricted universe multiverse\n"
     "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
 )
@@ -1247,11 +1256,15 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                          "https://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
 
     def test_native_profile_setup_accepts_only_exact_runner_mirror_source_config(self) -> None:
+        source_bytes = SYNTHETIC_UBUNTU_SOURCES.replace(
+            "Suites:", "# runner source comment\nSuites:").encode("utf-8")
         evidence = profile_setup._validate_runner_mirror_configuration(
-            SYNTHETIC_UBUNTU_SOURCES.replace(
-                "Suites:", "# runner source comment\nSuites:").encode("utf-8"),
-            profile_setup.APT_MIRRORLIST_BYTES)
+            source_bytes, profile_setup.APT_MIRRORLIST_BYTES)
         self.assertEqual(evidence["transport"], "github_ubuntu_runner_root_owned_mirrorlist")
+        self.assertEqual(evidence["source_layout"], "noble_archive_security_split")
+        self.assertEqual(evidence["source_record_count"], 2)
+        self.assertEqual(evidence["mirror_source_stanza_count"], 2)
+        self.assertEqual(evidence["source_file_sha256"], sha(source_bytes))
         self.assertEqual(evidence["mirror_uri_count"], 3)
         self.assertEqual(evidence["mirror_hosts"], [
             "azure.archive.ubuntu.com", "archive.ubuntu.com", "security.ubuntu.com"])
@@ -1262,12 +1275,29 @@ class ContractReleaseReadinessTests(unittest.TestCase):
     def test_native_profile_setup_rejects_untrusted_or_changed_runner_mirror_configuration(self) -> None:
         bad_sources = (
             SYNTHETIC_UBUNTU_SOURCES.replace("noble-updates", "noble-proposed"),
+            SYNTHETIC_UBUNTU_SOURCES.replace("Suites: noble-security", "Suites: noble-updates"),
+            SYNTHETIC_UBUNTU_SOURCES.replace(
+                "Suites: noble noble-updates noble-backports",
+                "Suites: noble noble-updates noble-backports noble-security"),
+            SYNTHETIC_UBUNTU_SOURCES.replace(
+                "Suites: noble-security", "Suites: noble-security noble-updates"),
+            SYNTHETIC_UBUNTU_SOURCES.replace(
+                "Components: main restricted universe multiverse",
+                "Components: main restricted universe"),
+            SYNTHETIC_UBUNTU_SOURCES + "\n" + SYNTHETIC_UBUNTU_SOURCES.split("\n\n", 1)[0],
             SYNTHETIC_UBUNTU_SOURCES.replace(
                 "/usr/share/keyrings/ubuntu-archive-keyring.gpg", "/tmp/untrusted.gpg"),
             SYNTHETIC_UBUNTU_SOURCES + "\nTypes: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\n",
             SYNTHETIC_UBUNTU_SOURCES.replace(
+                "URIs: mirror+file:/etc/apt/apt-mirrors.txt",
+                "URIs: mirror+file:/etc/apt/apt-mirrors.txt https://unexpected.invalid/ubuntu"),
+            SYNTHETIC_UBUNTU_SOURCES.replace(
+                "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n",
+                "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\nArchitectures: amd64\n"),
+            SYNTHETIC_UBUNTU_SOURCES.replace(
                 "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n",
                 "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\nTrusted: yes\n"),
+            SYNTHETIC_UBUNTU_SOURCES.split("\n\nTypes: deb\n", 1)[0],
         )
         for source_text in bad_sources:
             with self.subTest(source_text=source_text), self.assertRaises(profile_setup.SetupFailure):
@@ -1283,6 +1313,22 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         diagnostic = json.dumps(raised.exception.details, sort_keys=True)
         self.assertNotIn("mirror.invalid", diagnostic)
         self.assertNotIn("https://", diagnostic)
+
+    def test_native_profile_setup_source_layout_diagnostics_are_bounded_and_content_free(self) -> None:
+        private = SYNTHETIC_UBUNTU_SOURCES.replace(
+            "noble-security", "private-suite-name") + (
+                "\nTypes: deb\nURIs: https://user:secret@private.invalid/hidden\n"
+                "Suites: secret\nComponents: hidden\nSigned-By: /private/keyring\n")
+        with self.assertRaises(profile_setup.SetupFailure) as raised:
+            profile_setup._validate_runner_mirror_configuration(
+                private.encode("utf-8"), profile_setup.APT_MIRRORLIST_BYTES)
+        diagnostic = json.dumps(raised.exception.details, sort_keys=True)
+        self.assertEqual(raised.exception.code, "ubuntu_runner_sources_configuration_untrusted")
+        self.assertEqual(raised.exception.details["source_record_count"], 3)
+        self.assertEqual(raised.exception.details["mirror_source_stanza_count"], 2)
+        self.assertEqual(raised.exception.details["recognized_layout"], "unrecognized")
+        for private_value in ("private-suite-name", "private.invalid", "secret", "/private/keyring"):
+            self.assertNotIn(private_value, diagnostic)
 
     def test_native_profile_setup_reads_only_root_owned_nonsymlink_trust_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="acv1-apt-root-trust-") as temporary:

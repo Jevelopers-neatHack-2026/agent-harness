@@ -40,6 +40,11 @@ APT_MIRRORLIST_BYTES = (
     b"https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
     b"https://security.ubuntu.com/ubuntu/\tpriority:3\n"
 )
+APT_RUNNER_SOURCE_FIELDS = frozenset({"types", "uris", "suites", "components", "signed-by"})
+APT_RUNNER_ARCHIVE_SUITES = ("noble", "noble-updates", "noble-backports")
+APT_RUNNER_SECURITY_SUITES = ("noble-security",)
+APT_RUNNER_COMPONENTS = ("main", "restricted", "universe", "multiverse")
+APT_RUNNER_SOURCE_FORMAT = "pinned_github_ubuntu_2404_deb822_archive_security_split_v1"
 APT_INDEXTARGETS_FORMAT = (
     "Identifier: $(IDENTIFIER)\n"
     "MetaKey: $(METAKEY)\n"
@@ -362,44 +367,71 @@ def _parse_runner_mirrorlist(mirrorlist: bytes) -> tuple[str, ...]:
     return tuple(line.split(b"\t", 1)[0].decode("ascii") for line in mirrorlist.splitlines())
 
 
+def _runner_source_layout_diagnostics(records: list[dict[str, str]], source_file: bytes) -> dict[str, Any]:
+    archive_count = 0
+    security_count = 0
+    invalid_count = 0
+    mirror_count = sum(
+        APT_MIRROR_URI in row.get("uris", "").split() for row in records)
+    for row in records:
+        uris = row.get("uris", "").split()
+        suites = tuple(row.get("suites", "").split())
+        exact_common_fields = (
+            set(row) == APT_RUNNER_SOURCE_FIELDS
+            and row.get("types", "").split() == ["deb"]
+            and uris == [APT_MIRROR_URI]
+            and row.get("components", "").split() == list(APT_RUNNER_COMPONENTS)
+            and row.get("signed-by") == str(UBUNTU_ARCHIVE_KEYRING)
+        )
+        if exact_common_fields and suites == APT_RUNNER_ARCHIVE_SUITES:
+            archive_count += 1
+        elif exact_common_fields and suites == APT_RUNNER_SECURITY_SUITES:
+            security_count += 1
+        else:
+            invalid_count += 1
+    return {
+        "expected_format": APT_RUNNER_SOURCE_FORMAT,
+        "source_file_sha256": hashlib.sha256(source_file).hexdigest(),
+        "source_record_count": min(len(records), 99),
+        "source_record_count_capped": len(records) > 99,
+        "mirror_source_stanza_count": min(mirror_count, 99),
+        "mirror_source_stanza_count_capped": mirror_count > 99,
+        "archive_suite_stanza_count": archive_count,
+        "security_suite_stanza_count": security_count,
+        "invalid_stanza_count": min(invalid_count, 99),
+        "invalid_stanza_count_capped": invalid_count > 99,
+        "missing_expected_stanza_count": min(max(0, 2 - len(records)), 2),
+        "unexpected_stanza_count": min(max(0, len(records) - 2), 99),
+        "recognized_layout": (
+            "noble_archive_security_split"
+            if len(records) == 2 and archive_count == 1 and security_count == 1
+            and invalid_count == 0 else "unrecognized"
+        ),
+    }
+
+
 def _validate_runner_mirror_configuration(source_file: bytes,
                                           mirrorlist: bytes) -> dict[str, Any]:
     try:
         source_text = source_file.decode("utf-8", "strict")
     except UnicodeError as exc:
-        raise SetupFailure("ubuntu_runner_sources_configuration_invalid") from exc
+        raise SetupFailure("ubuntu_runner_sources_configuration_invalid", details={
+            "expected_format": APT_RUNNER_SOURCE_FORMAT,
+            "source_file_sha256": hashlib.sha256(source_file).hexdigest(),
+            "source_decode_error": True,
+        }) from exc
     records = _parse_deb822_records(source_text, failure_code="ubuntu_runner_sources_configuration_invalid",
                                     max_bytes=64 * 1024)
-    matches = [row for row in records
-               if APT_MIRROR_URI in row.get("uris", "").split()]
-    if len(matches) != 1:
-        raise SetupFailure("ubuntu_runner_sources_configuration_untrusted", details={
-            "mirror_source_stanza_count": min(len(matches), 99),
-            "expected_format": "pinned_github_ubuntu_2404_mirrorlist_v1",
-        })
-    source = matches[0]
-    if (source.get("uris", "").split() != [APT_MIRROR_URI]
-            or source.get("types", "").split() != ["deb"]
-            or "noble-updates" not in source.get("suites", "").split()
-            or "main" not in source.get("components", "").split()
-            or source.get("signed-by") != str(UBUNTU_ARCHIVE_KEYRING)
-            or any(source.get(name) == "yes" for name in ("trusted", "allow-insecure", "allow-weak",
-                                                            "allow-downgrade-to-insecure"))):
-        raise SetupFailure("ubuntu_runner_sources_configuration_untrusted", details={
-            "mirror_source_stanza_count": 1,
-            "mirror_uri_count": min(len(source.get("uris", "").split()), 99),
-            "suite_noble_updates": "noble-updates" in source.get("suites", "").split(),
-            "component_main": "main" in source.get("components", "").split(),
-            "signed_by_is_ubuntu_archive_keyring": (
-                source.get("signed-by") == str(UBUNTU_ARCHIVE_KEYRING)),
-            "signature_bypass_option_present": any(
-                source.get(name) == "yes" for name in (
-                    "trusted", "allow-insecure", "allow-weak", "allow-downgrade-to-insecure")),
-        })
+    diagnostics = _runner_source_layout_diagnostics(records, source_file)
+    if diagnostics["recognized_layout"] != "noble_archive_security_split":
+        raise SetupFailure("ubuntu_runner_sources_configuration_untrusted", details=diagnostics)
     mirrors = _parse_runner_mirrorlist(mirrorlist)
     return {
         "transport": "github_ubuntu_runner_root_owned_mirrorlist",
         "source_file_sha256": hashlib.sha256(source_file).hexdigest(),
+        "source_layout": diagnostics["recognized_layout"],
+        "source_record_count": diagnostics["source_record_count"],
+        "mirror_source_stanza_count": diagnostics["mirror_source_stanza_count"],
         "mirrorlist_sha256": hashlib.sha256(mirrorlist).hexdigest(),
         "mirror_uri_count": len(mirrors),
         "mirror_hosts": [urlparse(value).hostname for value in mirrors],
