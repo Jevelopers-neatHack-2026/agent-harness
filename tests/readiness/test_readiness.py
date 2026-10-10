@@ -1694,49 +1694,53 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertNotIn("ubuntu-archive-keyring.gpg", rendered)
         self.assertNotIn("key bytes", rendered)
 
-    def test_pinned_keyring_capture_accepts_only_observed_writable_parents_for_pinned_bytes(self) -> None:
+    def test_pinned_keyring_capture_accepts_observed_writable_parents_and_leaf_for_pinned_bytes(self) -> None:
         approved = b"synthetic approved archive keyring"
         uid, gid = os.geteuid(), os.getegid()
         for writable_component in ("share", "keyrings"):
-            with self.subTest(writable_component=writable_component), \
-                    tempfile.TemporaryDirectory(prefix="acv1-pinned-keyring-") as temporary:
-                root = Path(temporary)
-                path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
-                path.parent.mkdir(parents=True)
-                os.chmod(root / "usr", 0o755)
-                os.chmod(root / "usr" / "share", 0o777 if writable_component == "share" else 0o755)
-                os.chmod(path.parent, 0o777 if writable_component == "keyrings" else 0o755)
-                path.write_bytes(approved)
-                os.chmod(path, 0o644)
-                with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
-                        mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
-                    captured, evidence = profile_setup._read_pinned_keyring_bytes(
-                        path, trusted_root=root, owner_uid=uid, owner_gid=gid)
-                self.assertEqual(captured, approved)
-                self.assertEqual(evidence["sha256"], sha(approved))
-                self.assertEqual(evidence["writable_parent_component"], writable_component)
-                self.assertFalse(evidence["source_parent_reopened_by_apt"])
+            for writable_leaf in (False, True):
+                with self.subTest(writable_component=writable_component,
+                                  writable_leaf=writable_leaf), \
+                        tempfile.TemporaryDirectory(prefix="acv1-pinned-keyring-") as temporary:
+                    root = Path(temporary)
+                    path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
+                    path.parent.mkdir(parents=True)
+                    os.chmod(root / "usr", 0o755)
+                    os.chmod(root / "usr" / "share",
+                             0o777 if writable_component == "share" else 0o755)
+                    os.chmod(path.parent, 0o777 if writable_component == "keyrings" else 0o755)
+                    path.write_bytes(approved)
+                    os.chmod(path, 0o666 if writable_leaf else 0o644)
+                    with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
+                            mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
+                        captured, evidence = profile_setup._read_pinned_keyring_bytes(
+                            path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+                    self.assertEqual(captured, approved)
+                    self.assertEqual(evidence["sha256"], sha(approved))
+                    self.assertEqual(evidence["writable_parent_component"], writable_component)
+                    self.assertEqual(evidence["source_leaf_group_or_world_writable"], writable_leaf)
+                    self.assertFalse(evidence["source_parent_reopened_by_apt"])
 
-                # Replacing the writable source entry after capture cannot alter
-                # the captured bytes or redirect APT away from the private copy.
-                attacker = root / "attacker-keyring.gpg"
-                attacker.write_bytes(b"x" * len(approved))
-                path.unlink()
-                path.symlink_to(attacker)
-                private_root = Path("/run") / ("acv1-contract-apt-" + "a" * 32)
-                sources = profile_setup._private_source_bytes(
-                    profile_setup._parse_deb822_records(
-                        SYNTHETIC_UBUNTU_SOURCES,
-                        failure_code="synthetic_source_invalid", max_bytes=64 * 1024),
-                    private_root / "ubuntu-archive-keyring.gpg",
-                    private_root / "apt-mirrors.txt",
-                )
-                self.assertIn(("Signed-By: " + str(private_root
-                                                   / "ubuntu-archive-keyring.gpg")).encode(), sources)
-                self.assertIn(("URIs: mirror+file:" + str(private_root
-                                                           / "apt-mirrors.txt")).encode(), sources)
-                self.assertNotIn(str(path).encode(), sources)
-                self.assertEqual(captured, approved)
+                    # Replacing the writable source entry after capture cannot alter
+                    # the captured bytes or redirect APT away from the private copy.
+                    attacker = root / "attacker-keyring.gpg"
+                    attacker.write_bytes(b"x" * len(approved))
+                    path.unlink()
+                    path.symlink_to(attacker)
+                    private_root = Path("/run") / ("acv1-contract-apt-" + "a" * 32)
+                    sources = profile_setup._private_source_bytes(
+                        profile_setup._parse_deb822_records(
+                            SYNTHETIC_UBUNTU_SOURCES,
+                            failure_code="synthetic_source_invalid", max_bytes=64 * 1024),
+                        private_root / "ubuntu-archive-keyring.gpg",
+                        private_root / "apt-mirrors.txt",
+                    )
+                    self.assertIn(("Signed-By: " + str(private_root
+                                                       / "ubuntu-archive-keyring.gpg")).encode(), sources)
+                    self.assertIn(("URIs: mirror+file:" + str(private_root
+                                                               / "apt-mirrors.txt")).encode(), sources)
+                    self.assertNotIn(str(path).encode(), sources)
+                    self.assertEqual(captured, approved)
 
     def test_pinned_keyring_capture_rejects_digest_changes(self) -> None:
         approved = b"synthetic approved archive keyring"
@@ -1750,13 +1754,56 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             os.chmod(parent, 0o755)
             path = parent / "ubuntu-archive-keyring.gpg"
             path.write_bytes(b"x" * len(approved))
-            os.chmod(path, 0o644)
+            os.chmod(path, 0o666)
             with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
                     mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
-                with self.assertRaisesRegex(profile_setup.SetupFailure,
-                                             "ubuntu_archive_keyring_digest_mismatch"):
+                with self.assertRaises(profile_setup.SetupFailure) as raised:
                     profile_setup._read_pinned_keyring_bytes(
                         path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+                self.assertEqual(raised.exception.code, "ubuntu_archive_keyring_digest_mismatch")
+                self.assertEqual(
+                    raised.exception.details["trust_file_diagnostics"]["phase"],
+                    "captured_bytes")
+
+    def test_pinned_keyring_capture_keeps_leaf_owner_and_group_binding(self) -> None:
+        approved = b"synthetic approved archive keyring"
+        uid, gid = os.geteuid(), os.getegid()
+        with tempfile.TemporaryDirectory(prefix="acv1-keyring-owner-") as temporary:
+            root = Path(temporary)
+            parent = root / "usr" / "share" / "keyrings"
+            parent.mkdir(parents=True)
+            os.chmod(root / "usr", 0o755)
+            os.chmod(root / "usr" / "share", 0o755)
+            os.chmod(parent, 0o755)
+            path = parent / "ubuntu-archive-keyring.gpg"
+            path.write_bytes(approved)
+            os.chmod(path, 0o666)
+            original_stat = profile_setup.os.stat
+            with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
+                    mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
+                for field, wrong_value in (("st_uid", uid + 1), ("st_gid", gid + 1)):
+                    def stat_with_wrong_leaf_owner(file, *, dir_fd=None, follow_symlinks=True):
+                        observed = original_stat(
+                            file, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                        if file == path.name and dir_fd is not None:
+                            values = {
+                                name: getattr(observed, name)
+                                for name in ("st_mode", "st_uid", "st_gid", "st_size",
+                                             "st_dev", "st_ino", "st_mtime_ns", "st_ctime_ns")
+                            }
+                            values[field] = wrong_value
+                            return SimpleNamespace(**values)
+                        return observed
+
+                    with self.subTest(field=field), \
+                            mock.patch.object(profile_setup.os, "stat",
+                                              new=stat_with_wrong_leaf_owner), \
+                            self.assertRaises(profile_setup.SetupFailure) as raised:
+                        profile_setup._read_pinned_keyring_bytes(
+                            path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+                    diagnostics = raised.exception.details["trust_file_diagnostics"]
+                    self.assertEqual(diagnostics["phase"], "file_lstat")
+                    self.assertEqual(diagnostics["failure_class"], "file_custody_untrusted")
 
     def test_pinned_keyring_capture_still_rejects_unreviewed_writable_parent_and_keyrings_symlink(self) -> None:
         approved = b"synthetic approved archive keyring"
@@ -1794,14 +1841,15 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         approved = b"synthetic approved archive keyring"
         uid, gid = os.geteuid(), os.getegid()
 
-        for replacement in ("keyrings_parent", "leaf_before_open", "leaf_during_read"):
+        for replacement in ("keyrings_parent", "leaf_before_open", "leaf_during_read",
+                            "leaf_mode_before_open", "leaf_mode_during_read"):
             with self.subTest(replacement=replacement), \
                     tempfile.TemporaryDirectory(prefix="acv1-keyring-race-") as temporary:
                 root = Path(temporary)
                 path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
                 path.parent.mkdir(parents=True)
                 path.write_bytes(approved)
-                os.chmod(path, 0o644)
+                os.chmod(path, 0o666 if replacement.startswith("leaf_mode_") else 0o644)
                 os.chmod(path.parent, 0o777)
                 original_open = profile_setup.os.open
                 original_read = profile_setup.os.read
@@ -1821,12 +1869,18 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                         path.unlink()
                         path.symlink_to(target)
                         changed = True
+                    elif replacement == "leaf_mode_before_open" and file == path.name and dir_fd is not None and not changed:
+                        os.chmod(path, 0o644)
+                        changed = True
                     return original_open(file, flags, mode, dir_fd=dir_fd)
 
                 def replace_during_read(fd: int, count: int) -> bytes:
                     nonlocal changed
                     if replacement == "leaf_during_read" and not changed:
                         path.write_bytes(b"replacement bytes with a different size")
+                        changed = True
+                    elif replacement == "leaf_mode_during_read" and not changed:
+                        os.chmod(path, 0o644)
                         changed = True
                     return original_read(fd, count)
 
@@ -1840,6 +1894,12 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 self.assertTrue(changed)
                 diagnostics = raised.exception.details["trust_file_diagnostics"]
                 if replacement == "leaf_during_read":
+                    self.assertEqual(diagnostics["phase"], "descriptor_recheck")
+                    self.assertEqual(diagnostics["failure_class"], "file_changed_during_read")
+                elif replacement == "leaf_mode_before_open":
+                    self.assertEqual(diagnostics["phase"], "descriptor_stat")
+                    self.assertEqual(diagnostics["failure_class"], "file_mode_changed_before_open")
+                elif replacement == "leaf_mode_during_read":
                     self.assertEqual(diagnostics["phase"], "descriptor_recheck")
                     self.assertEqual(diagnostics["failure_class"], "file_changed_during_read")
                 else:

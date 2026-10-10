@@ -813,11 +813,13 @@ def _read_pinned_keyring_bytes(path: Path = UBUNTU_ARCHIVE_KEYRING, *,
                                owner_gid: int = 0) -> tuple[bytes, dict[str, Any]]:
     """Capture the one official keyring by descriptor, then trust its fixed digest.
 
-    The hosted runner's /usr/share/keyrings hierarchy can contain writable
-    parents. They are never used as APT's keyring path: this reader accepts
-    only the two observed fixed components because the exact captured bytes
-    must match the independently pinned Ubuntu package member before they are
-    copied into a private root-owned snapshot.
+    The hosted runner's /usr/share/keyrings hierarchy and fixed keyring leaf
+    can be writable. They are never used as APT's keyring path: this reader
+    accepts only the two observed fixed parent components, requires the leaf
+    to remain a root-owned regular file with stable descriptor identity, and
+    trusts it only after the captured bytes match the independently pinned
+    Ubuntu package member before copying them into a private root-owned
+    snapshot.
     """
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise SetupFailure("ubuntu_archive_keyring_nofollow_unavailable")
@@ -916,8 +918,7 @@ def _read_pinned_keyring_bytes(path: Path = UBUNTU_ARCHIVE_KEYRING, *,
             raise failure("file_lstat", "file", "symlink_disallowed", observed_file)
         if not stat.S_ISREG(before_file.st_mode):
             raise failure("file_lstat", "file", "not_regular_file", observed_file)
-        if (before_file.st_uid != owner_uid or before_file.st_gid != owner_gid
-                or before_file.st_mode & 0o022):
+        if before_file.st_uid != owner_uid or before_file.st_gid != owner_gid:
             raise failure("file_lstat", "file", "file_custody_untrusted", observed_file)
         if not (0 < before_file.st_size <= 1024 * 1024):
             raise failure("file_lstat", "file", "file_size_invalid", observed_file)
@@ -929,8 +930,11 @@ def _read_pinned_keyring_bytes(path: Path = UBUNTU_ARCHIVE_KEYRING, *,
             raise failure("file_open", "file", errno_category(exc), observed_file) from exc
         if ((opened.st_dev, opened.st_ino) != (before_file.st_dev, before_file.st_ino)
                 or not stat.S_ISREG(opened.st_mode) or opened.st_uid != owner_uid
-                or opened.st_gid != owner_gid or opened.st_mode & 0o022):
+                or opened.st_gid != owner_gid):
             raise failure("descriptor_stat", "file", "path_replaced_before_open",
+                          _keyring_stat_summary(opened, directory=False))
+        if opened.st_mode != before_file.st_mode:
+            raise failure("descriptor_stat", "file", "file_mode_changed_before_open",
                           _keyring_stat_summary(opened, directory=False))
         chunks: list[bytes] = []
         remaining = 1024 * 1024 + 1
@@ -973,6 +977,7 @@ def _read_pinned_keyring_bytes(path: Path = UBUNTU_ARCHIVE_KEYRING, *,
             "sha256": digest,
             "byte_count": len(captured),
             "capture_mode": "descriptor_read_then_official_sha256_pin",
+            "source_leaf_group_or_world_writable": bool(opened.st_mode & 0o022),
             "writable_parent_component": writable_parent or "none",
             "source_parent_reopened_by_apt": False,
         }
