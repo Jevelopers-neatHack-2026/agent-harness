@@ -1,8 +1,9 @@
 {
-  "format": "agent-creative.jev-dataset-manifest/v1",
+  "format": "agent-creative.jev-dataset-manifest/v2",
   "status": "pending_owner_dataset_and_label_review",
   "dataset_id": null,
   "dataset_version": null,
+  "owner_repository": null,
   "provenance": {
     "source_refs": [],
     "collection_protocol": null,
@@ -11,10 +12,11 @@
     "privacy_review_ref": null
   },
   "owner_approval": null,
+  "split_approvals": null,
   "splits": {
     "train": {"sha256": null, "examples": []},
     "validation": {"sha256": null, "examples": []},
     "held_out": {"sha256": null, "examples": []}
   },
-  "note": "No private/customer content or synthetic approved results are included. Owners must provide independently reviewed, disjoint, hash-pinned labeled references."
+  "note": "No private/customer content or synthetic approved results are included. Owners must provide independently reviewed, disjoint, hash-pinned labeled references. V2 requires each split hash and the complete dataset bytes to be covered by independently pinned owner evidence."
 }

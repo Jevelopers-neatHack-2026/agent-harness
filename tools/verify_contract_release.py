@@ -1,30 +1,45 @@
 #!/usr/bin/env python3
-"""Verify an owner-published Agent & Creative contract release offline.
+"""Verify pinned owner-published Agent & Creative contract evidence offline.
 
-This tool defines a readiness descriptor and an adapter invocation protocol. It
-does not define runtime schemas, ports, or their semantics. Until the canonical
-owner publishes a release descriptor with pinned schemas, fixtures, an offline
-validator adapter, and reviewed producer/consumer decisions, it exits blocked.
+This is readiness tooling, not a schema, port, approval authority, ledger, or
+provider integration. It accepts a contract release only when independently
+trusted owner evidence binds the exact bytes and an owner-published validator
+can run inside a verified OS sandbox. Missing trust evidence or sandbox support
+is a typed blocker; a local status, hash, or offline attestation is not proof.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
-import re
+import platform
+import selectors
+import shutil
+import signal
 import subprocess
 import sys
+import sysconfig
+import time
 from pathlib import Path
 from typing import Any
 
 
-FORMAT = "agent-creative.contract-readiness/v1"
-ADAPTER_PROTOCOL = "agent-creative.contract-fixture-adapter/v1"
+FORMAT = "agent-creative.contract-readiness/v2"
+FIELD_INVENTORY_FORMAT = "agent-creative.contract-field-inventory/v1"
+OWNER_EVIDENCE_INDEX_FORMAT = "agent-creative.owner-evidence-index/v1"
+OWNER_EVIDENCE_FORMAT = "agent-creative.owner-evidence/v1"
+ADAPTER_PROTOCOL = "agent-creative.contract-fixture-adapter/v2"
+MAX_JSON_BYTES = 16 * 1024 * 1024
+MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+MAX_ADAPTER_STDOUT = 2 * 1024 * 1024
+MAX_ADAPTER_STDERR = 64 * 1024
+ADAPTER_TIMEOUT_SECONDS = 60
 
-# Case identities and expected outcomes are copied from ACV1-CONTRACTS issue #5
-# and its closure audit. They are scenario requirements, not schema field names.
+# Required scenarios are issue #5 acceptance inputs. They are not schema fields
+# and the expected results remain owner supplied in the pinned release.
 REQUIRED_CASES: dict[str, str] = {
     "current_valid": "accepted",
     "current_invalid": "rejected",
@@ -51,35 +66,22 @@ REQUIRED_CASES: dict[str, str] = {
     "cancelled_deadline": "typed_cancelled_outcome",
     "unsupported_field_alias": "rejected",
     "old_consumer_additive_field": "compatibility_declared",
+    "choice_actual_provider_shape": "accepted",
+    "score_actual_provider_shape": "accepted",
+    "noul_actual_provider_shape": "accepted",
 }
-
-REQUIRED_FIELDS = {
-    "schema_version", "event_id", "tenant_id", "project_id", "correlation_id",
-    "producer", "occurred_at", "ingested_at", "environment", "billing_mode",
-    "source_refs", "workflow_id", "run_id", "order_id", "design_version_id",
-    "logical_operation_id", "billable_attempt_id", "transport_attempt_id",
-    "provider_request_id",
+PRIMITIVES = {"choice", "score", "noul", "none"}
+REQUIRED_PRIMITIVE_FIXTURES = {
+    "choice": "choice_actual_provider_shape",
+    "score": "score_actual_provider_shape",
+    "noul": "noul_actual_provider_shape",
 }
-
-REQUIRED_COVERAGE_TAGS = {
-    "common_envelope",
-    "financial_attempt_identities",
-    "source_observation_identity",
-    "immutable_facts_and_package",
-    "artifact_version_hash_binding",
-    "authenticated_actor_scope_action_expiry_revocation",
-    "reservation_attempt_binding_and_lifecycle",
-    "decision_question_policy_model_identity",
-    "trace_and_usage_references",
-}
-
 ROLE_REPOSITORIES = {
-    "Agent and research": {"agent-harness", "event-intelligence"},
+    "Agent and research": {"agent-harness", "event-intelligence", "shared-contracts"},
     "Creative and fulfillment": {"creative-engine"},
     "Finance and reliability": {"cost-intelligence"},
     "Product and frontend": {"getticketstub.com"},
 }
-
 OWNER_ACTIONS = [
     {
         "owner": "shared-contracts",
@@ -139,473 +141,1122 @@ def _pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("duplicate key")
+            raise ValueError("duplicate JSON key")
         result[key] = value
     return result
 
 
-def _reject_non_finite(value: str) -> Any:
+def _parse_int(value: str) -> int:
+    if len(value.lstrip("-")) > 256:
+        raise ValueError("integer too large")
+    return int(value)
+
+
+def _parse_float(value: str) -> float:
+    if len(value) > 256:
+        raise ValueError("number too large")
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError("non-finite number")
+    return number
+
+
+def _reject_constant(_: str) -> Any:
     raise ValueError("non-finite JSON number")
+
+
+def parse_json_bytes(raw: bytes) -> Any:
+    if len(raw) > MAX_JSON_BYTES:
+        raise ValueError("JSON input too large")
+    return json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_pairs_no_duplicates,
+        parse_int=_parse_int, parse_float=_parse_float, parse_constant=_reject_constant,
+    )
 
 
 def read_json(path: Path) -> Any:
     try:
-        with path.open("r", encoding="utf-8") as stream:
-            return json.load(stream, object_pairs_hook=_pairs_no_duplicates, parse_constant=_reject_non_finite)
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        with path.open("rb") as stream:
+            return parse_json_bytes(stream.read(MAX_JSON_BYTES + 1))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
         raise InputProblem(
             "manifest_unreadable_or_invalid_json", "$", "Agent and research",
-            "Supply a readable UTF-8 JSON readiness descriptor from the canonical contract owner.",
+            "Supply a bounded, readable UTF-8 JSON readiness descriptor from the canonical contract owner.",
         ) from None
+
+
+def digest_ok(value: Any) -> bool:
+    import re
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def revision_ok(value: Any) -> bool:
+    import re
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read_bounded_file(path: Path, limit: int = MAX_ARTIFACT_BYTES) -> bytes:
+    with path.open("rb") as stream:
+        raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise OSError("artifact exceeds size bound")
+    return raw
 
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        total = 0
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_ARTIFACT_BYTES:
+                raise OSError("artifact exceeds size bound")
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def digest_ok(value: Any) -> bool:
-    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+def canonical_hash(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return sha256_bytes(raw)
 
 
-def revision_ok(value: Any) -> bool:
-    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+def add_error(errors: list[dict[str, str]], code: str, path: str, owner: str, action: str) -> None:
+    errors.append({"code": code, "path": path, "owner": owner, "action": action})
 
 
-def owner_issue_ref(value: Any, owner: str | None = None) -> bool:
-    if not isinstance(value, str):
-        return False
-    if owner is not None:
-        repositories = {owner}
-    else:
-        repositories = {repo for repos in ROLE_REPOSITORIES.values() for repo in repos}
-    return any(
-        re.fullmatch(rf"https://github\.com/Jevelopers-neatHack-2026/{re.escape(repo)}/(issues|pull)/[1-9][0-9]*", value)
-        for repo in repositories
-    )
-
-
-def object_at(value: Any, path: str, owner: str, action: str, errors: list[dict[str, str]]) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    errors.append({"code": "object_required", "path": path, "owner": owner, "action": action})
-    return {}
-
-
-def require_text(value: Any, path: str, owner: str, action: str, errors: list[dict[str, str]]) -> bool:
-    if isinstance(value, str) and value.strip():
-        return True
-    errors.append({"code": "required_text_missing", "path": path, "owner": owner, "action": action})
-    return False
-
-
-def local_file(base: Path, relative: Any, path: str, owner: str, errors: list[dict[str, str]]) -> Path | None:
+def _lexical_safe_path(base: Path, relative: Any, json_path: str, owner: str,
+                       errors: list[dict[str, str]], *, external_root: Path | None = None) -> Path | None:
     if not isinstance(relative, str) or not relative.strip():
-        errors.append({"code": "artifact_path_missing", "path": path, "owner": owner,
-                       "action": "Publish the pinned artifact inside the canonical release package."})
+        add_error(errors, "artifact_path_missing", json_path, owner,
+                  "Publish an exact relative path to the owner-controlled artifact.")
         return None
-    candidate = (base / relative).resolve()
+    path_part = Path(relative)
+    if path_part.is_absolute() or any(part in {"..", ""} for part in path_part.parts):
+        add_error(errors, "artifact_path_invalid", json_path, owner,
+                  "Use a relative artifact path without parent traversal.")
+        return None
+    candidate = base / path_part
+    cursor = base
+    for part in path_part.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            add_error(errors, "artifact_symlink_forbidden", json_path, owner,
+                      "Publish regular artifacts without symlinks so the pinned bytes cannot escape their package.")
+            return None
     try:
-        candidate.relative_to(base.resolve())
-    except ValueError:
-        errors.append({"code": "artifact_path_escapes_release", "path": path, "owner": owner,
-                       "action": "Publish the pinned artifact within the canonical release package; external paths are not followed."})
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(base.resolve(strict=True))
+        if external_root is not None:
+            resolved.relative_to(external_root.resolve(strict=True))
+    except (OSError, ValueError):
+        add_error(errors, "artifact_path_outside_package_or_missing", json_path, owner,
+                  "Publish the artifact inside its pinned owner package; missing and out-of-package paths are not followed.")
         return None
-    if not candidate.is_file():
-        errors.append({"code": "pinned_artifact_missing", "path": path, "owner": owner,
-                       "action": "Publish the referenced canonical artifact at the pinned package path."})
+    if not resolved.is_file():
+        add_error(errors, "artifact_not_regular_file", json_path, owner,
+                  "Publish the exact artifact as a regular file.")
         return None
-    return candidate
+    try:
+        if resolved.stat().st_size > MAX_ARTIFACT_BYTES:
+            add_error(errors, "artifact_size_limit_exceeded", json_path, owner,
+                      "Republish a bounded artifact within the standalone verifier's documented size limit.")
+            return None
+    except OSError:
+        add_error(errors, "artifact_unreadable", json_path, owner,
+                  "Publish readable artifact bytes within the canonical release package.")
+        return None
+    return resolved
 
 
-def check_hash(base: Path, item: dict[str, Any], name: str, json_path: str,
-               owner: str, errors: list[dict[str, str]]) -> Path | None:
-    path = local_file(base, item.get("path"), json_path + ".path", owner, errors)
+def check_artifact(base: Path, item: Any, json_path: str, owner: str,
+                   errors: list[dict[str, str]]) -> tuple[Path | None, str | None]:
+    if not isinstance(item, dict):
+        add_error(errors, "artifact_descriptor_malformed", json_path, owner,
+                  "Publish an artifact descriptor with an exact path and SHA-256.")
+        return None, None
+    path = _lexical_safe_path(base, item.get("path"), json_path + ".path", owner, errors)
     expected = item.get("sha256")
     if not digest_ok(expected):
-        errors.append({"code": "sha256_required", "path": json_path + ".sha256", "owner": owner,
-                       "action": "Publish the SHA-256 of the exact canonical artifact bytes."})
-    if path is not None and digest_ok(expected):
+        add_error(errors, "artifact_sha256_missing", json_path + ".sha256", owner,
+                  "Publish the SHA-256 of the exact owner artifact bytes.")
+        expected = None
+    if path is not None and expected is not None:
         try:
-            actual = sha256_file(path)
-        except OSError:
-            actual = ""
+            raw = read_bounded_file(path)
+        except OSError as exc:
+            code = "artifact_size_limit_exceeded" if "size bound" in str(exc) else "artifact_unreadable"
+            add_error(errors, code, json_path + ".path", owner,
+                      "Publish readable artifact bytes within the standalone verifier's fixed size limit.")
+            return None, None
+        if not raw:
+            add_error(errors, "artifact_empty", json_path + ".path", owner,
+                      "Publish nonempty canonical schema, fixture, adapter, or inventory bytes.")
+            return None, None
+        actual = sha256_bytes(raw)
         if actual != expected:
-            errors.append({"code": "artifact_sha256_mismatch", "path": json_path, "owner": owner,
-                           "action": "Republish the descriptor with the canonical artifact bytes and matching SHA-256."})
-            return None
-    return path
+            add_error(errors, "artifact_sha256_mismatch", json_path, owner,
+                      "Republish the descriptor with the exact owner artifact SHA-256.")
+            return None, None
+        return path, actual
+    return path, None
 
 
-def validate_owner_decisions(manifest: dict[str, Any], errors: list[dict[str, str]]) -> None:
-    decisions = manifest.get("owner_decisions")
-    if not isinstance(decisions, list):
-        decisions = []
-    found: dict[str, dict[str, Any]] = {}
-    for index, decision in enumerate(decisions):
-        if not isinstance(decision, dict):
-            errors.append({"code": "owner_decision_malformed", "path": f"$.owner_decisions[{index}]",
-                           "owner": "Agent and research", "action": "Record an accountable external owner decision."})
+def _repo_for_role(role: Any, leaf: Any) -> str | None:
+    if not isinstance(role, str) or not isinstance(leaf, str):
+        return None
+    for repository in ROLE_REPOSITORIES.get(role, set()):
+        if f"/Jevelopers-neatHack-2026/{repository}/" in leaf:
+            return repository
+    return None
+
+
+def _valid_issue_ref(value: Any, repository: str) -> bool:
+    import re
+    return isinstance(value, str) and re.fullmatch(
+        rf"https://github\.com/Jevelopers-neatHack-2026/{re.escape(repository)}/(issues|pull)/[1-9][0-9]*", value
+    ) is not None
+
+
+def load_trusted_evidence_index(path_value: str | None, expected_sha: str | None,
+                                workspace_root: Path, errors: list[dict[str, str]]) -> dict[str, Any] | None:
+    owner_action = "Provision the independently verified owner-evidence index outside the repository and pin its exact SHA-256 in trusted runner configuration; local manifest assertions are not approval evidence."
+    if not path_value or not digest_ok(expected_sha):
+        add_error(errors, "owner_evidence_index_unavailable", "$.owner_evidence_index", "Agent and research", owner_action)
+        return None
+    index_path = Path(path_value)
+    if index_path.is_symlink():
+        add_error(errors, "owner_evidence_index_symlink_forbidden", "$.owner_evidence_index", "Agent and research", owner_action)
+        return None
+    try:
+        resolved = index_path.resolve(strict=True)
+        resolved.relative_to(workspace_root.resolve(strict=True))
+    except ValueError:
+        pass
+    except OSError:
+        add_error(errors, "owner_evidence_index_missing", "$.owner_evidence_index", "Agent and research", owner_action)
+        return None
+    else:
+        add_error(errors, "owner_evidence_index_must_be_external", "$.owner_evidence_index", "Agent and research", owner_action)
+        return None
+    try:
+        raw = read_bounded_file(resolved, MAX_JSON_BYTES)
+        if sha256_bytes(raw) != expected_sha:
+            raise ValueError("index digest mismatch or size limit")
+        index = parse_json_bytes(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+        add_error(errors, "owner_evidence_index_untrusted_or_invalid", "$.owner_evidence_index", "Agent and research", owner_action)
+        return None
+    if not isinstance(index, dict) or index.get("format") != OWNER_EVIDENCE_INDEX_FORMAT:
+        add_error(errors, "owner_evidence_index_format_invalid", "$.owner_evidence_index.format", "Agent and research", owner_action)
+        return None
+    records = index.get("evidence")
+    if not isinstance(records, list) or not records:
+        add_error(errors, "owner_evidence_index_empty", "$.owner_evidence_index.evidence", "Agent and research", owner_action)
+        return None
+    evidence_root = resolved.parent
+    by_id: dict[str, dict[str, Any]] = {}
+    for idx, row in enumerate(records):
+        ep = f"$.owner_evidence_index.evidence[{idx}]"
+        if not isinstance(row, dict):
+            add_error(errors, "owner_evidence_record_invalid", ep, "Agent and research", owner_action)
             continue
-        reference = decision.get("reference")
-        if isinstance(reference, str):
-            if reference in found:
-                errors.append({"code": "duplicate_owner_decision", "path": f"$.owner_decisions[{index}].reference",
-                               "owner": str(decision.get("owner", "Agent and research")),
-                               "action": "Record exactly one current owner decision for each external handoff."})
-            found[reference] = decision
-    for requirement in OWNER_ACTIONS:
-        decision = found.get(requirement["reference"])
-        if not decision:
-            errors.append({"code": "external_owner_decision_missing", "path": "$.owner_decisions",
-                           "owner": requirement["owner"], "action": requirement["action"]})
+        evidence_id = row.get("evidence_id")
+        owner = row.get("owner")
+        repository = row.get("repository")
+        revision = row.get("revision")
+        ref = row.get("decision_ref")
+        subjects = row.get("subjects")
+        allowed_repositories = {repo for repos in ROLE_REPOSITORIES.values() for repo in repos}
+        if (not isinstance(evidence_id, str) or not evidence_id.strip() or evidence_id in by_id
+                or not isinstance(owner, str) or owner not in allowed_repositories or repository != owner or not revision_ok(revision)
+                or not _valid_issue_ref(ref, owner) or row.get("status") != "accepted"
+                or not isinstance(subjects, dict) or not subjects
+                or any(not isinstance(key, str) or not digest_ok(value) for key, value in subjects.items())):
+            add_error(errors, "owner_evidence_record_invalid", ep, str(owner or "Agent and research"), owner_action)
             continue
-        expected_owner = requirement["owner"]
-        if decision.get("owner") != expected_owner or decision.get("status") != "accepted":
-            errors.append({"code": "external_owner_decision_not_accepted", "path": "$.owner_decisions",
-                           "owner": expected_owner, "action": requirement["action"]})
-        if not owner_issue_ref(decision.get("decision_ref"), expected_owner):
-            errors.append({"code": "owner_decision_reference_invalid", "path": "$.owner_decisions.decision_ref",
-                           "owner": expected_owner, "action": "Link the accepted decision in the accountable owner's repository issue or pull request."})
-        if not revision_ok(decision.get("revision")):
-            errors.append({"code": "owner_decision_revision_missing", "path": "$.owner_decisions.revision",
-                           "owner": expected_owner, "action": "Pin the accepted decision to a 40-character commit revision."})
+        artifact_path = _lexical_safe_path(evidence_root, row.get("evidence_path"), ep + ".evidence_path",
+                                           owner, errors, external_root=evidence_root)
+        evidence_sha = row.get("evidence_sha256")
+        if artifact_path is None or not digest_ok(evidence_sha):
+            add_error(errors, "owner_evidence_artifact_pin_missing", ep, owner, owner_action)
+            continue
+        try:
+            evidence_raw = read_bounded_file(artifact_path)
+            evidence = parse_json_bytes(evidence_raw)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+            add_error(errors, "owner_evidence_artifact_invalid", ep, owner, owner_action)
+            continue
+        if sha256_bytes(evidence_raw) != evidence_sha or not isinstance(evidence, dict):
+            add_error(errors, "owner_evidence_artifact_hash_mismatch", ep, owner, owner_action)
+            continue
+        identity = {
+            "format": OWNER_EVIDENCE_FORMAT,
+            "evidence_id": evidence_id,
+            "owner": owner,
+            "repository": repository,
+            "revision": revision,
+            "decision_ref": ref,
+            "status": "accepted",
+            "subjects": subjects,
+        }
+        if evidence != identity:
+            add_error(errors, "owner_evidence_content_identity_mismatch", ep, owner, owner_action)
+            continue
+        by_id[evidence_id] = dict(identity, evidence_sha256=evidence_sha)
+    if errors:
+        return None
+    return {"sha256": expected_sha, "records": by_id}
 
 
-def validate_crosswalk(manifest: dict[str, Any], schema_hashes: set[str], errors: list[dict[str, str]]) -> None:
+def validate_approval(approval: Any, *, path: str, owner_role: str, subject_id: str,
+                      subject_sha256: str, leaf: Any, evidence: dict[str, Any] | None,
+                      errors: list[dict[str, str]]) -> None:
+    owner = _repo_for_role(owner_role, leaf)
+    action = "Obtain owner-published evidence outside the manifest that approves the exact serialized subject bytes and owner revision."
+    if owner is None:
+        add_error(errors, "approval_owner_leaf_invalid", path, owner_role,
+                  "Link the exact accountable owner leaf in a repository assigned to that owner role.")
+        return
+    if evidence is None:
+        add_error(errors, "owner_approval_not_independently_verified", path, owner_role, action)
+        return
+    if not isinstance(approval, dict):
+        add_error(errors, "owner_approval_missing", path, owner_role, action)
+        return
+    evidence_id = approval.get("evidence_id")
+    record = evidence["records"].get(evidence_id) if isinstance(evidence_id, str) else None
+    if (approval.get("status") != "accepted" or approval.get("owner_role") != owner_role
+            or approval.get("owner_repository") != owner or approval.get("decision_ref") != leaf
+            or approval.get("subject_id") != subject_id or approval.get("subject_sha256") != subject_sha256):
+        add_error(errors, "owner_approval_subject_mismatch", path, owner_role, action)
+    if not isinstance(record, dict):
+        add_error(errors, "owner_evidence_reference_missing", path + ".evidence_id", owner_role, action)
+        return
+    if (record.get("owner") != owner or record.get("repository") != owner
+            or record.get("decision_ref") != leaf or record.get("revision") != approval.get("revision")
+            or record.get("subjects", {}).get(subject_id) != subject_sha256):
+        add_error(errors, "owner_evidence_subject_binding_mismatch", path, owner_role, action)
+
+
+def validate_release_decision(decision: Any, *, owner: str, reference: str, subject_sha256: str,
+                              evidence: dict[str, Any] | None, errors: list[dict[str, str]]) -> None:
+    """Bind an external repository handoff without assigning it a harness role."""
+    path = "$.owner_decisions[" + owner + "]"
+    action = "Obtain the exact external owner's published decision and independently pinned evidence for these release bytes."
+    if evidence is None:
+        add_error(errors, "owner_approval_not_independently_verified", path, owner, action)
+        return
+    if not isinstance(decision, dict):
+        add_error(errors, "owner_decision_malformed", path, owner, action)
+        return
+    subject_id = "contract-release:" + owner
+    evidence_id = decision.get("evidence_id")
+    record = evidence["records"].get(evidence_id) if isinstance(evidence.get("records"), dict) and isinstance(evidence_id, str) else None
+    if (decision.get("status") != "accepted" or decision.get("owner") != owner
+            or decision.get("decision_ref") != reference or not revision_ok(decision.get("revision"))
+            or decision.get("subject_id") != subject_id or decision.get("subject_sha256") != subject_sha256):
+        add_error(errors, "external_owner_decision_subject_mismatch", path, owner,
+                  "Bind the decision to the exact owner handoff, release content hash, and reviewed revision.")
+    if not isinstance(record, dict):
+        add_error(errors, "owner_evidence_reference_missing", path + ".evidence_id", owner, action)
+        return
+    if (record.get("owner") != owner or record.get("repository") != owner
+            or record.get("decision_ref") != reference or record.get("revision") != decision.get("revision")
+            or record.get("subjects", {}).get(subject_id) != subject_sha256):
+        add_error(errors, "owner_evidence_subject_binding_mismatch", path, owner,
+                  "Match the independently trusted owner evidence to this exact release subject hash and revision.")
+
+
+def adapter_provenance_verified(adapter: Any, adapter_sha256: str | None,
+                                evidence: dict[str, Any] | None) -> bool:
+    if not isinstance(adapter, dict) or not digest_ok(adapter_sha256) or evidence is None:
+        return False
+    evidence_id = adapter.get("evidence_id")
+    record = evidence.get("records", {}).get(evidence_id) if isinstance(evidence_id, str) else None
+    return bool(isinstance(record, dict)
+                and record.get("owner") == "shared-contracts"
+                and record.get("repository") == "shared-contracts"
+                and record.get("subjects", {}).get("contract-validator-adapter") == adapter_sha256)
+
+
+def _read_inventory(base: Path, descriptor: Any, errors: list[dict[str, str]]) -> tuple[dict[str, Any] | None, str | None, Path | None]:
+    path, digest = check_artifact(base, descriptor, "$.canonical_release.field_inventory", "shared-contracts", errors)
+    if path is None:
+        return None, digest, None
+    try:
+        data = parse_json_bytes(read_bounded_file(path))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+        add_error(errors, "field_inventory_invalid_json", "$.canonical_release.field_inventory", "shared-contracts",
+                  "Publish a bounded machine-readable field inventory generated from the exact canonical schema artifact bytes.")
+        return None, digest, path
+    if not isinstance(data, dict) or data.get("format") != FIELD_INVENTORY_FORMAT:
+        add_error(errors, "field_inventory_format_invalid", "$.canonical_release.field_inventory", "shared-contracts",
+                  f"Publish the owner-generated machine-readable inventory using {FIELD_INVENTORY_FORMAT}.")
+        return None, digest, path
+    return data, digest, path
+
+
+def validate_crosswalk(manifest: dict[str, Any], schemas: dict[str, dict[str, Any]],
+                       inventory: dict[str, Any] | None, evidence: dict[str, Any] | None,
+                       errors: list[dict[str, str]]) -> None:
+    expected: set[tuple[str, str, str, str, str]] = set()
+    inventory_schemas = inventory.get("schemas") if isinstance(inventory, dict) else None
+    if not isinstance(inventory_schemas, list) or not inventory_schemas:
+        add_error(errors, "canonical_schema_field_inventory_missing", "$.canonical_release.field_inventory.schemas", "shared-contracts",
+                  "Publish a nonempty exact field inventory per canonical schema, contract, and primitive; the harness will not infer field names.")
+        inventory_schemas = []
+    seen_inventory_keys: set[tuple[str, str, str]] = set()
+    all_primitives: set[str] = set()
+    for index, item in enumerate(inventory_schemas):
+        path = f"$.canonical_release.field_inventory.schemas[{index}]"
+        if not isinstance(item, dict):
+            add_error(errors, "schema_inventory_entry_invalid", path, "shared-contracts",
+                      "Publish each actual schema/contract/primitive inventory entry with its exact field paths.")
+            continue
+        schema_id, schema_sha = item.get("schema_id"), item.get("schema_sha256")
+        contract_id, primitive = item.get("contract_id"), item.get("primitive")
+        fields, aliases = item.get("field_paths"), item.get("aliases")
+        key = (schema_id, contract_id, primitive) if all(isinstance(x, str) for x in (schema_id, contract_id, primitive)) else None
+        if (key is None or not schema_id.strip() or not contract_id.strip() or primitive not in PRIMITIVES
+                or not digest_ok(schema_sha) or schemas.get(schema_id, {}).get("sha256") != schema_sha):
+            add_error(errors, "schema_inventory_identity_invalid", path, "shared-contracts",
+                      "Bind each inventory entry to an existing schema artifact SHA, exact owner contract ID, and supported primitive tag.")
+            continue
+        if key in seen_inventory_keys:
+            add_error(errors, "schema_inventory_duplicate", path, "shared-contracts",
+                      "Publish one field inventory per exact schema SHA, contract ID, and primitive.")
+        seen_inventory_keys.add(key)
+        if not isinstance(fields, list) or not fields or any(not isinstance(field, str) or not field.strip() for field in fields):
+            add_error(errors, "schema_field_inventory_empty_or_invalid", path + ".field_paths", "shared-contracts",
+                      "Publish every exact serialized field path from the owner schema; empty schemas cannot satisfy the gate.")
+            fields = []
+        if len(fields) != len(set(field for field in fields if isinstance(field, str))):
+            add_error(errors, "schema_field_inventory_duplicate", path + ".field_paths", "shared-contracts",
+                      "Remove duplicate field paths from the owner-generated schema inventory.")
+        if not isinstance(aliases, list) or any(not isinstance(alias, str) or not alias.strip() for alias in aliases):
+            add_error(errors, "schema_alias_inventory_invalid", path + ".aliases", "shared-contracts",
+                      "Publish an explicit owner-reviewed alias list; aliases cannot substitute for canonical field paths.")
+            aliases = []
+        for field in fields:
+            if isinstance(field, str) and field.strip():
+                expected.add((schema_id, schema_sha, contract_id, primitive, field))
+        if primitive in REQUIRED_PRIMITIVE_FIXTURES:
+            all_primitives.add(primitive)
+    for primitive in sorted(set(REQUIRED_PRIMITIVE_FIXTURES) - all_primitives):
+        add_error(errors, "actual_provider_primitive_inventory_missing", "$.canonical_release.field_inventory.schemas", "creative-engine",
+                  f"Publish the actual owner schema and fixture inventory for provider primitive {primitive!r}; do not synthesize provider semantics.")
+
     rows = manifest.get("field_crosswalk")
     if not isinstance(rows, list):
         rows = []
-    seen: set[tuple[str, str]] = set()
-    fields: set[str] = set()
-    tags: set[str] = set()
-    fields_owner_action = "Publish the accepted field-by-field crosswalk with producer and consumer review."
-    required = {
-        "field_name": "Record the canonical field spelling from the pinned schema; do not introduce an alias.",
-        "meaning": fields_owner_action,
-        "producer_role": fields_owner_action,
-        "producer_leaf": fields_owner_action,
-        "consumer_role": fields_owner_action,
-        "consumer_leaf": fields_owner_action,
-        "trusted_derivation": "Record whether the field is server-derived, owner-produced, externally verified, or unavailable.",
-        "unavailable_semantics": "Record omitted versus explicit-unknown behavior from the owner schema.",
-        "precision": "Record exact numeric precision and the owner-approved rounding boundary, or not-applicable with reason.",
-        "privacy_retention": "Record the owner-approved privacy and retention classification.",
-        "compatibility_rule": "Record the owner-approved additive and breaking-change rule.",
-    }
+    actual: set[tuple[str, str, str, str, str]] = set()
+    row_owner_action = "Publish exactly one crosswalk row per field path in the owner-generated schema/contract/primitive inventory."
+    text_fields = ("meaning", "producer_role", "producer_leaf", "consumer_role", "consumer_leaf",
+                  "trusted_derivation", "unavailable_semantics", "precision", "privacy_retention", "compatibility_rule")
     for index, row in enumerate(rows):
         path = f"$.field_crosswalk[{index}]"
         if not isinstance(row, dict):
-            errors.append({"code": "crosswalk_row_malformed", "path": path, "owner": "shared-contracts",
-                           "action": fields_owner_action})
+            add_error(errors, "crosswalk_row_malformed", path, "shared-contracts", row_owner_action)
             continue
-        field = row.get("field_name")
-        schema_sha = row.get("schema_sha256")
-        if not isinstance(field, str) or not field.strip():
-            errors.append({"code": "canonical_field_name_missing", "path": path + ".field_name",
-                           "owner": "shared-contracts", "action": required["field_name"]})
-        if not digest_ok(schema_sha) or schema_sha not in schema_hashes:
-            errors.append({"code": "crosswalk_schema_pin_missing", "path": path + ".schema_sha256",
-                           "owner": "shared-contracts", "action": "Pin each row to an artifact SHA-256 published in this release."})
-        elif isinstance(field, str):
-            pair = (schema_sha, field)
-            if pair in seen:
-                errors.append({"code": "duplicate_canonical_field", "path": path + ".field_name",
-                               "owner": "shared-contracts", "action": "Keep one crosswalk row per canonical field per schema artifact."})
-            seen.add(pair)
-            fields.add(field)
-        for key, action in required.items():
-            require_text(row.get(key), path + "." + key, "shared-contracts", action, errors)
-        for role_key, leaf_key in (("producer_role", "producer_leaf"), ("consumer_role", "consumer_leaf")):
-            role = row.get(role_key)
-            leaf = row.get(leaf_key)
-            repositories = ROLE_REPOSITORIES.get(role, set()) if isinstance(role, str) else set()
-            if not owner_issue_ref(leaf) or not any(
-                isinstance(leaf, str) and f"/Jevelopers-neatHack-2026/{repository}/" in leaf for repository in repositories
-            ):
-                errors.append({"code": "affected_role_leaf_reference_invalid", "path": path + "." + leaf_key,
-                               "owner": role if isinstance(role, str) else "Agent and research",
-                               "action": "Link the exact affected producer or consumer leaf in its authorized owner repository."})
-        coverage = row.get("coverage_tags", [])
-        if not isinstance(coverage, list) or any(not isinstance(tag, str) for tag in coverage):
-            errors.append({"code": "crosswalk_coverage_tags_invalid", "path": path + ".coverage_tags",
-                           "owner": "Agent and research", "action": "Tag the row with the issue #5 crosswalk categories it covers."})
+        if "coverage_tags" in row:
+            add_error(errors, "untrusted_coverage_tags_forbidden", path + ".coverage_tags", "Agent and research",
+                      "Remove caller-supplied coverage tags; exact schema field and fixture mappings determine coverage.")
+        schema_id, schema_sha = row.get("schema_id"), row.get("schema_sha256")
+        contract_id, primitive, field = row.get("contract_id"), row.get("primitive"), row.get("field_path")
+        key = (schema_id, schema_sha, contract_id, primitive, field) if all(isinstance(x, str) for x in (schema_id, schema_sha, contract_id, primitive, field)) else None
+        if key is None or key not in expected:
+            add_error(errors, "crosswalk_field_not_in_pinned_inventory", path, "shared-contracts",
+                      "Use an exact field path from the matching pinned schema, contract, and primitive inventory; tags cannot fill missing fields.")
+        elif key in actual:
+            add_error(errors, "crosswalk_field_duplicate", path, "shared-contracts", row_owner_action)
         else:
-            tags.update(coverage)
-        for side in ("producer_review", "consumer_review"):
+            actual.add(key)
+        for field_name in text_fields:
+            value = row.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                add_error(errors, "crosswalk_field_metadata_missing", path + "." + field_name, "shared-contracts",
+                          "Record owner-defined meaning, roles, exact leaves, trust derivation, unknown semantics, precision, privacy, and compatibility for this serialized field.")
+        producer_repo = _repo_for_role(row.get("producer_role"), row.get("producer_leaf"))
+        consumer_repo = _repo_for_role(row.get("consumer_role"), row.get("consumer_leaf"))
+        for side, role_key, leaf_key, repo in (("producer_review", "producer_role", "producer_leaf", producer_repo),
+                                               ("consumer_review", "consumer_role", "consumer_leaf", consumer_repo)):
             review = row.get(side)
-            if not isinstance(review, dict) or review.get("status") != "accepted":
-                role_key = "producer_role" if side == "producer_review" else "consumer_role"
-                role = row.get(role_key)
-                errors.append({"code": "affected_role_review_missing", "path": path + "." + side,
-                               "owner": str(role) if isinstance(role, str) else "Agent and research",
-                               "action": "Record accepted review by the affected producer and consumer role for this canonical field."})
+            subject_id = "contract-crosswalk:" + canonical_hash({k: v for k, v in row.items() if k not in {"producer_review", "consumer_review"}}) + ":" + side
+            subject_hash = canonical_hash({k: v for k, v in row.items() if k not in {"producer_review", "consumer_review"}})
+            if repo is None or not isinstance(review, dict):
+                add_error(errors, "affected_role_review_missing", path + "." + side,
+                          str(row.get(role_key) if isinstance(row.get(role_key), str) else "Agent and research"),
+                          "Record the affected producer or consumer's independently verified review of this exact field row.")
                 continue
-            for key in ("role", "reference"):
-                if not isinstance(review.get(key), str) or not review[key].strip():
-                    errors.append({"code": "affected_role_review_incomplete", "path": path + "." + side + "." + key,
-                                   "owner": str(review.get("role", "Agent and research")),
-                                   "action": "Record the reviewer role and its accountable issue reference."})
-            role_key = "producer_role" if side == "producer_review" else "consumer_role"
-            leaf_key = "producer_leaf" if side == "producer_review" else "consumer_leaf"
-            role = row.get(role_key)
-            if review.get("role") != role or review.get("reference") != row.get(leaf_key):
-                errors.append({"code": "affected_role_review_reference_mismatch", "path": path + "." + side,
-                               "owner": role if isinstance(role, str) else "Agent and research",
-                               "action": "Bind each accepted role review to the exact producer or consumer leaf named in this field crosswalk row."})
-            if not revision_ok(review.get("revision")):
-                errors.append({"code": "affected_role_revision_missing", "path": path + "." + side + ".revision",
-                               "owner": str(review.get("role", "Agent and research")),
-                               "action": "Pin affected-role review to the reviewed commit."})
-    for field in sorted(REQUIRED_FIELDS - fields):
-        errors.append({"code": "required_catalog_field_missing", "path": "$.field_crosswalk",
-                       "owner": "shared-contracts", "action": f"Include catalog field {field!r} in the accepted field crosswalk."})
-    for tag in sorted(REQUIRED_COVERAGE_TAGS - tags):
-        errors.append({"code": "required_crosswalk_topic_missing", "path": "$.field_crosswalk",
-                       "owner": "shared-contracts", "action": f"Cover the required issue #5 crosswalk topic {tag!r} with canonical fields."})
+            validate_approval(review, path=path + "." + side, owner_role=row[role_key], subject_id=subject_id,
+                              subject_sha256=subject_hash, leaf=row[leaf_key], evidence=evidence, errors=errors)
+    for missing in sorted(expected - actual):
+        add_error(errors, "crosswalk_field_missing", "$.field_crosswalk", "shared-contracts",
+                  "Add the exact schema/contract/primitive/field-path row missing from the pinned inventory.")
+    for extra in sorted(actual - expected):
+        add_error(errors, "crosswalk_field_not_in_pinned_inventory", "$.field_crosswalk", "shared-contracts",
+                  "Remove fields and aliases absent from the exact owner schema inventory.")
 
 
-def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, str]]) -> dict[str, Any] | None:
-    if not isinstance(manifest, dict):
-        errors.append({"code": "manifest_object_required", "path": "$", "owner": "Agent and research",
-                       "action": "Supply a canonical owner release descriptor as a JSON object."})
-        return None
-    if manifest.get("format") != FORMAT:
-        errors.append({"code": "readiness_descriptor_format_unsupported", "path": "$.format",
-                       "owner": "Agent and research", "action": f"Publish a descriptor using {FORMAT}."})
-    status = manifest.get("status")
-    if status != "published":
-        owner_actions = manifest.get("owner_actions")
-        if isinstance(owner_actions, list) and owner_actions:
-            for index, action in enumerate(owner_actions):
-                if isinstance(action, dict):
-                    errors.append({
-                        "code": "canonical_release_not_published",
-                        "path": f"$.owner_actions[{index}]",
-                        "owner": str(action.get("owner", "shared-contracts")),
-                        "action": str(action.get("action", "Publish the canonical contract release and owner fixtures.")),
-                    })
-        else:
-            for item in OWNER_ACTIONS:
-                errors.append({"code": "canonical_release_not_published", "path": "$.canonical_release",
-                               "owner": item["owner"], "action": item["action"]})
-        return None
-
-    base = manifest_path.resolve().parent
-    release = object_at(manifest.get("canonical_release"), "$.canonical_release", "shared-contracts",
-                        "Publish the pinned canonical release metadata and artifacts.", errors)
-    if release.get("repository") != "Jevelopers-neatHack-2026/shared-contracts":
-        errors.append({"code": "canonical_repository_mismatch", "path": "$.canonical_release.repository",
-                       "owner": "shared-contracts", "action": "Publish the release from the canonical shared-contracts repository."})
-    if not revision_ok(release.get("revision")):
-        errors.append({"code": "canonical_revision_missing", "path": "$.canonical_release.revision",
-                       "owner": "shared-contracts", "action": "Pin the canonical release to its exact 40-character commit."})
-    require_text(release.get("version"), "$.canonical_release.version", "shared-contracts",
-                 "Publish an explicit contract release version.", errors)
-
-    artifacts = release.get("schema_artifacts")
-    if not isinstance(artifacts, list) or not artifacts:
-        artifacts = []
-        errors.append({"code": "canonical_schema_artifacts_missing", "path": "$.canonical_release.schema_artifacts",
-                       "owner": "shared-contracts", "action": "Publish executable canonical schema/package artifacts and pin their SHA-256 values."})
-    schema_hashes: set[str] = set()
-    for index, artifact in enumerate(artifacts):
-        path = f"$.canonical_release.schema_artifacts[{index}]"
-        if not isinstance(artifact, dict):
-            errors.append({"code": "schema_artifact_malformed", "path": path, "owner": "shared-contracts",
-                           "action": "Publish each schema artifact with its path and exact SHA-256."})
-            continue
-        if check_hash(base, artifact, "schema", path, "shared-contracts", errors):
-            schema_hashes.add(str(artifact.get("sha256")))
-    validate_owner_decisions(manifest, errors)
-    validate_crosswalk(manifest, schema_hashes, errors)
-
-    compatibility = object_at(manifest.get("compatibility"), "$.compatibility", "shared-contracts",
-                              "Record the owner decision for supported old consumers and additive fields.", errors)
-    additive = compatibility.get("unknown_additive_fields")
-    if additive not in {"preserve", "ignore"}:
-        errors.append({"code": "additive_field_policy_missing", "path": "$.compatibility.unknown_additive_fields",
-                       "owner": "shared-contracts", "action": "Record whether unknown additive fields are preserved or ignored, with owner approval."})
-
-    adapter = object_at(release.get("validator_adapter"), "$.canonical_release.validator_adapter", "shared-contracts",
-                        "Publish the pinned offline canonical fixture validator adapter.", errors)
-    if adapter.get("protocol") != ADAPTER_PROTOCOL:
-        errors.append({"code": "validator_adapter_protocol_missing", "path": "$.canonical_release.validator_adapter.protocol",
-                       "owner": "shared-contracts", "action": f"Publish an offline adapter implementing {ADAPTER_PROTOCOL}; this is a readiness tool protocol, not a runtime schema."})
-    if adapter.get("offline_attested") is not True:
-        errors.append({"code": "validator_adapter_not_offline_attested", "path": "$.canonical_release.validator_adapter.offline_attested",
-                       "owner": "shared-contracts", "action": "Publish an owner-reviewed adapter that executes only local fixtures and does not contact providers or services."})
-    adapter_path = check_hash(base, adapter, "validator adapter", "$.canonical_release.validator_adapter",
-                              "shared-contracts", errors)
-
+def _validate_fixture_map(manifest: dict[str, Any], schemas: dict[str, dict[str, Any]], inventory: dict[str, Any] | None,
+                          base: Path, errors: list[dict[str, str]]) -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
     fixture_rows = manifest.get("fixtures")
     if not isinstance(fixture_rows, list):
         fixture_rows = []
     fixtures: dict[str, dict[str, Any]] = {}
+    fixture_paths: dict[str, Path] = {}
+    schema_entries = inventory.get("schemas", []) if isinstance(inventory, dict) else []
+    inventory_keys = {
+        (item.get("schema_id"), item.get("schema_sha256"), item.get("contract_id"), item.get("primitive"))
+        for item in schema_entries if isinstance(item, dict)
+        and all(isinstance(item.get(key), str) for key in ("schema_id", "schema_sha256", "contract_id", "primitive"))
+    }
     for index, fixture in enumerate(fixture_rows):
         path = f"$.fixtures[{index}]"
         if not isinstance(fixture, dict):
-            errors.append({"code": "fixture_manifest_entry_malformed", "path": path, "owner": "shared-contracts",
-                           "action": "Publish each owner fixture with its case ID, path, bytes hash, expected outcome, and optional canonical serialization hash."})
+            add_error(errors, "fixture_manifest_entry_malformed", path, "shared-contracts",
+                      "Publish fixture path/hash plus exact owner schema, contract, primitive, and expected semantic outcome.")
             continue
         case_id = fixture.get("case_id")
         if not isinstance(case_id, str) or case_id not in REQUIRED_CASES:
-            errors.append({"code": "fixture_case_id_unsupported", "path": path + ".case_id", "owner": "Agent and research",
-                           "action": "Use the exact ACV1-CONTRACTS fixture case IDs listed in the harness readiness plan."})
+            add_error(errors, "fixture_case_id_unsupported", path + ".case_id", "Agent and research",
+                      "Use one exact ACV1-CONTRACTS issue #5 acceptance case ID.")
             continue
         if case_id in fixtures:
-            errors.append({"code": "duplicate_fixture_case", "path": path + ".case_id", "owner": "shared-contracts",
-                           "action": "Publish exactly one current pinned fixture for each required case ID."})
+            add_error(errors, "duplicate_fixture_case", path + ".case_id", "shared-contracts",
+                      "Map each required acceptance case once to an owner-published fixture.")
             continue
         fixtures[case_id] = fixture
-        if check_hash(base, fixture, "fixture", path, "shared-contracts", errors) is None:
-            continue
-        if fixture.get("data_classification") not in {"synthetic", "sanitized_non_customer"}:
-            errors.append({"code": "fixture_data_classification_missing", "path": path + ".data_classification",
-                           "owner": "shared-contracts", "action": "Mark fixtures synthetic or sanitized non-customer data; never publish secrets or customer content."})
-        expected = REQUIRED_CASES[case_id]
-        if case_id == "unknown_additive_fields" or case_id == "old_consumer_additive_field":
-            if additive in {"preserve", "ignore"}:
-                expected = "accepted_and_preserved" if additive == "preserve" else "accepted_and_ignored"
-        if fixture.get("expected_outcome") != expected:
-            errors.append({"code": "fixture_expected_outcome_disagrees", "path": path + ".expected_outcome",
-                           "owner": "shared-contracts", "action": f"Set the expected result to the accepted contract decision for case {case_id!r}."})
-        if case_id in {"current_valid", "supported_older_version", "unknown_additive_fields", "fractional_subcent_usage"}:
+        fixture_path, fixture_sha = check_artifact(base, fixture, path, "shared-contracts", errors)
+        schema_id, schema_sha = fixture.get("schema_id"), fixture.get("schema_sha256")
+        contract_id, primitive = fixture.get("contract_id"), fixture.get("primitive")
+        identity_values = (schema_id, schema_sha, contract_id, primitive)
+        identity_is_typed = all(isinstance(value, str) for value in identity_values)
+        mapped_identity = identity_is_typed and identity_values in inventory_keys
+        schema_record = schemas.get(schema_id) if isinstance(schema_id, str) else None
+        if not mapped_identity or not isinstance(schema_record, dict) or schema_record.get("sha256") != schema_sha:
+            add_error(errors, "fixture_schema_contract_primitive_unmapped", path, "shared-contracts",
+                      "Map each fixture to the exact pinned schema, owner contract, and primitive inventory entry it exercises.")
+        if fixture.get("expected_outcome") != REQUIRED_CASES[case_id]:
+            add_error(errors, "fixture_expected_outcome_invalid", path + ".expected_outcome", "shared-contracts",
+                      "Publish the owner-approved semantic expected outcome for this issue acceptance case.")
+        classification = fixture.get("data_classification")
+        if not isinstance(classification, str) or classification not in {"synthetic", "sanitized_non_customer"}:
+            add_error(errors, "fixture_data_classification_missing", path + ".data_classification", "shared-contracts",
+                      "Mark fixtures synthetic or sanitized non-customer data; never include secrets or customer content.")
+        if fixture_path is not None:
+            fixture_paths[case_id] = fixture_path
+            try:
+                raw = read_bounded_file(fixture_path)
+                media_type = fixture.get("media_type")
+                if ((isinstance(media_type, str) and "json" in media_type)
+                        or fixture_path.suffix.lower() == ".json"):
+                    content = parse_json_bytes(raw)
+                    if content is None or content == {} or content == []:
+                        add_error(errors, "fixture_content_empty", path + ".path", "shared-contracts",
+                                  "Publish a nonempty owner fixture that exercises real input bytes; an empty object is not a conformance case.")
+            except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+                add_error(errors, "fixture_json_invalid", path + ".path", "shared-contracts",
+                          "Publish valid bounded JSON fixture bytes for a JSON-classified fixture.")
+        if case_id in {"current_valid", "current_invalid", "supported_older_version",
+                       "unknown_additive_fields", "old_consumer_additive_field",
+                       "fractional_subcent_usage", "choice_actual_provider_shape",
+                       "score_actual_provider_shape", "noul_actual_provider_shape"}:
             if not digest_ok(fixture.get("serialized_sha256")):
-                errors.append({"code": "canonical_serialization_hash_missing", "path": path + ".serialized_sha256",
-                               "owner": "shared-contracts", "action": "Publish the reference-byte hash using the canonical owner serialization rule."})
+                add_error(errors, "canonical_serialization_hash_missing", path + ".serialized_sha256", "shared-contracts",
+                          "Publish the expected SHA-256 of actual canonical serialized output bytes under the pinned owner serialization rule.")
     for case_id in REQUIRED_CASES:
         if case_id not in fixtures:
-            errors.append({"code": "required_fixture_missing", "path": "$.fixtures",
-                           "owner": "shared-contracts", "action": f"Publish the owner fixture for required case {case_id!r}."})
-
-    if errors:
-        return None
-
-    request = {
-        "protocol": ADAPTER_PROTOCOL,
-        "release_revision": release["revision"],
-        "release_version": release["version"],
-        "unknown_additive_fields": additive,
-        "fixtures": [
-            {
-                "case_id": case_id,
-                "path": str((base / fixtures[case_id]["path"]).resolve()),
-                "sha256": fixtures[case_id]["sha256"],
-                "expected_outcome": fixtures[case_id]["expected_outcome"],
-                "serialized_sha256": fixtures[case_id].get("serialized_sha256"),
-            }
-            for case_id in REQUIRED_CASES
-        ],
+            add_error(errors, "required_fixture_missing", "$.fixtures", "shared-contracts",
+                      f"Publish the owner fixture for required issue #5 case {case_id!r}.")
+    for primitive, case_id in REQUIRED_PRIMITIVE_FIXTURES.items():
+        fixture = fixtures.get(case_id)
+        if not isinstance(fixture, dict) or fixture.get("primitive") != primitive:
+            add_error(errors, "provider_primitive_fixture_missing", "$.fixtures", "creative-engine",
+                      f"Provide the actual owner fixture for provider primitive {primitive!r}; do not infer provider payload or confidence semantics.")
+    crosswalk = manifest.get("fixture_crosswalk")
+    expected_mapping = {
+        (case_id, fixture.get("schema_id"), fixture.get("schema_sha256"), fixture.get("contract_id"), fixture.get("primitive"), fixture.get("sha256"))
+        for case_id, fixture in fixtures.items() if isinstance(fixture, dict)
+        and all(isinstance(fixture.get(key), str) for key in
+                ("schema_id", "schema_sha256", "contract_id", "primitive", "sha256"))
     }
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0"}
+    actual_mapping: set[tuple[Any, ...]] = set()
+    if not isinstance(crosswalk, list) or not crosswalk:
+        add_error(errors, "fixture_crosswalk_missing", "$.fixture_crosswalk", "shared-contracts",
+                  "Publish an explicit fixture-to-schema/contract/primitive mapping for every acceptance case.")
+        crosswalk = []
+    for index, row in enumerate(crosswalk):
+        path = f"$.fixture_crosswalk[{index}]"
+        if not isinstance(row, dict):
+            add_error(errors, "fixture_crosswalk_row_invalid", path, "shared-contracts",
+                      "Map each fixture ID to exact owner schema, contract, primitive, and fixture SHA-256.")
+            continue
+        key_values = (row.get("case_id"), row.get("schema_id"), row.get("schema_sha256"),
+                      row.get("contract_id"), row.get("primitive"), row.get("fixture_sha256"))
+        if not all(isinstance(value, str) for value in key_values):
+            add_error(errors, "fixture_crosswalk_identity_invalid", path, "shared-contracts",
+                      "Use bounded string IDs and hashes for each exact fixture-to-schema crosswalk identity.")
+            continue
+        key = key_values
+        if key in actual_mapping:
+            add_error(errors, "fixture_crosswalk_duplicate", path, "shared-contracts",
+                      "Map each case/schema/contract/primitive tuple exactly once.")
+        actual_mapping.add(key)
+    for missing in expected_mapping - actual_mapping:
+        add_error(errors, "fixture_crosswalk_case_missing", "$.fixture_crosswalk", "shared-contracts",
+                  "Add the exact owner fixture mapping omitted from the acceptance crosswalk.")
+    for extra in actual_mapping - expected_mapping:
+        add_error(errors, "fixture_crosswalk_case_unowned", "$.fixture_crosswalk", "shared-contracts",
+                  "Remove mappings that do not match a pinned owner fixture byte-for-byte.")
+    return fixtures, fixture_paths
+
+
+def _sandbox_command(package_root: Path, adapter: Path, request_bytes: bytes) -> tuple[list[str] | None, str | None]:
+    if platform.system() != "Linux":
+        return None, "The current platform has no accepted supported no-network filesystem sandbox backend; macOS sandbox-exec is deprecated and is not used as a security boundary. Provision reviewed bubblewrap on a supported Linux runner or another audited OS sandbox."
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        return None, "bubblewrap is unavailable. Provision a supported bubblewrap runtime with user, network, and PID namespaces; adapters are not executed without an enforceable OS sandbox."
+    if not request_bytes or len(request_bytes) > 512 * 1024:
+        return None, "The adapter request exceeds the fixed offline execution input bound."
+    python_exe = os.path.realpath(sys.executable)
+    if not python_exe.startswith("/usr/"):
+        return None, "The Python runtime is outside the isolated /usr system tree; provision the approved Python runtime under /usr."
+    if not adapter.is_file() or not package_root.is_dir():
+        return None, "The pinned adapter or owner package is unavailable; republish them within the canonical package."
+    command = [
+        bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+        "--dir", "/usr", "--ro-bind", "/usr", "/usr",
+    ]
+    for system_dir in ("/lib", "/lib64", "/bin", "/sbin"):
+        if os.path.exists(system_dir):
+            command.extend(["--dir", system_dir, "--ro-bind", system_dir, system_dir])
+    command.extend([
+        "--dir", "/release", "--ro-bind", str(package_root.resolve()), "/release",
+        "--chdir", "/release", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
+        "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8",
+        python_exe, "-I", "-B", "-S", "/release/" + adapter.relative_to(package_root).as_posix(),
+    ])
+    return command, None
+
+
+def probe_sandbox(package_root: Path) -> str | None:
+    """Require an offline canary proving host paths and host networking are isolated."""
+    if platform.system() != "Linux":
+        return "The current platform has no accepted supported no-network filesystem sandbox backend; macOS sandbox-exec is deprecated and is not used as a security boundary. Provision reviewed bubblewrap on a supported Linux runner or another audited OS sandbox."
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        return "bubblewrap is unavailable. Provision a supported bubblewrap runtime with user, network, and PID namespaces; adapters are not executed without an enforceable OS sandbox."
+    python_exe = os.path.realpath(sys.executable)
+    if not python_exe.startswith("/usr/"):
+        return "The Python runtime is outside the isolated /usr system tree; provision the approved Python runtime under /usr."
     try:
-        completed = subprocess.run(
-            [sys.executable, str(adapter_path)],
-            input=json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
-            text=True,
-            capture_output=True,
-            timeout=90,
-            cwd=base,
-            env=env,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        errors.append({"code": "canonical_validator_execution_failed", "path": "$.canonical_release.validator_adapter",
-                       "owner": "shared-contracts", "action": "Repair and republish the pinned offline canonical validator adapter."})
-        return None
-    if completed.returncode != 0:
-        errors.append({"code": "canonical_fixture_validation_failed", "path": "$.fixtures",
-                       "owner": "shared-contracts", "action": "Correct the canonical fixture or owner-approved contract rule; inspect adapter diagnostics outside this sanitized report."})
-        return None
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="acv1-sandbox-canary-") as temp:
+            outside = Path(temp) / "host-canary.txt"
+            outside.write_text("synthetic-host-canary", encoding="utf-8")
+            prefix = [bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
+                      "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                      "--dir", "/usr", "--ro-bind", "/usr", "/usr"]
+            for system_dir in ("/lib", "/lib64", "/bin", "/sbin"):
+                if os.path.exists(system_dir):
+                    prefix.extend(["--dir", system_dir, "--ro-bind", system_dir, system_dir])
+            prefix.extend(["--dir", "/release", "--ro-bind", str(package_root.resolve()), "/release",
+                           "--chdir", "/release", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
+                           "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8"])
+            child_code = (
+                "import socket,sys\n"
+                "read_blocked=False\n"
+                "try: open(sys.argv[1],'rb').read()\n"
+                "except OSError: read_blocked=True\n"
+                "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2)\n"
+                "try: s.connect(('198.18.0.1',9)); net_blocked=False\n"
+                "except OSError: net_blocked=True\n"
+                "print('child-read-blocked='+str(read_blocked)+' child-network-blocked='+str(net_blocked))\n"
+                "sys.exit(0 if read_blocked and net_blocked else 7)\n"
+            )
+            parent_code = (
+                "import json,socket,subprocess,sys\n"
+                "r={'outside_read_blocked':False,'network_blocked':False,'child_isolated':False}\n"
+                "try: open(sys.argv[1],'rb').read()\n"
+                "except OSError: r['outside_read_blocked']=True\n"
+                "try:\n"
+                " s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2); s.connect(('198.18.0.1',9))\n"
+                "except OSError: r['network_blocked']=True\n"
+                "p=subprocess.run([sys.executable,'-I','-B','-S','-c',sys.argv[2],sys.argv[1]],capture_output=True,timeout=2)\n"
+                "r['child_isolated']=(p.returncode==0 and b'child-read-blocked=True child-network-blocked=True' in p.stdout)\n"
+                "open(sys.argv[1],'wb').write(b'sandbox-shadow-write')\n"
+                "print(json.dumps(r,sort_keys=True,separators=(',',':')))\n"
+                "sys.exit(0 if all(r.values()) else 8)\n"
+            )
+            command = prefix + [python_exe, "-I", "-B", "-S", "-c", parent_code,
+                                str(outside), child_code]
+            run = run_bounded(command, cwd=package_root,
+                              env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
+                                   "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"},
+                              input_bytes=b"", timeout=5, stdout_limit=4096, stderr_limit=4096)
+            if not run.get("ok") or outside.read_text(encoding="utf-8") != "synthetic-host-canary":
+                return "bubblewrap isolation canary failed; host path, host-write, child containment, or network namespace policy did not hold."
+            try:
+                report = parse_json_bytes(run["stdout"])
+            except (ValueError, UnicodeError, json.JSONDecodeError, RecursionError):
+                return "bubblewrap isolation canary returned invalid diagnostics; the owner adapter is not executed."
+            if (not isinstance(report, dict) or report.get("outside_read_blocked") is not True
+                    or report.get("network_blocked") is not True or report.get("child_isolated") is not True):
+                return "bubblewrap isolation canary did not prove read, socket, and descendant boundaries; the owner adapter is not executed."
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return "bubblewrap isolation prerequisite could not be verified with synthetic canaries; the owner adapter is not executed."
+    return None
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
-        response = json.loads(completed.stdout, object_pairs_hook=_pairs_no_duplicates)
-    except (json.JSONDecodeError, ValueError):
-        errors.append({"code": "canonical_validator_output_invalid", "path": "$.canonical_release.validator_adapter",
-                       "owner": "shared-contracts", "action": "Republish the adapter to return one protocol-conforming JSON result object."})
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def run_bounded(command: list[str], *, cwd: Path, env: dict[str, str], input_bytes: bytes,
+                timeout: float, stdout_limit: int, stderr_limit: int) -> dict[str, Any]:
+    """Run a synthetic or sandboxed child with bounded pipes and group cleanup."""
+    try:
+        process = subprocess.Popen(command, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True, close_fds=True)
+    except (OSError, ValueError):
+        return {"ok": False, "code": "execution_start_failed", "stdout": b"", "stderr": b""}
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    try:
+        selector = selectors.DefaultSelector()
+        os.set_blocking(process.stdin.fileno(), False)
+        os.set_blocking(process.stdout.fileno(), False)
+        os.set_blocking(process.stderr.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        input_offset = 0
+        if input_bytes:
+            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        else:
+            process.stdin.close()
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+        deadline = time.monotonic() + timeout
+        code: str | None = None
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                code = "execution_timeout"
+                _kill_process_group(process)
+                break
+            events = selector.select(min(0.1, remaining))
+            for key, _ in events:
+                if key.data == "stdin":
+                    try:
+                        written = os.write(key.fileobj.fileno(), input_bytes[input_offset:input_offset + 8192])
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        written = 0
+                        input_offset = len(input_bytes)
+                    else:
+                        input_offset += written
+                    if input_offset >= len(input_bytes):
+                        try:
+                            selector.unregister(key.fileobj)
+                        except Exception:
+                            pass
+                        try:
+                            key.fileobj.close()
+                        except OSError:
+                            pass
+                    continue
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                except (BlockingIOError, OSError):
+                    chunk = b""
+                if not chunk:
+                    try:
+                        selector.unregister(key.fileobj)
+                    except Exception:
+                        pass
+                    continue
+                target = buffers[key.data]
+                target.extend(chunk)
+                if len(target) > limits[key.data]:
+                    code = "execution_output_limit_exceeded"
+                    _kill_process_group(process)
+                    break
+            if code is not None:
+                break
+        if code is not None:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process)
+                process.wait()
+            selector.close()
+            return {"ok": False, "code": code, "stdout": bytes(buffers["stdout"][:stdout_limit]),
+                    "stderr": bytes(buffers["stderr"][:stderr_limit])}
+        returncode = process.wait()
+        selector.close()
+        return {"ok": returncode == 0, "code": "adapter_nonzero_exit" if returncode else "ok",
+                "returncode": returncode, "stdout": bytes(buffers["stdout"]), "stderr": bytes(buffers["stderr"])}
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            _kill_process_group(process)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def _validate_adapter_result(raw: bytes, request: dict[str, Any], fixtures: dict[str, dict[str, Any]],
+                             schema_hashes: dict[str, str], errors: list[dict[str, str]]) -> dict[str, Any] | None:
+    try:
+        response = parse_json_bytes(raw)
+    except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+        add_error(errors, "canonical_validator_output_invalid", "$.canonical_release.validator_adapter",
+                  "shared-contracts", "Return one bounded typed JSON report with observed input hashes and actual serialized output bytes.")
         return None
     if not isinstance(response, dict) or response.get("protocol") != ADAPTER_PROTOCOL:
-        errors.append({"code": "canonical_validator_protocol_mismatch", "path": "$.canonical_release.validator_adapter",
-                       "owner": "shared-contracts", "action": f"Return a result object implementing {ADAPTER_PROTOCOL}."})
+        add_error(errors, "canonical_validator_protocol_mismatch", "$.canonical_release.validator_adapter",
+                  "shared-contracts", f"Publish a validator implementing {ADAPTER_PROTOCOL}; legacy echo-response adapters are rejected.")
         return None
-    if response.get("release_revision") != release.get("revision"):
-        errors.append({"code": "canonical_validator_revision_mismatch", "path": "$.canonical_release.validator_adapter",
-                       "owner": "shared-contracts", "action": "Return results for exactly the pinned canonical release revision."})
+    if response.get("release_revision") != request.get("release_revision"):
+        add_error(errors, "canonical_validator_revision_mismatch", "$.canonical_release.validator_adapter",
+                  "shared-contracts", "Return observations tied to the exact pinned canonical release revision.")
         return None
     results = response.get("results")
     if not isinstance(results, list):
-        errors.append({"code": "canonical_validator_results_missing", "path": "$.canonical_release.validator_adapter",
-                       "owner": "shared-contracts", "action": "Return one typed result for every required fixture case."})
+        add_error(errors, "canonical_validator_results_missing", "$.canonical_release.validator_adapter.results",
+                  "shared-contracts", "Return an observed result for each mapped owner fixture.")
         return None
-    result_by_id: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
     for result in results:
-        if isinstance(result, dict) and isinstance(result.get("case_id"), str):
-            if result["case_id"] in result_by_id:
-                errors.append({"code": "canonical_validator_duplicate_result", "path": "$.canonical_release.validator_adapter.results",
-                               "owner": "shared-contracts", "action": "Return exactly one result per required fixture case."})
-            result_by_id[result["case_id"]] = result
-    for case_id, fixture in fixtures.items():
-        result = result_by_id.get(case_id)
-        if result is None:
-            errors.append({"code": "canonical_validator_case_result_missing", "path": "$.canonical_release.validator_adapter.results",
-                           "owner": "shared-contracts", "action": f"Return a result for fixture case {case_id!r}."})
+        if not isinstance(result, dict) or not isinstance(result.get("case_id"), str):
+            add_error(errors, "canonical_validator_result_malformed", "$.canonical_release.validator_adapter.results",
+                      "shared-contracts", "Return a typed case result with observed schema/fixture hashes and serialized bytes.")
             continue
+        case_id = result["case_id"]
+        if case_id in by_id:
+            add_error(errors, "canonical_validator_duplicate_result", "$.canonical_release.validator_adapter.results",
+                      "shared-contracts", "Return exactly one observed result per required fixture case.")
+        by_id[case_id] = result
+    output_digests: dict[str, str] = {}
+    for case_id, fixture in fixtures.items():
+        result = by_id.get(case_id)
+        if result is None:
+            add_error(errors, "canonical_validator_case_result_missing", "$.canonical_release.validator_adapter.results",
+                      "shared-contracts", f"Return an observed result for fixture case {case_id!r}.")
+            continue
+        schema_id = fixture.get("schema_id")
+        if result.get("observed_schema_sha256") != schema_hashes.get(schema_id):
+            add_error(errors, "canonical_validator_schema_observation_mismatch", "$.canonical_release.validator_adapter.results",
+                      "shared-contracts", f"Read and report the exact pinned schema bytes used for case {case_id!r}.")
+        if result.get("observed_fixture_sha256") != fixture.get("sha256"):
+            add_error(errors, "canonical_validator_fixture_observation_mismatch", "$.canonical_release.validator_adapter.results",
+                      "shared-contracts", f"Read and report the exact pinned fixture bytes used for case {case_id!r}.")
+        if result.get("contract_id") != fixture.get("contract_id") or result.get("primitive") != fixture.get("primitive"):
+            add_error(errors, "canonical_validator_case_identity_mismatch", "$.canonical_release.validator_adapter.results",
+                      "shared-contracts", f"Bind the observed result to the exact owner contract and primitive for case {case_id!r}.")
         if result.get("outcome") != fixture.get("expected_outcome"):
-            errors.append({"code": "canonical_fixture_outcome_mismatch", "path": "$.canonical_release.validator_adapter.results",
-                           "owner": "shared-contracts", "action": f"Make canonical fixture case {case_id!r} conform to its owner-approved expected outcome."})
-        expected_serialization = fixture.get("serialized_sha256")
-        if expected_serialization and result.get("serialized_sha256") != expected_serialization:
-            errors.append({"code": "canonical_serialization_hash_mismatch", "path": "$.canonical_release.validator_adapter.results",
-                           "owner": "shared-contracts", "action": f"Make canonical serialization for fixture case {case_id!r} match the owner-published reference bytes."})
-    extras = set(result_by_id) - set(REQUIRED_CASES)
+            add_error(errors, "canonical_fixture_outcome_mismatch", "$.canonical_release.validator_adapter.results",
+                      "shared-contracts", f"Make observed fixture case {case_id!r} match the owner-published semantic decision.")
+        encoded = result.get("serialized_bytes_base64")
+        expected_serialized = fixture.get("serialized_sha256")
+        if expected_serialized is not None:
+            if not isinstance(encoded, str) or len(encoded) > MAX_ADAPTER_STDOUT:
+                add_error(errors, "canonical_serialized_bytes_missing", "$.canonical_release.validator_adapter.results",
+                          "shared-contracts", f"Return actual canonical serialized bytes for case {case_id!r}; a digest echo is not evidence.")
+                continue
+            try:
+                actual_bytes = base64.b64decode(encoded.encode("ascii"), validate=True)
+            except (UnicodeError, ValueError):
+                actual_bytes = b""
+            actual_digest = sha256_bytes(actual_bytes) if actual_bytes else ""
+            if actual_digest != expected_serialized:
+                add_error(errors, "canonical_serialization_hash_mismatch", "$.canonical_release.validator_adapter.results",
+                          "shared-contracts", f"Hash actual serialized bytes for case {case_id!r} and match the owner-published reference bytes.")
+            else:
+                output_digests[case_id] = actual_digest
+    extras = set(by_id) - set(REQUIRED_CASES)
     if extras:
-        errors.append({"code": "canonical_validator_unexpected_case_result", "path": "$.canonical_release.validator_adapter.results",
-                       "owner": "shared-contracts", "action": "Return only case IDs declared in the owner-published release descriptor."})
+        add_error(errors, "canonical_validator_unexpected_case_result", "$.canonical_release.validator_adapter.results",
+                  "shared-contracts", "Return only fixture case IDs declared in the owner-published release descriptor.")
     if errors:
         return None
-    return {
-        "canonical_revision": release["revision"],
-        "canonical_version": release["version"],
-        "schema_sha256": sorted(schema_hashes),
-        "fixture_sha256": {case_id: fixtures[case_id]["sha256"] for case_id in REQUIRED_CASES},
-        "validated_fixture_cases": len(REQUIRED_CASES),
-        "scope": "offline canonical fixture conformance only; no producer/consumer runtime, live provider, or global acceptance claim",
-    }
+    return {"serialized_output_sha256": output_digests}
+
+
+def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, str]],
+                     evidence: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(manifest, dict):
+        add_error(errors, "manifest_object_required", "$", "Agent and research",
+                  "Supply the versioned canonical owner release descriptor as a JSON object.")
+        return None
+    if manifest.get("format") != FORMAT:
+        add_error(errors, "readiness_descriptor_format_unsupported", "$.format", "Agent and research",
+                  f"Publish a descriptor using {FORMAT}; v1 manifests lack trusted content binding and exact field/fixture crosswalks.")
+    if manifest.get("status") != "published":
+        owner_actions = manifest.get("owner_actions")
+        if isinstance(owner_actions, list) and owner_actions:
+            for index, action in enumerate(owner_actions):
+                if isinstance(action, dict) and isinstance(action.get("owner"), str) and isinstance(action.get("action"), str):
+                    add_error(errors, "canonical_release_not_published", f"$.owner_actions[{index}]",
+                              action["owner"], action["action"])
+        else:
+            for item in OWNER_ACTIONS:
+                add_error(errors, "canonical_release_not_published", "$.canonical_release", item["owner"], item["action"])
+        return None
+    if evidence is None:
+        add_error(errors, "owner_evidence_index_unavailable", "$.owner_evidence_index", "Agent and research",
+                  "Provision the independently verified owner-evidence index outside the repository and pin its exact SHA-256 in trusted runner configuration; local manifest assertions are not approval evidence.")
+
+    base = manifest_path.resolve().parent
+    release = manifest.get("canonical_release")
+    if not isinstance(release, dict):
+        release = {}
+        add_error(errors, "canonical_release_object_missing", "$.canonical_release", "shared-contracts",
+                  "Publish exact canonical release metadata and owner artifacts.")
+    if release.get("repository") != "Jevelopers-neatHack-2026/shared-contracts":
+        add_error(errors, "canonical_repository_mismatch", "$.canonical_release.repository", "shared-contracts",
+                  "Publish the canonical release from shared-contracts.")
+    if not revision_ok(release.get("revision")):
+        add_error(errors, "canonical_revision_missing", "$.canonical_release.revision", "shared-contracts",
+                  "Pin the canonical release to its exact 40-character owner commit revision.")
+    if not isinstance(release.get("version"), str) or not release["version"].strip():
+        add_error(errors, "canonical_version_missing", "$.canonical_release.version", "shared-contracts",
+                  "Publish an explicit canonical contract release version.")
+
+    schema_rows = release.get("schema_artifacts")
+    schemas: dict[str, dict[str, Any]] = {}
+    schema_hashes: dict[str, str] = {}
+    if not isinstance(schema_rows, list) or not schema_rows:
+        add_error(errors, "canonical_schema_artifacts_missing", "$.canonical_release.schema_artifacts", "shared-contracts",
+                  "Publish nonempty canonical executable schema/package artifacts; no schema is copied into this repository.")
+        schema_rows = []
+    for index, artifact in enumerate(schema_rows):
+        path = f"$.canonical_release.schema_artifacts[{index}]"
+        schema_id = artifact.get("schema_id") if isinstance(artifact, dict) else None
+        artifact_path, digest = check_artifact(base, artifact, path, "shared-contracts", errors)
+        if not isinstance(schema_id, str) or not schema_id.strip() or schema_id in schemas:
+            add_error(errors, "schema_id_missing_or_duplicate", path + ".schema_id", "shared-contracts",
+                      "Assign each actual owner-published schema a unique stable schema ID.")
+            continue
+        if artifact_path is not None and digest is not None:
+            media_type = artifact.get("media_type") if isinstance(artifact, dict) else None
+            if isinstance(media_type, str) and "json" in media_type or artifact_path.suffix.lower() == ".json":
+                try:
+                    schema_content = parse_json_bytes(read_bounded_file(artifact_path))
+                    if not isinstance(schema_content, (dict, list)) or not schema_content:
+                        add_error(errors, "canonical_schema_empty", path + ".path", "shared-contracts",
+                                  "Publish nonempty actual canonical schema bytes; an empty object/array cannot describe a contract.")
+                except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+                    add_error(errors, "canonical_schema_json_invalid", path + ".path", "shared-contracts",
+                              "Publish valid bounded JSON schema bytes for artifacts classified as JSON.")
+            schemas[schema_id] = {"path": artifact_path, "sha256": digest, "descriptor": artifact}
+            schema_hashes[schema_id] = digest
+
+    inventory, inventory_sha, inventory_path = _read_inventory(base, release.get("field_inventory"), errors)
+    validate_crosswalk(manifest, schemas, inventory, evidence, errors)
+
+    compatibility = release.get("compatibility")
+    if not isinstance(compatibility, dict):
+        compatibility = {}
+        add_error(errors, "compatibility_policy_missing", "$.canonical_release.compatibility", "shared-contracts",
+                  "Publish owner-approved current/older major and additive-field compatibility rules.")
+    additive = compatibility.get("unknown_additive_fields")
+    if not isinstance(additive, str) or additive not in {"preserve", "ignore"}:
+        add_error(errors, "additive_field_policy_missing", "$.canonical_release.compatibility.unknown_additive_fields", "shared-contracts",
+                  "Record the owner-approved behavior for additive unknown fields.")
+    adapter = release.get("validator_adapter")
+    adapter_path, adapter_sha = check_artifact(base, adapter, "$.canonical_release.validator_adapter", "shared-contracts", errors)
+    if not isinstance(adapter, dict) or adapter.get("protocol") != ADAPTER_PROTOCOL:
+        add_error(errors, "validator_adapter_protocol_missing", "$.canonical_release.validator_adapter.protocol", "shared-contracts",
+                  f"Publish the independently reviewed offline fixture adapter implementing {ADAPTER_PROTOCOL}.")
+    if adapter_path is not None and adapter_sha is not None:
+        if not adapter_provenance_verified(adapter, adapter_sha, evidence):
+            add_error(errors, "validator_adapter_provenance_unverified", "$.canonical_release.validator_adapter", "shared-contracts",
+                      "Bind adapter bytes to the independent shared-contracts owner evidence index before execution.")
+
+    fixtures, fixture_paths = _validate_fixture_map(manifest, schemas, inventory, base, errors)
+    # The owner-evidence digest binds exact publication bytes, not local status
+    # text or a set of review references supplied by this descriptor.
+    release_subject = canonical_hash({
+        "release": {k: v for k, v in release.items() if k not in {"owner_decisions"}},
+        "field_crosswalk": manifest.get("field_crosswalk"),
+        "fixture_crosswalk": manifest.get("fixture_crosswalk"),
+        "fixtures": manifest.get("fixtures"),
+    })
+    decisions = manifest.get("owner_decisions")
+    if not isinstance(decisions, list):
+        decisions = []
+    decision_by_owner_and_reference: dict[tuple[str, str], dict[str, Any]] = {}
+    for index, decision in enumerate(decisions):
+        path = f"$.owner_decisions[{index}]"
+        if not isinstance(decision, dict):
+            add_error(errors, "owner_decision_malformed", path, "Agent and research",
+                      "Record the independently verified external owner handoff decision.")
+            continue
+        owner = decision.get("owner")
+        reference = decision.get("decision_ref")
+        if not isinstance(owner, str) or not isinstance(reference, str):
+            add_error(errors, "owner_decision_duplicate_or_invalid", path, str(owner or "Agent and research"),
+                      "Record the exact owner repository and issue reference for each canonical handoff decision.")
+            continue
+        identity = (owner, reference)
+        if identity in decision_by_owner_and_reference:
+            add_error(errors, "owner_decision_duplicate_or_invalid", path, owner,
+                      "Record one current decision for each exact external owner handoff; distinct issue cases from one owner remain separate.")
+            continue
+        decision_by_owner_and_reference[identity] = decision
+    for requirement in OWNER_ACTIONS:
+        owner = requirement["owner"]
+        reference = requirement["reference"]
+        decision = decision_by_owner_and_reference.get((owner, reference))
+        if not decision or decision.get("status") != "accepted" or decision.get("decision_ref") != requirement["reference"]:
+            add_error(errors, "external_owner_decision_missing_or_stale", "$.owner_decisions", owner, requirement["action"])
+            continue
+        validate_release_decision(decision, owner=owner, reference=reference,
+                                  subject_sha256=release_subject, evidence=evidence, errors=errors)
+
+    if errors:
+        return None
+    # Expected outcomes and reference output digests are intentionally withheld
+    # from the adapter. It must read actual schema/fixture bytes and produce
+    # observed hashes plus base64 serialized bytes, which this tool hashes.
+    request_fixtures = []
+    for case_id in REQUIRED_CASES:
+        fixture = fixtures[case_id]
+        schema_id = fixture["schema_id"]
+        fixture_path = fixture_paths[case_id]
+        request_fixtures.append({
+            "case_id": case_id,
+            "schema_id": schema_id,
+            "schema_path": "/release/" + schemas[schema_id]["path"].relative_to(base).as_posix(),
+            "schema_sha256": schema_hashes[schema_id],
+            "fixture_path": "/release/" + fixture_path.relative_to(base).as_posix(),
+            "fixture_sha256": fixture["sha256"],
+            "contract_id": fixture["contract_id"],
+            "primitive": fixture["primitive"],
+        })
+    request = {"protocol": ADAPTER_PROTOCOL, "release_revision": release["revision"],
+               "release_version": release["version"], "field_inventory_sha256": inventory_sha,
+               "fixtures": request_fixtures}
+    if adapter_path is None:
+        return None
+    command, sandbox_error = _sandbox_command(base, adapter_path, json.dumps(request).encode("utf-8"))
+    if command is None:
+        add_error(errors, "execution_sandbox_unavailable", "$.canonical_release.validator_adapter", "shared-contracts",
+                  sandbox_error or "Provision a reviewed supported offline OS sandbox; never execute an owner adapter unsandboxed.")
+        return None
+    sandbox_error = probe_sandbox(base)
+    if sandbox_error is not None:
+        add_error(errors, "execution_sandbox_unverified", "$.canonical_release.validator_adapter", "shared-contracts", sandbox_error)
+        return None
+    env = {"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
+           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"}
+    run = run_bounded(command, cwd=base, env=env,
+                      input_bytes=json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+                      timeout=ADAPTER_TIMEOUT_SECONDS, stdout_limit=MAX_ADAPTER_STDOUT, stderr_limit=MAX_ADAPTER_STDERR)
+    if not run["ok"]:
+        add_error(errors, run.get("code", "canonical_validator_execution_failed"), "$.canonical_release.validator_adapter", "shared-contracts",
+                  "Repair the trusted adapter or provision the supported isolated runtime; bounded private diagnostics are not echoed.")
+        return None
+    observed = _validate_adapter_result(run["stdout"], request, fixtures, schema_hashes, errors)
+    if observed is None or errors:
+        return None
+    # Re-hash all fixture and schema bytes after execution. The sandbox is
+    # read-only; this also catches substitutions between validation and use.
+    for schema_id, schema in schemas.items():
+        if sha256_file(schema["path"]) != schema["sha256"]:
+            add_error(errors, "schema_bytes_changed_during_execution", "$.canonical_release.schema_artifacts", "shared-contracts",
+                      "Keep pinned schema bytes immutable throughout fixture validation.")
+    for case_id, fixture in fixtures.items():
+        if sha256_file(fixture_paths[case_id]) != fixture.get("sha256"):
+            add_error(errors, "fixture_bytes_changed_during_execution", "$.fixtures", "shared-contracts",
+                      "Keep pinned fixture bytes immutable throughout fixture validation.")
+    for artifact_path, expected_hash, artifact_name in (
+        (inventory_path, inventory_sha, "field inventory"),
+        (adapter_path, adapter_sha, "validator adapter"),
+    ):
+        try:
+            artifact_unchanged = (artifact_path is not None and digest_ok(expected_hash)
+                                  and sha256_file(artifact_path) == expected_hash)
+        except OSError:
+            artifact_unchanged = False
+        if not artifact_unchanged:
+            add_error(errors, "trusted_release_artifact_changed_during_execution", "$.canonical_release", "shared-contracts",
+                      f"Keep the pinned {artifact_name} bytes immutable throughout fixture validation.")
+    if errors:
+        return None
+    return {"canonical_revision": release["revision"], "canonical_version": release["version"],
+            "schema_sha256": dict(sorted(schema_hashes.items())),
+            "fixture_sha256": {case_id: fixtures[case_id]["sha256"] for case_id in REQUIRED_CASES},
+            "serialized_output_sha256": observed["serialized_output_sha256"],
+            "validated_fixture_cases": len(REQUIRED_CASES),
+            "scope": "owner-evidence-verified offline fixture conformance only; no producer/consumer runtime, live provider, or global acceptance claim"}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--offline", action="store_true", help="Require local pinned artifacts and execute only the owner-attested offline validator adapter.")
+    parser.add_argument("--offline", action="store_true", help="Require the verified offline owner fixture gate; live/provider execution is forbidden.")
+    parser.add_argument("--owner-evidence-index", type=Path, default=os.environ.get("ACV1_OWNER_EVIDENCE_INDEX"))
+    parser.add_argument("--owner-evidence-sha256", default=os.environ.get("ACV1_OWNER_EVIDENCE_SHA256"))
     args = parser.parse_args(argv)
     errors: list[dict[str, str]] = []
-    result: dict[str, Any] | None = None
-    if not args.offline:
-        errors.append({"code": "offline_mode_required", "path": "$", "owner": "Agent and research",
-                       "action": "Run the pinned fixture verifier with --offline; live/provider execution is not part of this gate."})
+    output = None
     try:
         manifest = read_json(args.manifest)
-        if args.offline and not errors:
-            result = validate_and_run(manifest, args.manifest, errors)
+        workspace_root = Path(__file__).resolve().parents[1]
+        evidence = load_trusted_evidence_index(
+            str(args.owner_evidence_index) if args.owner_evidence_index else None,
+            args.owner_evidence_sha256, workspace_root, errors)
+        if not args.offline:
+            add_error(errors, "offline_mode_required", "$", "Agent and research",
+                      "Run only the verified offline fixture gate with --offline; live/provider execution is out of scope.")
+        if args.offline:
+            result = validate_and_run(manifest, args.manifest, errors, evidence)
+            if result is not None:
+                output = result
     except InputProblem as problem:
         errors.append(problem.item)
-    if errors:
-        output = {"tool": "verify_contract_release", "status": "blocked", "ready": False,
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        errors.append({"code": "input_invalid", "path": "$", "owner": "Agent and research",
+                       "action": "Supply bounded, typed owner artifacts; malformed data is not echoed and cannot pass readiness."})
+    except Exception:
+        errors.append({"code": "verifier_internal_error", "path": "$", "owner": "Agent and research",
+                       "action": "Review the standalone verifier diagnostics; private input and traceback details are suppressed."})
+    if errors or output is None:
+        if not errors:
+            errors.append({"code": "canonical_release_not_verified", "path": "$.canonical_release", "owner": "shared-contracts",
+                           "action": "Publish the canonical release, owner fixtures, independently pinned owner evidence, and supported sandbox runtime before readiness."})
+        report = {"tool": "verify_contract_release", "status": "blocked", "ready": False,
                   "dependency_mode": "offline", "errors": sorted(errors, key=lambda item: (item["path"], item["code"], item["owner"]))}
-        print(json.dumps(output, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        print(json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
         return 2
-    if result is None:
-        output = {"tool": "verify_contract_release", "status": "blocked", "ready": False,
-                  "dependency_mode": "offline", "errors": [{"code": "canonical_release_not_verified", "path": "$.canonical_release",
-                  "owner": "shared-contracts", "action": "Publish canonical schemas, owner fixtures and adapter before readiness can pass."}]}
-        print(json.dumps(output, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
-        return 2
-    print(json.dumps({"tool": "verify_contract_release", "status": "offline_conformance_passed",
-                      "ready": True, "dependency_mode": "offline", "result": result},
-                     sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    report = {"tool": "verify_contract_release", "status": "offline_conformance_passed", "ready": True,
+              "dependency_mode": "offline", "result": output}
+    print(json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
     return 0
 
 

@@ -1,5 +1,5 @@
 {
-  "format": "agent-creative.contract-readiness/v1",
+  "format": "agent-creative.contract-readiness/v2",
   "status": "pending",
   "owner_actions": [
     {
@@ -48,5 +48,5 @@
       "action": "Review and publish the exact facts, artwork, composition, approval, and handoff contract identified by CE-C04."
     }
   ],
-  "note": "This is a pending readiness inventory, not a schema, port, contract release, owner decision, or fixture. Canonical bytes and executable validation remain externally owned."
+  "note": "This is a pending readiness inventory, not a schema, port, contract release, owner decision, or fixture. Canonical bytes and executable validation remain externally owned. V2 requires an external owner-evidence index pinned by trusted runner configuration and exact schema-field/fixture crosswalks."
 }

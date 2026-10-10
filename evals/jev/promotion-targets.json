@@ -1,7 +1,8 @@
 {
-  "format": "agent-creative.jev-promotion-targets/v1",
+  "format": "agent-creative.jev-promotion-targets/v2",
   "status": "pending_owner_decisions",
   "owner_reviews": [],
+  "metering_stage_inventory": null,
   "dataset_split_sha256": {
     "train": null,
     "validation": null,
@@ -27,6 +28,11 @@
   },
   "shadow_only_counts_as_active": false,
   "active_routing_claim": false,
+  "evaluation_follow_on": {
+    "issue_ref": "https://github.com/Jevelopers-neatHack-2026/agent-harness/issues/22",
+    "owner_role": "Agent and research",
+    "status": "pending"
+  },
   "evaluation_budget": {
     "budget_scope_ref": null,
     "currency": null,
@@ -36,5 +42,5 @@
   },
   "rollback_owner_role": null,
   "rollback_rule": null,
-  "note": "No question IDs, metric values, sample counts, cost limits, policy thresholds, approvals, or baseline conclusions are supplied here. Engine owners define their questions. This file stays blocked until they publish decisions and frozen data references."
+  "note": "No question IDs, metric values, sample counts, cost limits, policy thresholds, approvals, or baseline conclusions are supplied here. Engine owners define their questions. This file stays blocked until they publish decisions and frozen data references. V2 requires externally pinned owner evidence, candidate/baseline byte identity, and a complete independently maintained metering-stage inventory."
 }

@@ -20,34 +20,104 @@ on:
       - 'tests/readiness/**'
       - 'fixtures/contracts/**'
       - 'evals/jev/**'
+      - 'docs/decisions/contract-readiness.md'
+      - 'docs/decisions/evaluation-plan.md'
 
 permissions:
   contents: read
 
 jobs:
   checker-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Report runner Python version
-        run: python3 --version
-      - name: Run standalone readiness checker tests
-        run: python3 -m unittest discover -s tests/readiness -v
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install bubblewrap from the Ubuntu runner package repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes bubblewrap
+      - name: Verify required Linux sandbox runtime
+        run: |
+          python3 --version
+          command -v bwrap
+          bwrap --version
+      - name: Run standalone readiness checker tests without skips
+        env:
+          ACV1_REQUIRE_BWRAP: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests/readiness -v 2>&1 | tee "$RUNNER_TEMP/readiness-tests.log"
+          if grep -Eq 'skipped=[1-9]' "$RUNNER_TEMP/readiness-tests.log"; then
+            echo "::error::Required readiness coverage must not be skipped on the Linux CI runner."
+            exit 1
+          fi
+      - name: Publish test log
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: readiness-checker-tests
+          path: ${{ runner.temp }}/readiness-tests.log
+          if-no-files-found: error
+          retention-days: 7
 
-  contract-release:
-    runs-on: ubuntu-latest
+  contract-readiness-classification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Report runner Python version
         run: python3 --version
-      - name: Verify owner-published canonical release and fixtures
-        run: python3 tools/verify_contract_release.py --manifest fixtures/contracts/release.json --offline
+      - name: Confirm canonical release remains blocked on its exact owner actions
+        run: |
+          python3 tests/readiness/classify_ci_gates.py --gate contracts --output "$RUNNER_TEMP/contract-readiness-blocked.json"
+          cat "$RUNNER_TEMP/contract-readiness-blocked.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish classified canonical release evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: canonical-release-readiness-classification
+          path: ${{ runner.temp }}/contract-readiness-blocked.json
+          if-no-files-found: error
+          retention-days: 30
 
-  jev-targets:
-    runs-on: ubuntu-latest
+  jev-readiness-classification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Report runner Python version
         run: python3 --version
-      - name: Validate owner-approved JEV targets and dataset
-        run: python3 tools/validate_jev_targets.py --targets evals/jev/promotion-targets.json --dataset evals/jev/dataset-manifest.json
+      - name: Confirm JEV targets remain blocked on owner definitions and evidence
+        run: |
+          python3 tests/readiness/classify_ci_gates.py --gate jev --output "$RUNNER_TEMP/jev-readiness-blocked.json"
+          cat "$RUNNER_TEMP/jev-readiness-blocked.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish classified JEV readiness evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: jev-readiness-classification
+          path: ${{ runner.temp }}/jev-readiness-blocked.json
+          if-no-files-found: error
+          retention-days: 30
+
+  sandbox-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install bubblewrap from the Ubuntu runner package repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes bubblewrap
+      - name: Require Linux bubblewrap filesystem, network, and descendant canaries
+        run: python3 tests/readiness/classify_ci_gates.py --gate sandbox --output "$RUNNER_TEMP/sandbox-canaries.json"
+      - name: Publish real synthetic sandbox canary evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bubblewrap-sandbox-canaries
+          path: ${{ runner.temp }}/sandbox-canaries.json
+          if-no-files-found: error
+          retention-days: 30
