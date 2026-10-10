@@ -46,14 +46,20 @@ def synthetic_apt_transport() -> dict:
         "_source_uri": profile_setup.APT_MIRROR_URI,
         "_mirror_uris": mirrors,
         "mirrorlist_sha256": sha(profile_setup.APT_MIRRORLIST_BYTES),
-        "signed_by": "ubuntu_archive_keyring_package",
-        "ubuntu_archive_keyring_sha256": "f" * 64,
+        "signed_by": "pinned_private_ubuntu_archive_keyring_snapshot",
+        "ubuntu_archive_keyring_sha256": profile_setup.UBUNTU_ARCHIVE_KEYRING_SHA256,
+        "private_source_sha256": "d" * 64,
+        "private_snapshot_custody": "root_owned_read_only_outside_checkout",
         "apt_package_version": "2.8.3",
     }
 
 
 def synthetic_apt_index_target(repo_uri: str | None = None, **changes: str) -> str:
     repository = (repo_uri or profile_setup.APT_MIRROR_URI).rstrip("/")
+    suite = changes.get("Suite", "noble-updates")
+    component = changes.get("Component", "main")
+    architecture = changes.get("Architecture", "amd64")
+    metakey = changes.get("MetaKey", "main/binary-amd64/Packages")
     values = {
         "Identifier": "Packages",
         "MetaKey": "main/binary-amd64/Packages",
@@ -66,7 +72,7 @@ def synthetic_apt_index_target(repo_uri: str | None = None, **changes: str) -> s
         "Label": "Ubuntu",
         "Trusted": "yes",
         "Repo-URI": repo_uri or profile_setup.APT_MIRROR_URI,
-        "URI": repository + "/dists/noble-updates/main/binary-amd64/Packages",
+        "URI": repository + "/dists/" + suite + "/" + metakey,
     }
     values.update(changes)
     return "".join(f"{field}: {value}\n" for field, value in values.items()) + "\n"
@@ -1565,6 +1571,202 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertNotIn("ubuntu-archive-keyring.gpg", rendered)
         self.assertNotIn("key bytes", rendered)
 
+    def test_pinned_keyring_capture_accepts_world_writable_share_only_for_exact_pinned_bytes(self) -> None:
+        approved = b"synthetic approved archive keyring"
+        uid, gid = os.geteuid(), os.getegid()
+        with tempfile.TemporaryDirectory(prefix="acv1-pinned-keyring-") as temporary:
+            root = Path(temporary)
+            path = root / "usr" / "share" / "keyrings" / "ubuntu-archive-keyring.gpg"
+            path.parent.mkdir(parents=True)
+            os.chmod(root / "usr", 0o755)
+            os.chmod(root / "usr" / "share", 0o777)
+            os.chmod(path.parent, 0o755)
+            path.write_bytes(approved)
+            os.chmod(path, 0o644)
+            with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
+                    mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
+                captured, evidence = profile_setup._read_pinned_keyring_bytes(
+                    path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+            self.assertEqual(captured, approved)
+            self.assertEqual(evidence["sha256"], sha(approved))
+            self.assertEqual(evidence["writable_parent_component"], "share")
+            self.assertFalse(evidence["source_parent_reopened_by_apt"])
+
+            attacker = root / "attacker-keyring.gpg"
+            attacker.write_bytes(b"x" * len(approved))
+            path.unlink()
+            path.symlink_to(attacker)
+            private_root = Path("/run") / ("acv1-contract-apt-" + "a" * 32)
+            sources = profile_setup._private_source_bytes(
+                profile_setup._parse_deb822_records(
+                    SYNTHETIC_UBUNTU_SOURCES,
+                    failure_code="synthetic_source_invalid", max_bytes=64 * 1024),
+                private_root / "ubuntu-archive-keyring.gpg",
+                private_root / "apt-mirrors.txt",
+            )
+            self.assertIn(("Signed-By: " + str(private_root
+                                               / "ubuntu-archive-keyring.gpg")).encode(), sources)
+            self.assertIn(("URIs: mirror+file:" + str(private_root
+                                                       / "apt-mirrors.txt")).encode(), sources)
+            self.assertNotIn(str(path).encode(), sources)
+            self.assertEqual(captured, approved)
+
+    def test_pinned_keyring_capture_rejects_digest_changes_and_symlink_parents(self) -> None:
+        approved = b"synthetic approved archive keyring"
+        uid, gid = os.geteuid(), os.getegid()
+        with tempfile.TemporaryDirectory(prefix="acv1-keyring-negative-") as temporary:
+            root = Path(temporary)
+            parent = root / "usr" / "share" / "keyrings"
+            parent.mkdir(parents=True)
+            os.chmod(root / "usr", 0o755)
+            os.chmod(root / "usr" / "share", 0o777)
+            os.chmod(parent, 0o755)
+            path = parent / "ubuntu-archive-keyring.gpg"
+            path.write_bytes(b"x" * len(approved))
+            os.chmod(path, 0o644)
+            with mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SHA256", sha(approved)), \
+                    mock.patch.object(profile_setup, "UBUNTU_ARCHIVE_KEYRING_SIZE", len(approved)):
+                with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                             "ubuntu_archive_keyring_digest_mismatch"):
+                    profile_setup._read_pinned_keyring_bytes(
+                        path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+                target = root / "real-keyrings"
+                target.mkdir()
+                link_root = root / "usr" / "share"
+                parent.rename(target)
+                parent.symlink_to(target, target_is_directory=True)
+                with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                             "ubuntu_archive_keyring_capture_failed"):
+                    profile_setup._read_pinned_keyring_bytes(
+                        path, trusted_root=root, owner_uid=uid, owner_gid=gid)
+
+    def test_private_apt_snapshot_uses_preloaded_config_and_captured_sources(self) -> None:
+        root = Path("/run") / ("acv1-contract-apt-" + "b" * 32)
+        keyring = root / "ubuntu-archive-keyring.gpg"
+        mirrors = root / "apt-mirrors.txt"
+        records = profile_setup._parse_deb822_records(
+            SYNTHETIC_UBUNTU_SOURCES, failure_code="synthetic_source_invalid",
+            max_bytes=64 * 1024)
+        source = profile_setup._private_source_bytes(records, keyring, mirrors).decode("utf-8")
+        self.assertEqual(source.count("Types: deb\n"), 2)
+        self.assertEqual(source.count("URIs: mirror+file:" + str(mirrors)), 2)
+        self.assertEqual(source.count("Signed-By: " + str(keyring)), 2)
+        self.assertNotIn("/etc/apt/apt-mirrors.txt", source)
+        self.assertNotIn(str(profile_setup.UBUNTU_ARCHIVE_KEYRING), source)
+        private_uri = "mirror+file:" + str(mirrors)
+        private_transport = synthetic_apt_transport()
+        private_transport["_source_uri"] = private_uri
+        source_identity = private_uri + " noble-updates/main amd64 Packages"
+        self.assertEqual(profile_setup._validated_apt_source(
+            source_identity, private_transport), source_identity)
+        wrong_private = source_identity.replace("b" * 32, "f" * 32)
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "signed_apt_package_origin_is_not_ubuntu_noble_updates"):
+            profile_setup._validated_apt_source(wrong_private, private_transport)
+        self.assertEqual(profile_setup._candidate_record_diagnostics(
+            "", "Package: apparmor-profiles:all\n" +
+            "Version: 1\n" + "Filename: x\n" + "SHA256: x\n" +
+            "APT-Sources: " + source_identity + "\n",
+            profile_setup.PROFILE_PACKAGE, "1")["source_record"]["source_host_class"],
+            "ubuntu_runner_mirrorlist")
+
+        config = profile_setup._private_apt_config_bytes(root).decode("ascii")
+        for value in (str(root / "ubuntu.sources"), str(root / "apt.conf.d"),
+                      str(root / "sourceparts"), str(root / "preferences"),
+                      str(root / "trusted.gpg"), str(root / "lists")):
+            self.assertIn(value, config)
+        self.assertIn('Acquire::AllowInsecureRepositories "false";', config)
+        self.assertIn('Acquire::Check-Valid-Until "true";', config)
+        self.assertIn('Dir::Cache::pkgcache "";', config)
+        self.assertIn('Dir::Cache::srcpkgcache "";', config)
+        self.assertNotIn("/etc/apt/", config)
+        cli_options = profile_setup._private_apt_cli_options(root)
+        self.assertNotIn("-c", cli_options)
+        option_values = {
+            cli_options[index + 1].split("=", 1)[0]: cli_options[index + 1].split("=", 1)[1]
+            for index, value in enumerate(cli_options[:-1]) if value == "-o"
+        }
+        self.assertEqual(option_values["Dir::Etc"], str(root))
+        self.assertEqual(option_values["Dir::Etc::trusted"], str(root / "trusted.gpg"))
+        self.assertEqual(option_values["Dir::Cache::pkgcache"], "")
+        self.assertEqual(option_values["Dir::Cache::srcpkgcache"], "")
+        self.assertEqual(option_values["Acquire::AllowInsecureRepositories"], "false")
+        self.assertEqual(option_values["Acquire::Check-Valid-Until"], "true")
+
+        apt_config = root / "apt.conf"
+        expected_env = dict(os.environ)
+        expected_env["APT_CONFIG"] = str(apt_config)
+        with mock.patch.object(profile_setup.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=b"ok", stderr=b"")) as run:
+            result, _ = profile_setup._command(
+                ["/usr/bin/apt-config", "dump"], apt_config=apt_config)
+        self.assertEqual(result, b"ok")
+        self.assertEqual(run.call_args.kwargs["env"], expected_env)
+        self.assertEqual(profile_setup._apt_sudo_prefix({"_private_apt_dir": str(root)}), [
+            "/usr/bin/sudo", "-n", "--", "/usr/bin/env",
+            "APT_CONFIG=" + str(apt_config),
+        ])
+
+    def test_ubuntu_keyring_pin_matches_reviewed_official_source_member_provenance(self) -> None:
+        self.assertEqual(profile_setup.UBUNTU_KEYRING_PACKAGE_VERSION, "2023.11.28.1")
+        self.assertEqual(profile_setup.UBUNTU_ARCHIVE_KEYRING_SHA256,
+                         "80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31")
+        self.assertEqual(profile_setup.UBUNTU_ARCHIVE_KEYRING_SIZE, 3607)
+        self.assertEqual(profile_setup.UBUNTU_KEYRING_SOURCE_TARBALL_SHA256,
+                         "aecd455ae15561371d6e454f121f079f0641d5e1b579a5563a2bc363fc74aa2e")
+        self.assertEqual(profile_setup.UBUNTU_KEYRING_SOURCE_SIGNER_FINGERPRINT,
+                         "EE240A052A231AD8925841D79B8EC849D5EF70ED")
+
+    def test_private_apt_configuration_validation_checks_every_isolated_path_and_security_value(self) -> None:
+        root = Path("/run") / ("acv1-contract-apt-" + "c" * 32)
+        path_values = {
+            "Dir::Etc": str(root),
+            "Dir::Etc::main": "/dev/null",
+            "Dir::Etc::parts": str(root / "apt.conf.d"),
+            "Dir::Etc::sourcelist": str(root / "ubuntu.sources"),
+            "Dir::Etc::sourceparts": str(root / "sourceparts"),
+            "Dir::Etc::preferences": str(root / "preferences"),
+            "Dir::Etc::preferencesparts": str(root / "preferences.d"),
+            "Dir::Etc::trusted": str(root / "trusted.gpg"),
+            "Dir::Etc::trustedparts": str(root / "trusted.gpg.d"),
+            "Dir::State::lists": str(root / "lists"),
+            "Dir::State::extended_states": str(root / "extended_states"),
+            "Dir::Cache::archives": str(root / "archives"),
+            "Dir::Cache::pkgcache": "",
+            "Dir::Cache::srcpkgcache": "",
+        }
+        settings = {**path_values,
+                    "APT::Get::AllowUnauthenticated": "false",
+                    "Acquire::AllowInsecureRepositories": "false",
+                    "Acquire::AllowWeakRepositories": "false",
+                    "Acquire::AllowDowngradeToInsecureRepositories": "false",
+                    "Acquire::Check-Date": "true",
+                    "Acquire::Check-Valid-Until": "true"}
+        text = "".join(f'{name} "{value}";\n' for name, value in settings.items())
+        transport = {"_private_apt_dir": str(root)}
+        with mock.patch.object(profile_setup, "_verify_private_apt_snapshot", return_value=root), \
+                mock.patch.object(profile_setup, "_command", return_value=(text.encode(), b"")) as command:
+            evidence = profile_setup._verify_private_apt_configuration(transport)
+        self.assertEqual(evidence["source_config"], "private_exact_runner_stanzas")
+        self.assertEqual(command.call_args.kwargs["apt_config"], root / "apt.conf")
+
+        unsafe = text.replace('Acquire::Check-Date "true";',
+                              'Acquire::Check-Date "false";')
+        with mock.patch.object(profile_setup, "_verify_private_apt_snapshot", return_value=root), \
+                mock.patch.object(profile_setup, "_command", return_value=(unsafe.encode(), b"")):
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "apt_source_configuration_disables_freshness_checks"):
+                profile_setup._verify_private_apt_configuration(transport)
+        wrong_trust_path = text.replace(
+            f'Dir::Etc::trustedparts "{root / "trusted.gpg.d"}";',
+            'Dir::Etc::trustedparts "/etc/apt/trusted.gpg.d";')
+        with mock.patch.object(profile_setup, "_verify_private_apt_snapshot", return_value=root), \
+                mock.patch.object(profile_setup, "_command",
+                                  return_value=(wrong_trust_path.encode(), b"")):
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "private_apt_configuration_paths_mismatch"):
+                profile_setup._verify_private_apt_configuration(transport)
+
     def test_native_profile_setup_binds_candidate_to_authenticated_apt_release_target(self) -> None:
         transport = synthetic_apt_transport()
         source = (profile_setup.APT_MIRROR_URI
@@ -1583,7 +1785,8 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             self.assertEqual(evidence["suite"], "noble-updates")
             self.assertEqual(evidence["component"], "main")
             self.assertEqual(evidence["architecture"], "amd64")
-            self.assertEqual(evidence["signed_by"], str(profile_setup.UBUNTU_ARCHIVE_KEYRING))
+            self.assertEqual(evidence["signed_by"],
+                             "private_captured_ubuntu_archive_keyring_snapshot")
 
     def test_native_profile_setup_filters_unrelated_supported_index_target_records(self) -> None:
         transport = synthetic_apt_transport()
@@ -1614,6 +1817,51 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(diagnostics["unrelated_unresolved_variable_record_count"], 1)
         self.assertEqual(diagnostics["candidate_unexpanded_field_count"], 0)
 
+    def test_native_profile_setup_selects_noble_updates_before_counting_configured_suites(self) -> None:
+        transport = synthetic_apt_transport()
+        source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
+        suites = (
+            "noble", "noble-updates", "noble-backports", "noble-security",
+        )
+        package_targets = [
+            synthetic_apt_index_target(Suite=suite, Codename="noble")
+            for suite in suites
+        ]
+        translation = synthetic_apt_index_target(**{
+            "Identifier": "Translations", "MetaKey": "main/i18n/Translation-en",
+            "Architecture": "$(ARCHITECTURE)",
+        })
+        contents = synthetic_apt_index_target(**{
+            "Identifier": "Contents-deb", "MetaKey": "main/Contents-amd64",
+        })
+        listing = translation + contents + "".join(package_targets)
+        evidence = profile_setup._validate_signed_apt_index_target(listing, source, transport)
+        diagnostics = profile_setup._apt_index_target_diagnostics(listing, source, transport)
+        self.assertEqual(evidence["suite"], "noble-updates")
+        self.assertEqual(diagnostics["package_index_family_count"], 4)
+        self.assertEqual(diagnostics["package_candidate_count"], 1)
+        self.assertEqual(diagnostics["unrelated_target_record_count"], 5)
+        self.assertEqual(diagnostics["unrelated_unresolved_variable_record_count"], 1)
+
+        duplicate_updates = (translation + contents + package_targets[0]
+                             + package_targets[1] + package_targets[1]
+                             + package_targets[2] + package_targets[3])
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_target_missing_or_ambiguous"):
+            profile_setup._validate_signed_apt_index_target(
+                duplicate_updates, source, transport)
+
+        private_root = Path("/run") / ("acv1-contract-apt-" + "e" * 32)
+        private_transport = dict(transport)
+        private_transport["_source_uri"] = (
+            "mirror+file:" + str(private_root / "apt-mirrors.txt"))
+        private_source = private_transport["_source_uri"] + " noble-updates/main amd64 Packages"
+        azure_target = synthetic_apt_index_target("http://azure.archive.ubuntu.com/ubuntu/")
+        private_evidence = profile_setup._validate_signed_apt_index_target(
+            azure_target, private_source, private_transport)
+        self.assertEqual(private_evidence["suite"], "noble-updates")
+        self.assertEqual(private_evidence["transport"], "runner_mirrorlist")
+
     def test_native_profile_setup_rejects_untrusted_or_ambiguous_apt_release_targets(self) -> None:
         transport = synthetic_apt_transport()
         source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
@@ -1639,13 +1887,17 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         missing_candidate_field = synthetic_apt_index_target().replace(
             "Architecture: amd64\n", "")
         with self.assertRaisesRegex(profile_setup.SetupFailure,
-                                    "apt_signed_release_target_record_fields_invalid"):
+                                    "apt_signed_release_target_missing_or_ambiguous"):
             profile_setup._validate_signed_apt_index_target(
                 missing_candidate_field, source, transport)
         with self.assertRaisesRegex(profile_setup.SetupFailure,
-                                    "apt_signed_release_target_unexpanded_format_variable"):
+                                    "apt_signed_release_target_missing_or_ambiguous"):
             profile_setup._validate_signed_apt_index_target(
                 synthetic_apt_index_target(Architecture="$(ARCHITECTURE)"), source, transport)
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_target_unexpanded_format_variable"):
+            profile_setup._validate_signed_apt_index_target(
+                synthetic_apt_index_target(Origin="$(ORIGIN)"), source, transport)
         with self.assertRaises(profile_setup.SetupFailure) as raised:
             profile_setup._validate_signed_apt_index_target(
                 synthetic_apt_index_target().replace("Trusted: yes", "Trusted: no"),
@@ -1762,7 +2014,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             "URI": "https://azure.archive.ubuntu.com/ubuntu/dists/noble-updates/main/Contents-amd64",
         })
         index_targets = translation_target + other_target + package_target
-        with mock.patch.object(profile_setup, "_command", side_effect=[
+        with mock.patch.object(profile_setup, "_apt_options", return_value=[]), \
+                mock.patch.object(profile_setup, "_apt_config_path",
+                                  return_value=Path("/run/acv1-contract-apt-" + "a" * 32 + "/apt.conf")), \
+                mock.patch.object(profile_setup, "_command", side_effect=[
                 (metadata.encode(), b""), (source_record.encode(), b""),
                 (index_targets.encode(), b"")]) as command:
             parsed = profile_setup._package_record(
@@ -1829,7 +2084,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 error_category="apt_cache_or_index_infrastructure_failure",
                 stderr_bytes=91),
         })
-        with mock.patch.object(profile_setup, "_command", side_effect=[
+        with mock.patch.object(profile_setup, "_apt_options", return_value=[]), \
+                mock.patch.object(profile_setup, "_apt_config_path",
+                                  return_value=Path("/run/acv1-contract-apt-" + "a" * 32 + "/apt.conf")), \
+                mock.patch.object(profile_setup, "_command", side_effect=[
                 (metadata.encode(), b""), failure]):
             with self.assertRaises(profile_setup.SetupFailure) as raised:
                 profile_setup._package_record(
@@ -1859,7 +2117,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 error_category="apt_repository_or_index_infrastructure_failure",
                 stderr_bytes=51),
         })
-        with mock.patch.object(profile_setup, "_command", side_effect=[
+        with mock.patch.object(profile_setup, "_apt_options", return_value=[]), \
+                mock.patch.object(profile_setup, "_apt_config_path",
+                                  return_value=Path("/run/acv1-contract-apt-" + "a" * 32 + "/apt.conf")), \
+                mock.patch.object(profile_setup, "_command", side_effect=[
                 (metadata.encode(), b""), (source.encode(), b""), failure]):
             with self.assertRaises(profile_setup.SetupFailure) as raised:
                 profile_setup._package_record(
@@ -1901,6 +2162,8 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                     "signed_repository_checks_enabled": True, "unsafe_overrides": []}), \
                 mock.patch.object(profile_setup, "_runner_mirror_configuration",
                                   return_value=synthetic_apt_transport()), \
+                mock.patch.object(profile_setup, "_apt_options", return_value=[]), \
+                mock.patch.object(profile_setup, "_apt_sudo_prefix", return_value=[]), \
                 mock.patch.object(profile_setup, "_quiet_command"), \
                 mock.patch.object(profile_setup, "_package_record", side_effect=failure), \
                 redirect_stdout(io.StringIO()) as captured, \
@@ -1963,7 +2226,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
             "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
         )
-        with mock.patch.object(profile_setup, "_command", side_effect=[
+        with mock.patch.object(profile_setup, "_apt_options", return_value=[]), \
+                mock.patch.object(profile_setup, "_apt_config_path",
+                                  return_value=Path("/run/acv1-contract-apt-" + "a" * 32 + "/apt.conf")), \
+                mock.patch.object(profile_setup, "_command", side_effect=[
                 (metadata.encode(), b""), (source_record.encode(), b"")]):
             with self.assertRaisesRegex(profile_setup.SetupFailure,
                                         "signed_apt_package_origin_missing") as raised:
@@ -2199,9 +2465,14 @@ class ContractReleaseReadinessTests(unittest.TestCase):
     def test_native_profile_setup_rejects_unexpanded_index_fields_and_missing_keyring_binding(self) -> None:
         source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
         with self.assertRaisesRegex(profile_setup.SetupFailure,
-                                    "apt_signed_release_target_unexpanded_format_variable"):
+                                    "apt_signed_release_target_missing_or_ambiguous"):
             profile_setup._validate_signed_apt_index_target(
                 synthetic_apt_index_target(Architecture="$(SIGNED_BY)"), source,
+                synthetic_apt_transport())
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_target_unexpanded_format_variable"):
+            profile_setup._validate_signed_apt_index_target(
+                synthetic_apt_index_target(Origin="$(SIGNED_BY)"), source,
                 synthetic_apt_transport())
         missing = synthetic_apt_transport()
         missing["ubuntu_archive_keyring_sha256"] = "unverified"

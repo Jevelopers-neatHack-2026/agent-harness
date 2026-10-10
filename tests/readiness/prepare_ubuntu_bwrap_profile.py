@@ -12,6 +12,7 @@ import platform
 import posixpath
 import re
 import shlex
+import secrets
 import shutil
 import stat
 import subprocess
@@ -38,6 +39,16 @@ APT_MIRROR_URI = "mirror+file:/etc/apt/apt-mirrors.txt"
 APT_MIRRORLIST_PATH = Path("/etc/apt/apt-mirrors.txt")
 UBUNTU_SOURCES_PATH = Path("/etc/apt/sources.list.d/ubuntu.sources")
 UBUNTU_ARCHIVE_KEYRING = Path("/usr/share/keyrings/ubuntu-archive-keyring.gpg")
+UBUNTU_KEYRING_PACKAGE_VERSION = "2023.11.28.1"
+UBUNTU_ARCHIVE_KEYRING_SHA256 = "80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31"
+UBUNTU_ARCHIVE_KEYRING_SIZE = 3607
+UBUNTU_KEYRING_SOURCE_TARBALL_SHA256 = "aecd455ae15561371d6e454f121f079f0641d5e1b579a5563a2bc363fc74aa2e"
+UBUNTU_KEYRING_SOURCE_SIGNER_FINGERPRINT = "EE240A052A231AD8925841D79B8EC849D5EF70ED"
+PRIVATE_APT_ROOT = Path("/run")
+PRIVATE_APT_NAME_PREFIX = "acv1-contract-apt-"
+PRIVATE_APT_ROOT_RE = re.compile(r"/run/acv1-contract-apt-[0-9a-f]{32}\Z")
+PRIVATE_APT_MIRROR_URI_RE = re.compile(
+    r"mirror\+file:/run/acv1-contract-apt-[0-9a-f]{32}/apt-mirrors\.txt\Z")
 APT_MIRRORLIST_BYTES = (
     b"http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
     b"https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
@@ -99,6 +110,7 @@ APT_SOURCE_FILE_LIMIT = 64
 APT_SOURCE_DIRECTORY_ENTRY_LIMIT = 512
 APT_SOURCE_FILE_BYTES = 64 * 1024
 APT_SOURCE_TOTAL_BYTES = 256 * 1024
+PRIVATE_APT_FILE_LIMIT = 128 * 1024
 TRUST_FILE_DIAGNOSTIC_PATHS = {
     "ubuntu_archive_keyring": (
         UBUNTU_ARCHIVE_KEYRING,
@@ -170,11 +182,16 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _command(args: list[str], *, timeout: float = 20, limit: int = 128 * 1024,
-             cwd: Path | None = None, apt_phase: str | None = None) -> tuple[bytes, bytes]:
+             cwd: Path | None = None, apt_phase: str | None = None,
+             apt_config: Path | None = None) -> tuple[bytes, bytes]:
     if apt_phase is not None and apt_phase not in APT_PROVENANCE_FAILURE_PHASES:
         raise SetupFailure("apt_cache_command_phase_invalid")
     try:
-        result = subprocess.run(args, cwd=cwd, stdin=subprocess.DEVNULL,
+        command_env = None
+        if apt_config is not None:
+            command_env = dict(os.environ)
+            command_env["APT_CONFIG"] = str(apt_config)
+        result = subprocess.run(args, cwd=cwd, env=command_env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 check=False, timeout=timeout, close_fds=True)
     except OSError as exc:
@@ -204,9 +221,13 @@ def _command(args: list[str], *, timeout: float = 20, limit: int = 128 * 1024,
 
 
 def _quiet_command(args: list[str], *, timeout: float = 180,
-                   cwd: Path | None = None) -> None:
+                   cwd: Path | None = None, apt_config: Path | None = None) -> None:
     try:
-        result = subprocess.run(args, cwd=cwd, stdin=subprocess.DEVNULL,
+        command_env = None
+        if apt_config is not None:
+            command_env = dict(os.environ)
+            command_env["APT_CONFIG"] = str(apt_config)
+        result = subprocess.run(args, cwd=cwd, env=command_env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 check=False, timeout=timeout, close_fds=True)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -282,7 +303,9 @@ def _candidate_record_diagnostics(metadata_text: str, source_text: str | None,
             host_class = "ubuntu_runner_mirrorlist"
             source_scheme = "mirror+file"
         elif uri and uri.scheme.lower() == "mirror+file":
-            host_class = "unrecognized_mirrorlist_path"
+            host_class = (
+                "ubuntu_runner_mirrorlist" if PRIVATE_APT_MIRROR_URI_RE.fullmatch(tokens[0])
+                else "unrecognized_mirrorlist_path")
             source_scheme = "mirror+file"
         elif uri and uri.scheme.lower() in {"mirror", "mirror+http", "mirror+https"}:
             host_class = "unrecognized_mirror_transport"
@@ -328,7 +351,8 @@ def _candidate_record_diagnostics(metadata_text: str, source_text: str | None,
             "source_record": summarize(source_text)}
 
 
-def _validated_apt_source(source: str) -> str:
+def _validated_apt_source(source: str,
+                          transport: dict[str, Any] | None = None) -> str:
     source_tokens = source.split()
     if len(source_tokens) != 4:
         raise SetupFailure("signed_apt_package_origin_missing")
@@ -340,6 +364,11 @@ def _validated_apt_source(source: str) -> str:
             or source_tokens[2] != expected_index_architecture or source_tokens[3] != "Packages"):
         raise SetupFailure("signed_apt_package_origin_is_not_ubuntu_noble_updates")
     if uri_text == APT_MIRROR_URI:
+        return source
+    if PRIVATE_APT_MIRROR_URI_RE.fullmatch(uri_text):
+        if (transport is None
+                or uri_text != str(transport.get("_source_uri", ""))):
+            raise SetupFailure("signed_apt_package_origin_is_not_ubuntu_noble_updates")
         return source
     try:
         parsed = urlparse(uri_text)
@@ -588,6 +617,7 @@ def _validate_runner_mirror_configuration(source_file: bytes,
         "mirror_uri_count": len(mirrors),
         "mirror_hosts": [urlparse(value).hostname for value in mirrors],
         "signed_by": "ubuntu_archive_keyring_package",
+        "_source_records": records,
         "_source_uri": APT_MIRROR_URI,
         "_mirror_uris": mirrors,
     }
@@ -753,6 +783,504 @@ def _read_root_owned_file(path: Path, *, limit: int, failure_code: str,
                 reject("descriptor_close", "file", errno_class(exc), observed)
 
 
+def _keyring_stat_summary(st: os.stat_result, *, directory: bool) -> dict[str, Any]:
+    if stat.S_ISDIR(st.st_mode):
+        kind = "directory"
+    elif stat.S_ISREG(st.st_mode):
+        kind = "regular_file"
+    elif stat.S_ISLNK(st.st_mode):
+        kind = "symlink"
+    else:
+        kind = "other"
+    result: dict[str, Any] = {
+        "object_type": kind,
+        "owner": "root" if st.st_uid == 0 else "non_root",
+        "group": "root" if st.st_gid == 0 else "non_root",
+        "group_writable": bool(st.st_mode & stat.S_IWGRP),
+        "world_writable": bool(st.st_mode & stat.S_IWOTH),
+    }
+    if not directory:
+        result["size_class"] = (
+            "empty" if st.st_size == 0 else
+            "over_limit" if st.st_size > 1024 * 1024 else "within_limit")
+    return result
+
+
+def _read_pinned_keyring_bytes(path: Path = UBUNTU_ARCHIVE_KEYRING, *,
+                               trusted_root: Path = Path("/"),
+                               owner_uid: int = 0,
+                               owner_gid: int = 0) -> tuple[bytes, dict[str, Any]]:
+    """Capture the one official keyring by descriptor, then trust its fixed digest.
+
+    The hosted runner's /usr/share parent can be writable. It is never used as
+    APT's keyring path: this reader accepts that one parent only because the
+    exact captured bytes must match the independently pinned Ubuntu package
+    member before they are copied into a private root-owned snapshot.
+    """
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise SetupFailure("ubuntu_archive_keyring_nofollow_unavailable")
+    try:
+        relative = path.relative_to(trusted_root)
+    except ValueError as exc:
+        raise SetupFailure("ubuntu_archive_keyring_path_not_fixed") from exc
+    parts = relative.parts
+    if parts != ("usr", "share", "keyrings", "ubuntu-archive-keyring.gpg"):
+        raise SetupFailure("ubuntu_archive_keyring_path_not_fixed")
+
+    def failure(phase: str, component: str, category: str,
+                observed: dict[str, Any] | None = None) -> SetupFailure:
+        detail: dict[str, Any] = {
+            "path_id": "ubuntu_archive_keyring",
+            "phase": phase,
+            "component": component,
+            "failure_class": category,
+        }
+        if observed is not None:
+            detail["observed"] = observed
+        return SetupFailure("ubuntu_archive_keyring_capture_failed",
+                            details={"trust_file_diagnostics": detail})
+
+    def errno_category(exc: OSError) -> str:
+        if exc.errno == errno.ENOENT:
+            return "missing"
+        if exc.errno == errno.ENOTDIR:
+            return "not_directory"
+        if exc.errno == errno.ELOOP:
+            return "symlink_disallowed"
+        if exc.errno in {errno.EACCES, errno.EPERM}:
+            return "permission_denied"
+        if exc.errno in {errno.EIO, getattr(errno, "ESTALE", -1)}:
+            return "io_or_stale_error"
+        return "filesystem_error"
+
+    directory_fd: int | None = None
+    opened_fd: int | None = None
+    writable_parent: str | None = None
+    try:
+        root_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+        try:
+            directory_fd = os.open(str(trusted_root), root_flags)
+            root_stat = os.fstat(directory_fd)
+        except OSError as exc:
+            raise failure("root_open", "root", errno_category(exc)) from exc
+        if (not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != owner_uid
+                or root_stat.st_gid != owner_gid or root_stat.st_mode & 0o022):
+            raise failure("root_stat", "root", "root_directory_untrusted",
+                          _keyring_stat_summary(root_stat, directory=True))
+
+        for component in parts[:-1]:
+            try:
+                before = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise failure("parent_lstat", component, errno_category(exc)) from exc
+            observed = _keyring_stat_summary(before, directory=True)
+            if stat.S_ISLNK(before.st_mode):
+                raise failure("parent_lstat", component, "symlink_disallowed", observed)
+            if not stat.S_ISDIR(before.st_mode):
+                raise failure("parent_lstat", component, "not_directory", observed)
+            if before.st_uid != owner_uid or before.st_gid != owner_gid:
+                raise failure("parent_lstat", component, "non_root_owner", observed)
+            writable = bool(before.st_mode & 0o022)
+            if writable and component != "share":
+                raise failure("parent_lstat", component, "writable_parent", observed)
+            if writable:
+                writable_parent = component
+            try:
+                next_fd = os.open(component, root_flags, dir_fd=directory_fd)
+                opened_dir = os.fstat(next_fd)
+            except OSError as exc:
+                raise failure("parent_open", component, errno_category(exc), observed) from exc
+            if (not stat.S_ISDIR(opened_dir.st_mode)
+                    or (opened_dir.st_dev, opened_dir.st_ino)
+                    != (before.st_dev, before.st_ino)
+                    or opened_dir.st_uid != owner_uid or opened_dir.st_gid != owner_gid):
+                os.close(next_fd)
+                raise failure("parent_recheck", component, "path_replaced_before_open",
+                              _keyring_stat_summary(opened_dir, directory=True))
+            if opened_dir.st_mode & 0o022 and component != "share":
+                os.close(next_fd)
+                raise failure("parent_recheck", component, "writable_parent",
+                              _keyring_stat_summary(opened_dir, directory=True))
+            os.close(directory_fd)
+            directory_fd = next_fd
+
+        try:
+            before_file = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise failure("file_lstat", "file", errno_category(exc)) from exc
+        observed_file = _keyring_stat_summary(before_file, directory=False)
+        if stat.S_ISLNK(before_file.st_mode):
+            raise failure("file_lstat", "file", "symlink_disallowed", observed_file)
+        if not stat.S_ISREG(before_file.st_mode):
+            raise failure("file_lstat", "file", "not_regular_file", observed_file)
+        if (before_file.st_uid != owner_uid or before_file.st_gid != owner_gid
+                or before_file.st_mode & 0o022):
+            raise failure("file_lstat", "file", "file_custody_untrusted", observed_file)
+        if not (0 < before_file.st_size <= 1024 * 1024):
+            raise failure("file_lstat", "file", "file_size_invalid", observed_file)
+        try:
+            opened_fd = os.open(parts[-1], os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                                | os.O_NOFOLLOW, dir_fd=directory_fd)
+            opened = os.fstat(opened_fd)
+        except OSError as exc:
+            raise failure("file_open", "file", errno_category(exc), observed_file) from exc
+        if ((opened.st_dev, opened.st_ino) != (before_file.st_dev, before_file.st_ino)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_uid != owner_uid
+                or opened.st_gid != owner_gid or opened.st_mode & 0o022):
+            raise failure("descriptor_stat", "file", "path_replaced_before_open",
+                          _keyring_stat_summary(opened, directory=False))
+        chunks: list[bytes] = []
+        remaining = 1024 * 1024 + 1
+        while remaining:
+            try:
+                chunk = os.read(opened_fd, min(64 * 1024, remaining))
+            except OSError as exc:
+                raise failure("file_read", "file", errno_category(exc), observed_file) from exc
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        captured = b"".join(chunks)
+        try:
+            after = os.fstat(opened_fd)
+        except OSError as exc:
+            raise failure("descriptor_recheck", "file", errno_category(exc),
+                          observed_file) from exc
+        if len(captured) > 1024 * 1024:
+            raise failure("file_read", "file", "file_over_limit",
+                          _keyring_stat_summary(after, directory=False))
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns",
+                         "st_uid", "st_gid", "st_mode")
+        if any(getattr(opened, field) != getattr(after, field) for field in stable_fields):
+            raise failure("descriptor_recheck", "file", "file_changed_during_read",
+                          _keyring_stat_summary(after, directory=False))
+        digest = hashlib.sha256(captured).hexdigest()
+        if (digest != UBUNTU_ARCHIVE_KEYRING_SHA256
+                or len(captured) != UBUNTU_ARCHIVE_KEYRING_SIZE):
+            raise SetupFailure("ubuntu_archive_keyring_digest_mismatch", details={
+                "trust_file_diagnostics": {
+                    "path_id": "ubuntu_archive_keyring",
+                    "phase": "captured_bytes",
+                    "component": "file",
+                    "failure_class": "official_digest_or_size_mismatch",
+                    "observed": {"size_class": "within_limit", "byte_count": len(captured)},
+                },
+            })
+        return captured, {
+            "sha256": digest,
+            "byte_count": len(captured),
+            "capture_mode": "descriptor_read_then_official_sha256_pin",
+            "writable_parent_component": writable_parent or "none",
+            "source_parent_reopened_by_apt": False,
+        }
+    finally:
+        if opened_fd is not None:
+            os.close(opened_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _private_source_bytes(records: list[dict[str, str]], keyring_path: Path,
+                          mirrorlist_path: Path) -> bytes:
+    if (len(records) != 2 or not PRIVATE_APT_ROOT_RE.fullmatch(str(keyring_path.parent))
+            or mirrorlist_path.parent != keyring_path.parent
+            or mirrorlist_path.name != "apt-mirrors.txt"):
+        raise SetupFailure("private_apt_source_configuration_invalid")
+    stanzas: list[str] = []
+    for row in records:
+        if set(row) != APT_RUNNER_SOURCE_FIELDS:
+            raise SetupFailure("private_apt_source_configuration_invalid")
+        if (row.get("types") != "deb" or row.get("uris") != APT_MIRROR_URI
+                or row.get("signed-by") != str(UBUNTU_ARCHIVE_KEYRING)):
+            raise SetupFailure("private_apt_source_configuration_invalid")
+        stanzas.append("\n".join((
+            "Types: " + row["types"],
+            "URIs: mirror+file:" + str(mirrorlist_path),
+            "Suites: " + row["suites"],
+            "Components: " + row["components"],
+            "Signed-By: " + str(keyring_path),
+        )))
+    return ("\n\n".join(stanzas) + "\n").encode("utf-8")
+
+
+def _private_apt_config_bytes(root: Path) -> bytes:
+    if not PRIVATE_APT_ROOT_RE.fullmatch(str(root)):
+        raise SetupFailure("private_apt_root_path_invalid")
+    values = (
+        ("Dir::Etc", str(root)),
+        ("Dir::Etc::main", "/dev/null"),
+        ("Dir::Etc::parts", str(root / "apt.conf.d")),
+        ("Dir::Etc::sourcelist", str(root / "ubuntu.sources")),
+        ("Dir::Etc::sourceparts", str(root / "sourceparts")),
+        ("Dir::Etc::preferences", str(root / "preferences")),
+        ("Dir::Etc::preferencesparts", str(root / "preferences.d")),
+        ("Dir::Etc::trusted", str(root / "trusted.gpg")),
+        ("Dir::Etc::trustedparts", str(root / "trusted.gpg.d")),
+        ("Dir::State::lists", str(root / "lists")),
+        ("Dir::State::extended_states", str(root / "extended_states")),
+        ("Dir::Cache::archives", str(root / "archives")),
+        # apt-cache show runs unprivileged. Disable these optional generated
+        # caches so it cannot write into the root-owned snapshot or host cache.
+        ("Dir::Cache::pkgcache", ""),
+        ("Dir::Cache::srcpkgcache", ""),
+        ("APT::Get::AllowUnauthenticated", "false"),
+        ("Acquire::AllowInsecureRepositories", "false"),
+        ("Acquire::AllowWeakRepositories", "false"),
+        ("Acquire::AllowDowngradeToInsecureRepositories", "false"),
+        ("Acquire::Check-Date", "true"),
+        ("Acquire::Check-Valid-Until", "true"),
+    )
+    return "".join(f'{key} "{value}";\n' for key, value in values).encode("ascii")
+
+
+def _private_apt_cli_options(root: Path) -> list[str]:
+    if not PRIVATE_APT_ROOT_RE.fullmatch(str(root)):
+        raise SetupFailure("private_apt_root_path_invalid")
+    pairs = (
+        ("Dir::Etc", str(root)),
+        ("Dir::Etc::main", "/dev/null"),
+        ("Dir::Etc::parts", str(root / "apt.conf.d")),
+        ("Dir::Etc::sourcelist", str(root / "ubuntu.sources")),
+        ("Dir::Etc::sourceparts", str(root / "sourceparts")),
+        ("Dir::Etc::preferences", str(root / "preferences")),
+        ("Dir::Etc::preferencesparts", str(root / "preferences.d")),
+        ("Dir::Etc::trusted", str(root / "trusted.gpg")),
+        ("Dir::Etc::trustedparts", str(root / "trusted.gpg.d")),
+        ("Dir::State::lists", str(root / "lists")),
+        ("Dir::State::extended_states", str(root / "extended_states")),
+        ("Dir::Cache::archives", str(root / "archives")),
+        ("Dir::Cache::pkgcache", ""),
+        ("Dir::Cache::srcpkgcache", ""),
+        ("APT::Get::AllowUnauthenticated", "false"),
+        ("Acquire::AllowInsecureRepositories", "false"),
+        ("Acquire::AllowWeakRepositories", "false"),
+        ("Acquire::AllowDowngradeToInsecureRepositories", "false"),
+        ("Acquire::Check-Date", "true"),
+        ("Acquire::Check-Valid-Until", "true"),
+    )
+    # The same file is supplied via APT_CONFIG before APT parses any default
+    # configuration. The explicit -o values make the expected values visible
+    # in apt-config dump and guard against later configuration layers.
+    result: list[str] = []
+    for key, value in pairs:
+        result.extend(("-o", key + "=" + value))
+    return result
+
+
+def _private_apt_root_path(transport: dict[str, Any]) -> Path:
+    value = transport.get("_private_apt_dir")
+    if not isinstance(value, str) or not PRIVATE_APT_ROOT_RE.fullmatch(value):
+        raise SetupFailure("private_apt_root_path_invalid")
+    return Path(value)
+
+
+def _verify_private_apt_snapshot(transport: dict[str, Any]) -> Path:
+    root = _private_apt_root_path(transport)
+    current = Path("/")
+    for component in root.parts[1:]:
+        current /= component
+        try:
+            item = current.lstat()
+        except OSError as exc:
+            raise SetupFailure("private_apt_snapshot_unavailable") from exc
+        if (stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode)
+                or item.st_uid != 0 or item.st_gid != 0 or item.st_mode & 0o022):
+            raise SetupFailure("private_apt_snapshot_custody_invalid")
+    for name in ("apt.conf.d", "sourceparts", "preferences.d", "trusted.gpg.d",
+                 "lists", "archives"):
+        try:
+            directory = (root / name).lstat()
+        except OSError as exc:
+            raise SetupFailure("private_apt_snapshot_unavailable") from exc
+        if (stat.S_ISLNK(directory.st_mode) or not stat.S_ISDIR(directory.st_mode)
+                or directory.st_uid != 0 or directory.st_gid != 0
+                or directory.st_mode & 0o022):
+            raise SetupFailure("private_apt_snapshot_custody_invalid")
+    files = {
+        "ubuntu-archive-keyring.gpg": UBUNTU_ARCHIVE_KEYRING_SHA256,
+        "ubuntu.sources": str(transport.get("_private_source_sha256", "")),
+        "apt.conf": str(transport.get("_private_config_sha256", "")),
+        "apt-mirrors.txt": str(transport.get("_private_mirrorlist_sha256", "")),
+        "preferences": hashlib.sha256(b"").hexdigest(),
+        "trusted.gpg": hashlib.sha256(b"").hexdigest(),
+    }
+    for name, expected_hash in files.items():
+        raw = _read_root_owned_file(root / name, limit=PRIVATE_APT_FILE_LIMIT,
+                                    failure_code="private_apt_snapshot_unavailable")
+        if raw is None or hashlib.sha256(raw).hexdigest() != expected_hash:
+            raise SetupFailure("private_apt_snapshot_digest_mismatch")
+    return root
+
+
+def _apt_options(transport: dict[str, Any]) -> list[str]:
+    if "APT_CONFIG" in os.environ:
+        raise SetupFailure("external_apt_configuration_override_unverified")
+    root = _verify_private_apt_snapshot(transport)
+    return _private_apt_cli_options(root)
+
+
+def _apt_config_path(transport: dict[str, Any]) -> Path:
+    return _private_apt_root_path(transport) / "apt.conf"
+
+
+def _apt_sudo_prefix(transport: dict[str, Any]) -> list[str]:
+    # Keep the privileged operation fixed and shell-free while ensuring sudo's
+    # environment filtering cannot discard the isolated APT configuration.
+    return ["/usr/bin/sudo", "-n", "--", "/usr/bin/env",
+            "APT_CONFIG=" + str(_apt_config_path(transport))]
+
+
+def _verify_private_apt_configuration(transport: dict[str, Any]) -> dict[str, Any]:
+    root = _verify_private_apt_snapshot(transport)
+    output, _ = _command([APT_CONFIG_PATH, *_private_apt_cli_options(root), "dump"],
+                         limit=256 * 1024, apt_config=root / "apt.conf")
+    try:
+        text = output.decode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise SetupFailure("private_apt_configuration_encoding_invalid") from exc
+    booleans, paths = _parse_apt_config_dump(
+        text, expected_source_paths=(str(root / "ubuntu.sources"),
+                                    str(root / "sourceparts")))
+    expected = {
+        "dir::etc": str(root),
+        "dir::etc::main": "/dev/null",
+        "dir::etc::parts": str(root / "apt.conf.d"),
+        "dir::etc::sourcelist": str(root / "ubuntu.sources"),
+        "dir::etc::sourceparts": str(root / "sourceparts"),
+        "dir::etc::preferences": str(root / "preferences"),
+        "dir::etc::preferencesparts": str(root / "preferences.d"),
+        "dir::etc::trusted": str(root / "trusted.gpg"),
+        "dir::etc::trustedparts": str(root / "trusted.gpg.d"),
+        "dir::state::lists": str(root / "lists"),
+        "dir::state::extended_states": str(root / "extended_states"),
+        "dir::cache::archives": str(root / "archives"),
+        "dir::cache::pkgcache": "",
+        "dir::cache::srcpkgcache": "",
+    }
+    if any(paths.get(name) != value for name, value in expected.items()):
+        raise SetupFailure("private_apt_configuration_paths_mismatch")
+    for name, should_be_true in (
+        ("apt::get::allowunauthenticated", False),
+        ("acquire::allowinsecurerepositories", False),
+        ("acquire::allowweakrepositories", False),
+        ("acquire::allowdowngradetoinsecurerepositories", False),
+        ("acquire::check-date", True),
+        ("acquire::check-valid-until", True),
+    ):
+        if name not in booleans or _apt_boolean_value(booleans[name]) is not should_be_true:
+            raise SetupFailure("private_apt_configuration_security_mismatch")
+    return {
+        "source_config": "private_exact_runner_stanzas",
+        "source_parts": "isolated_empty_directory",
+        "preferences": "private_empty_file_and_directory",
+        "trusted_keyrings": "private_empty_defaults_plus_explicit_signed_by",
+        "index_lists": "private_empty_directory",
+        "security_checks": "explicit_signed_and_freshness_required",
+    }
+
+
+def _install_private_apt_snapshot(source_file: bytes, mirrorlist: bytes,
+                                  transport: dict[str, Any],
+                                  keyring: bytes, keyring_capture: dict[str, Any]) -> dict[str, Any]:
+    if (hashlib.sha256(keyring).hexdigest() != UBUNTU_ARCHIVE_KEYRING_SHA256
+            or len(keyring) != UBUNTU_ARCHIVE_KEYRING_SIZE):
+        raise SetupFailure("ubuntu_archive_keyring_digest_mismatch")
+    if hashlib.sha256(source_file).hexdigest() != transport.get("source_file_sha256"):
+        raise SetupFailure("ubuntu_runner_sources_configuration_changed")
+    if (hashlib.sha256(mirrorlist).hexdigest() != transport.get("mirrorlist_sha256")
+            or mirrorlist != APT_MIRRORLIST_BYTES):
+        raise SetupFailure("ubuntu_runner_apt_mirrorlist_changed")
+    try:
+        parsed_source = _parse_deb822_records(
+            source_file.decode("utf-8", "strict"),
+            failure_code="ubuntu_runner_sources_configuration_invalid",
+            max_bytes=64 * 1024,
+        )
+    except (UnicodeError, SetupFailure) as exc:
+        raise SetupFailure("ubuntu_runner_sources_configuration_invalid") from exc
+    if parsed_source != transport.get("_source_records"):
+        raise SetupFailure("ubuntu_runner_sources_configuration_changed")
+    if tuple(_parse_runner_mirrorlist(mirrorlist)) != tuple(transport.get("_mirror_uris", ())):
+        raise SetupFailure("ubuntu_runner_apt_mirrorlist_changed")
+    root_stat = PRIVATE_APT_ROOT.lstat()
+    if (stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != 0 or root_stat.st_gid != 0 or root_stat.st_mode & 0o022):
+        raise SetupFailure("private_apt_parent_custody_invalid")
+    root = PRIVATE_APT_ROOT / (PRIVATE_APT_NAME_PREFIX + secrets.token_hex(16))
+    if root.exists() or root.is_symlink():
+        raise SetupFailure("private_apt_root_collision")
+    keyring_path = root / "ubuntu-archive-keyring.gpg"
+    mirrorlist_path = root / "apt-mirrors.txt"
+    private_sources = _private_source_bytes(
+        transport["_source_records"], keyring_path, mirrorlist_path)
+    apt_config = _private_apt_config_bytes(root)
+    directories = [
+        root, root / "apt.conf.d", root / "sourceparts", root / "preferences.d",
+        root / "trusted.gpg.d",
+        root / "lists", root / "archives",
+    ]
+    _quiet_command(["/usr/bin/sudo", "-n", "--", "/usr/bin/install", "-d",
+                    "-o", "root", "-g", "root", "-m", "0755",
+                    *(str(directory) for directory in directories)], timeout=10)
+    with tempfile.TemporaryDirectory(prefix="acv1-apt-snapshot-") as temporary:
+        work = Path(temporary)
+        payloads = {
+            "ubuntu-archive-keyring.gpg": keyring,
+            "ubuntu.sources": private_sources,
+            "apt.conf": apt_config,
+            "apt-mirrors.txt": mirrorlist,
+            "preferences": b"",
+            "trusted.gpg": b"",
+        }
+        for name, data in payloads.items():
+            local = work / name
+            local.write_bytes(data)
+            destination = root / name
+            _quiet_command(["/usr/bin/sudo", "-n", "--", "/usr/bin/install",
+                            "-o", "root", "-g", "root", "-m", "0444",
+                            str(local), str(destination)], timeout=10)
+    source_hash = hashlib.sha256(private_sources).hexdigest()
+    config_hash = hashlib.sha256(apt_config).hexdigest()
+    mirrorlist_hash = hashlib.sha256(mirrorlist).hexdigest()
+    installed_stat = root.lstat()
+    if (stat.S_ISLNK(installed_stat.st_mode) or not stat.S_ISDIR(installed_stat.st_mode)
+            or installed_stat.st_uid != 0 or installed_stat.st_gid != 0
+            or installed_stat.st_mode & 0o022):
+        raise SetupFailure("private_apt_snapshot_custody_invalid")
+    private_transport = dict(transport)
+    private_transport.update({
+        "_private_apt_dir": str(root),
+        "_private_source_sha256": source_hash,
+        "_private_config_sha256": config_hash,
+        "_private_mirrorlist_sha256": mirrorlist_hash,
+        "_source_uri": "mirror+file:" + str(mirrorlist_path),
+        "_mirror_uris": list(transport.get("_mirror_uris", ())),
+    })
+    _verify_private_apt_snapshot(private_transport)
+    private_transport.update(_verify_private_apt_configuration(private_transport))
+    private_transport.update({
+        "signed_by": "pinned_private_ubuntu_archive_keyring_snapshot",
+        "ubuntu_archive_keyring_sha256": UBUNTU_ARCHIVE_KEYRING_SHA256,
+        "ubuntu_archive_keyring_bytes": UBUNTU_ARCHIVE_KEYRING_SIZE,
+        "ubuntu_archive_keyring_package_version": UBUNTU_KEYRING_PACKAGE_VERSION,
+        "ubuntu_archive_keyring_package_owner": "ubuntu-keyring",
+        "ubuntu_archive_keyring_dpkg_verify": "clean",
+        "ubuntu_keyring_source_tarball_sha256": UBUNTU_KEYRING_SOURCE_TARBALL_SHA256,
+        "ubuntu_keyring_source_dsc_signer_fingerprint": UBUNTU_KEYRING_SOURCE_SIGNER_FINGERPRINT,
+        "keyring_capture": keyring_capture,
+        "private_source_sha256": source_hash,
+        "private_config_sha256": config_hash,
+        "private_mirrorlist_sha256": mirrorlist_hash,
+        "private_snapshot_custody": "root_owned_read_only_outside_checkout",
+        "apt_config_loaded_before_defaults": True,
+        "mirrorlist_captured_outside_mutable_etc": True,
+        "ambient_sources_disabled": True,
+        "ambient_keyrings_disabled": True,
+        "ambient_index_lists_disabled": True,
+    })
+    return private_transport
+
+
 def _runner_mirror_configuration() -> dict[str, Any]:
     source_file = _read_root_owned_file(
         UBUNTU_SOURCES_PATH, limit=64 * 1024,
@@ -761,19 +1289,17 @@ def _runner_mirror_configuration() -> dict[str, Any]:
         APT_MIRRORLIST_PATH, limit=4096,
         failure_code="ubuntu_runner_apt_mirrorlist_unavailable")
     evidence = _validate_runner_mirror_configuration(source_file, mirrorlist)
-    keyring = _read_root_owned_file(
-        UBUNTU_ARCHIVE_KEYRING, limit=1024 * 1024,
-        failure_code="ubuntu_archive_keyring_unavailable",
-        diagnostic_id="ubuntu_archive_keyring")
-    if not keyring:
-        raise SetupFailure("ubuntu_archive_keyring_unverified")
+    package_version = _package_version("ubuntu-keyring")
+    if package_version != UBUNTU_KEYRING_PACKAGE_VERSION:
+        raise SetupFailure("ubuntu_archive_keyring_package_version_mismatch")
+    keyring, capture = _read_pinned_keyring_bytes()
     if _owner_of(str(UBUNTU_ARCHIVE_KEYRING)) != "ubuntu-keyring":
         raise SetupFailure("ubuntu_archive_keyring_package_owner_mismatch")
     _verify_package("ubuntu-keyring")
-    evidence["ubuntu_archive_keyring_sha256"] = hashlib.sha256(keyring).hexdigest()
-    evidence["ubuntu_archive_keyring_package_owner"] = "ubuntu-keyring"
-    evidence["ubuntu_archive_keyring_dpkg_verify"] = "clean"
-    return evidence
+    evidence["apt_package_version"] = package_version
+    private_transport = _install_private_apt_snapshot(
+        source_file, mirrorlist, evidence, keyring, capture)
+    return private_transport
 
 
 def _is_pinned_package_index_target(row: dict[str, str]) -> bool:
@@ -782,12 +1308,8 @@ def _is_pinned_package_index_target(row: dict[str, str]) -> bool:
             and row.get("target-of") == "deb")
 
 
-def _apt_index_target_diagnostics(text: str, source: str,
-                                  transport: dict[str, Any]) -> dict[str, Any]:
-    try:
-        records = _parse_deb822_records(text, failure_code="apt_signed_release_target_record_invalid")
-    except SetupFailure:
-        records = []
+def _allowed_apt_repositories(source: str,
+                              transport: dict[str, Any]) -> set[str]:
     source_uri = source.split()[0] if source.split() else ""
     candidate_repositories: set[str] = set()
     canonical_source = _canonical_archive_uri(source_uri)
@@ -798,16 +1320,33 @@ def _apt_index_target_diagnostics(text: str, source: str,
         candidate_repositories.update(
             value for value in transport.get("_mirror_uris", ())
             if isinstance(value, str) and _canonical_archive_uri(value))
-    candidates = [row for row in records if _is_pinned_package_index_target(row)]
-    matches = [row for row in candidates
-               if row.get("architecture") == "amd64"
-               and row.get("component") == "main"
-               and row.get("suite") == "noble-updates"
-               and row.get("repo-uri", "").rstrip("/") in
-               {value.rstrip("/") for value in candidate_repositories}]
+    return {value.rstrip("/") for value in candidate_repositories}
+
+
+def _is_exact_ubuntu_updates_candidate(row: dict[str, str],
+                                      allowed_repositories: set[str]) -> bool:
+    return (
+        _is_pinned_package_index_target(row)
+        and row.get("architecture") == "amd64"
+        and row.get("component") == "main"
+        and row.get("suite") == "noble-updates"
+        and row.get("repo-uri", "").rstrip("/") in allowed_repositories
+    )
+
+
+def _apt_index_target_diagnostics(text: str, source: str,
+                                  transport: dict[str, Any]) -> dict[str, Any]:
+    try:
+        records = _parse_deb822_records(text, failure_code="apt_signed_release_target_record_invalid")
+    except SetupFailure:
+        records = []
+    allowed_repositories = _allowed_apt_repositories(source, transport)
+    package_rows = [row for row in records if _is_pinned_package_index_target(row)]
+    candidates = [row for row in package_rows
+                  if _is_exact_ubuntu_updates_candidate(row, allowed_repositories)]
+    matches = candidates
     row = candidates[0] if len(candidates) == 1 else {}
-    unrelated = [record for record in records
-                 if not _is_pinned_package_index_target(record)]
+    unrelated = [record for record in records if record not in candidates]
     unsupported_field_record_count = sum(
         bool(set(record) - APT_INDEX_TARGET_FIELDS) for record in records
     )
@@ -828,14 +1367,19 @@ def _apt_index_target_diagnostics(text: str, source: str,
     codename = row.get("codename", "")
     signer_binding = (
         "root_owned_source_stanza"
-        if transport.get("signed_by") == "ubuntu_archive_keyring_package"
+        if transport.get("signed_by") == "pinned_private_ubuntu_archive_keyring_snapshot"
         and re.fullmatch(r"[0-9a-f]{64}", str(transport.get("source_file_sha256", "")))
-        and re.fullmatch(r"[0-9a-f]{64}", str(transport.get("ubuntu_archive_keyring_sha256", "")))
+        and transport.get("ubuntu_archive_keyring_sha256") == UBUNTU_ARCHIVE_KEYRING_SHA256
+        and re.fullmatch(r"[0-9a-f]{64}", str(transport.get("private_source_sha256", "")))
+        and transport.get("private_snapshot_custody")
+        == "root_owned_read_only_outside_checkout"
         else "missing_or_unverified"
     )
     return {
         "target_record_count": min(len(records), 99),
         "target_record_count_capped": len(records) > 99,
+        "package_index_family_count": min(len(package_rows), 99),
+        "package_index_family_count_capped": len(package_rows) > 99,
         "package_candidate_count": min(len(candidates), 99),
         "package_candidate_count_capped": len(candidates) > 99,
         "matching_ubuntu_updates_target_count": min(len(matches), 99),
@@ -857,7 +1401,13 @@ def _apt_index_target_diagnostics(text: str, source: str,
         "source_keyring_binding": signer_binding,
         "apt_package_version": str(transport.get("apt_package_version", "unavailable")),
         "repo_transport": (
-            "runner_mirrorlist" if row.get("repo-uri", "").rstrip("/") == APT_MIRROR_URI
+            "runner_mirrorlist" if row.get("repo-uri", "").rstrip("/")
+            in {
+                APT_MIRROR_URI,
+                str(transport.get("_source_uri", "")).rstrip("/"),
+                *(value.rstrip("/") for value in transport.get("_mirror_uris", ())
+                  if isinstance(value, str)),
+            }
             else ("ubuntu_archive_endpoint" if row else "missing_or_unrecognized")
         ),
     }
@@ -877,11 +1427,14 @@ def _validate_signed_apt_index_target(text: str, source: str,
     if any(set(row) - APT_INDEX_TARGET_FIELDS for row in records):
         raise SetupFailure("apt_signed_release_target_record_fields_invalid",
                            details={"apt_release_target_diagnostics": diagnostics})
-    # First identify the one pinned package-index record using stable selector
-    # fields. APT's supported --format output also includes unrelated target
-    # kinds (for example Translation-en); missing substitutions in those rows
-    # must not be mistaken for defects in the signed Packages target.
-    candidates = [row for row in records if _is_pinned_package_index_target(row)]
+    # APT emits a Packages target for each configured suite. Filter on the
+    # exact source repository and release identity before requiring uniqueness;
+    # other configured suites cannot make the noble-updates row ambiguous.
+    # Translation/Contents rows remain unrelated, including optional unresolved
+    # substitutions that are not present in the selected Packages record.
+    allowed_repositories = _allowed_apt_repositories(source, transport)
+    candidates = [row for row in records
+                  if _is_exact_ubuntu_updates_candidate(row, allowed_repositories)]
     if len(candidates) != 1:
         raise SetupFailure("apt_signed_release_target_missing_or_ambiguous",
                            details={"apt_release_target_diagnostics": diagnostics})
@@ -895,21 +1448,7 @@ def _validate_signed_apt_index_target(text: str, source: str,
     if diagnostics["source_keyring_binding"] != "root_owned_source_stanza":
         raise SetupFailure("apt_signed_release_source_keyring_binding_missing",
                            details={"apt_release_target_diagnostics": diagnostics})
-    source_uri = source.split()[0] if source.split() else ""
-    allowed_repositories: set[str] = set()
-    canonical_source = _canonical_archive_uri(source_uri)
-    if canonical_source:
-        allowed_repositories.add(canonical_source)
-    elif source_uri == transport.get("_source_uri"):
-        allowed_repositories.add(source_uri)
-        allowed_repositories.update(
-            value for value in transport.get("_mirror_uris", ())
-            if isinstance(value, str) and _canonical_archive_uri(value))
-    if (row.get("architecture") != "amd64"
-            or row.get("component") != "main"
-            or row.get("suite") != "noble-updates"
-            or row.get("repo-uri", "").rstrip("/") not in
-            {value.rstrip("/") for value in allowed_repositories}):
+    if not _is_exact_ubuntu_updates_candidate(row, allowed_repositories):
         raise SetupFailure("apt_signed_release_target_missing_or_ambiguous",
                            details={"apt_release_target_diagnostics": diagnostics})
     repository_uri = row["repo-uri"].rstrip("/")
@@ -927,7 +1466,7 @@ def _validate_signed_apt_index_target(text: str, source: str,
         "suite": row["suite"], "codename": row["codename"],
         "component": row["component"], "architecture": row["architecture"],
         "trusted": row["trusted"],
-        "signed_by": str(UBUNTU_ARCHIVE_KEYRING),
+        "signed_by": "private_captured_ubuntu_archive_keyring_snapshot",
         "signer_binding": "root_owned_source_stanza",
         "apt_package_version": str(transport.get("apt_package_version", "unavailable")),
         "transport": diagnostics["repo_transport"],
@@ -935,7 +1474,8 @@ def _validate_signed_apt_index_target(text: str, source: str,
 
 
 def validate_apt_record(text: str, package: str, version: str,
-                        sha256: str, *, source_text: str) -> dict[str, str]:
+                        sha256: str, *, source_text: str,
+                        apt_transport: dict[str, Any] | None = None) -> dict[str, str]:
     diagnostics = _candidate_record_diagnostics(text, source_text, package, version)
     try:
         exact = _parse_deb822_records(
@@ -979,7 +1519,7 @@ def validate_apt_record(text: str, package: str, version: str,
     if not source:
         raise SetupFailure("signed_apt_package_origin_missing", details=diagnostics)
     try:
-        _validated_apt_source(source)
+        _validated_apt_source(source, apt_transport)
     except SetupFailure as exc:
         exc.details = diagnostics
         raise
@@ -1003,19 +1543,21 @@ def _package_record(package: str, version: str, sha256: str, *,
     # but does not synthesize APT-Sources. Request v2 separately for provenance.
     # In APT 2.7.14, -f/--full is registered only for `search`; `show` gets the
     # same full-record behavior through the generic configuration option.
-    output, _ = _command([APT_CACHE_PATH, "-o", "APT::Cache::ShowFull=true",
+    apt_options = _apt_options(apt_transport)
+    apt_config = _apt_config_path(apt_transport)
+    output, _ = _command([APT_CACHE_PATH, *apt_options, "-o", "APT::Cache::ShowFull=true",
                           "-o", "APT::Cache::Show::Version=1", "show",
                           package + "=" + version], limit=128 * 1024,
-                         apt_phase="metadata_v1")
+                         apt_phase="metadata_v1", apt_config=apt_config)
     try:
         text = output.decode("utf-8")
     except UnicodeError as exc:
         raise SetupFailure("signed_apt_package_record_encoding_invalid") from exc
     try:
-        source_output, _ = _command([APT_CACHE_PATH, "-o", "APT::Cache::ShowFull=true",
-                                     "-o", "APT::Cache::Show::Version=2", "show",
-                                     package + "=" + version], limit=128 * 1024,
-                                    apt_phase="source_v2")
+        source_output, _ = _command(
+            [APT_CACHE_PATH, *apt_options, "-o", "APT::Cache::ShowFull=true",
+             "-o", "APT::Cache::Show::Version=2", "show", package + "=" + version],
+            limit=128 * 1024, apt_phase="source_v2", apt_config=apt_config)
     except SetupFailure as exc:
         diagnostics = _candidate_record_diagnostics(text, None, package, version)
         if exc.details.get("apt_command"):
@@ -1026,12 +1568,15 @@ def _package_record(package: str, version: str, sha256: str, *,
         source_text = source_output.decode("utf-8")
     except UnicodeError as exc:
         raise SetupFailure("signed_apt_package_source_record_encoding_invalid") from exc
-    record = validate_apt_record(text, package, version, sha256, source_text=source_text)
+    record = validate_apt_record(text, package, version, sha256,
+                                 source_text=source_text, apt_transport=apt_transport)
     try:
         target_output, _ = _command(
-            [APT_GET_PATH, "-o", "APT::Get::IndexTargets::ReleaseInfo=true",
+            [APT_GET_PATH, *apt_options,
+             "-o", "APT::Get::IndexTargets::ReleaseInfo=true",
              "indextargets", "--format", APT_INDEXTARGETS_FORMAT],
-            limit=APT_INDEX_TARGETS_LIMIT, apt_phase="index_targets")
+            limit=APT_INDEX_TARGETS_LIMIT, apt_phase="index_targets",
+            apt_config=apt_config)
     except SetupFailure as exc:
         diagnostics = _candidate_record_diagnostics(text, source_text, package, version)
         diagnostics["apt_command"] = exc.details.get(
@@ -1086,6 +1631,10 @@ def _public_apt_source(source: str) -> str:
     tokens = source.split()
     if tokens and tokens[0] == APT_MIRROR_URI:
         return "mirror+file:<verified Ubuntu runner mirrorlist> " + " ".join(tokens[1:])
+    if tokens and re.fullmatch(
+            r"mirror\+file:/run/acv1-contract-apt-[0-9a-f]{32}/apt-mirrors\.txt",
+            tokens[0]):
+        return "mirror+file:<captured verified Ubuntu runner mirrorlist> " + " ".join(tokens[1:])
     parsed = urlparse(tokens[0])
     host = (parsed.hostname or "").lower()
     return f"{parsed.scheme.lower()}://{host}/[path-redacted] {' '.join(tokens[1:])}"
@@ -1123,12 +1672,22 @@ def _check_apt_security_boolean(name: str, value: str, policy: str) -> None:
         raise SetupFailure("apt_source_configuration_disables_freshness_checks")
 
 
-def _parse_apt_config_dump(text: str) -> tuple[dict[str, str], dict[str, str]]:
+def _parse_apt_config_dump(
+        text: str, *,
+        expected_source_paths: tuple[str, str] | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
     if len(text) > 256 * 1024 or "\x00" in text:
         raise SetupFailure("apt_security_configuration_invalid")
     booleans: dict[str, str] = {}
     paths: dict[str, str] = {}
-    path_keys = {"dir", "dir::etc", "dir::etc::sourcelist", "dir::etc::sourceparts"}
+    path_keys = {
+        "dir", "dir::etc", "dir::etc::main", "dir::etc::parts",
+        "dir::etc::sourcelist", "dir::etc::sourceparts",
+        "dir::etc::preferences", "dir::etc::preferencesparts",
+        "dir::etc::trusted", "dir::etc::trustedparts",
+        "dir::state::lists", "dir::state::extended_states",
+        "dir::cache::archives", "dir::cache::pkgcache", "dir::cache::srcpkgcache",
+    }
     assignment = re.compile(r'^\s*([^\s;{}]+)\s+(?:"([^"\\]*)"|([^\s;]+))\s*;\s*$')
     for line in text.splitlines():
         if len(line) > 4096 or "\x00" in line:
@@ -1157,22 +1716,24 @@ def _parse_apt_config_dump(text: str) -> tuple[dict[str, str], dict[str, str]]:
     apt_root = paths.get("dir", "/")
     if posixpath.normpath(apt_root) != "/":
         raise SetupFailure("apt_source_configuration_path_unverified")
-    etc_value = paths.get("dir::etc", "etc/apt")
-    etc_path = posixpath.normpath(
-        etc_value if posixpath.isabs(etc_value) else posixpath.join(apt_root, etc_value)
-    )
-    if etc_path != "/etc/apt":
-        raise SetupFailure("apt_source_configuration_path_unverified")
+    if expected_source_paths is None:
+        etc_value = paths.get("dir::etc", "etc/apt")
+        etc_path = posixpath.normpath(
+            etc_value if posixpath.isabs(etc_value) else posixpath.join(apt_root, etc_value)
+        )
+        if etc_path != "/etc/apt":
+            raise SetupFailure("apt_source_configuration_path_unverified")
+        expected_source_paths = (str(APT_SOURCES_LIST_PATH), str(APT_SOURCES_PARTS_PATH))
     source_list = paths.get("dir::etc::sourcelist", "sources.list")
     source_parts = paths.get("dir::etc::sourceparts", "sources.list.d")
     source_list_path = posixpath.normpath(
-        source_list if posixpath.isabs(source_list) else posixpath.join(etc_path, source_list)
+        source_list if posixpath.isabs(source_list) else posixpath.join("/etc/apt", source_list)
     )
     source_parts_path = posixpath.normpath(
-        source_parts if posixpath.isabs(source_parts) else posixpath.join(etc_path, source_parts)
+        source_parts if posixpath.isabs(source_parts) else posixpath.join("/etc/apt", source_parts)
     )
-    if (source_list_path != str(APT_SOURCES_LIST_PATH)
-            or source_parts_path != str(APT_SOURCES_PARTS_PATH)):
+    if (source_list_path, source_parts_path) != tuple(
+            posixpath.normpath(path) for path in expected_source_paths):
         raise SetupFailure("apt_source_configuration_path_unverified")
     return booleans, paths
 
@@ -1562,7 +2123,8 @@ def prepare(evidence_path: Path) -> int:
         _write_json(evidence_path, report)
 
         report["stage"] = "signed_apt_index_refresh"
-        _quiet_command(["/usr/bin/sudo", "-n", APT_GET_PATH,
+        _quiet_command([*_apt_sudo_prefix(apt_transport), APT_GET_PATH,
+                        *_apt_options(apt_transport),
                         "-o", "APT::Update::Error-Mode=any",
                         "update", "-qq"], timeout=240)
 
@@ -1578,7 +2140,8 @@ def prepare(evidence_path: Path) -> int:
         _write_json(evidence_path, report)
 
         report["stage"] = "bubblewrap_package_install"
-        _quiet_command(["/usr/bin/sudo", "-n", APT_GET_PATH,
+        _quiet_command([*_apt_sudo_prefix(apt_transport), APT_GET_PATH,
+                        *_apt_options(apt_transport),
                         "install", "--no-install-recommends", "--yes",
                         "bubblewrap=" + BWRAP_VERSION], timeout=180)
         bwrap_path = shutil.which("bwrap")
@@ -1617,8 +2180,9 @@ def prepare(evidence_path: Path) -> int:
         report["stage"] = "profile_package_authenticated_download"
         with tempfile.TemporaryDirectory(prefix="acv1-native-profile-hardening-") as temporary:
             work = Path(temporary)
-            _quiet_command([APT_GET_PATH, "download", PROFILE_PACKAGE + "=" + PROFILE_VERSION],
-                           timeout=120, cwd=work)
+            _quiet_command([APT_GET_PATH, *_apt_options(apt_transport),
+                            "download", PROFILE_PACKAGE + "=" + PROFILE_VERSION],
+                           timeout=120, cwd=work, apt_config=_apt_config_path(apt_transport))
             packages = list(work.glob("*.deb"))
             if len(packages) != 1:
                 raise SetupFailure("exact_profile_package_download_missing_or_ambiguous")
