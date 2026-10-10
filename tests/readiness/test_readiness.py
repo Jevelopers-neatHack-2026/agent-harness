@@ -700,6 +700,125 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             self.assertIn("schema_inventory_field_set_mismatch", codes)
             self.assertIn("fixture_crosswalk_case_missing", codes)
 
+    def test_verified_artifact_bytes_are_the_same_bytes_parsed_and_sealed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-verified-artifact-bytes-") as temp:
+            root = Path(temp).resolve()
+            target = root / "schema.json"
+            original = b'{"type":"object","properties":{"decision":{"type":"string"}}}'
+            replacement = b'{"type":"object","properties":{"replacement":{"type":"string"}}}'
+            target.write_bytes(original)
+            captured: dict[Path, tuple[bytes, str]] = {}
+            errors: list[dict[str, str]] = []
+            path, digest, raw = contracts.check_artifact_bytes(
+                root, {"path": target.name, "sha256": sha(original)}, "$.schema", "shared-contracts",
+                errors, captured)
+            self.assertEqual(errors, [])
+            self.assertEqual(raw, original)
+            target.write_bytes(replacement)
+            execution = contracts._read_execution_artifacts(
+                root, [(path, digest, "runtime schema")], errors, captured)
+            self.assertEqual(errors, [])
+            self.assertEqual(execution, {"schema.json": (original, sha(original))})
+            snapshot, reason = contracts._make_sealed_snapshot(execution or {})
+            if not hasattr(os, "memfd_create"):
+                self.assertIsNone(snapshot)
+                self.assertIn("lacks sealed in-memory file support", reason or "")
+                return
+            self.assertIsNone(reason)
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            descriptor = snapshot.files["schema.json"]
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            self.assertEqual(os.read(descriptor, len(original) + 1), original)
+            snapshot.close()
+
+    def test_assembled_schema_inventory_and_fixture_swaps_cannot_change_parsed_bytes(self) -> None:
+        schema_with_omitted = {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "required": ["decision", "value"],
+            "properties": {"decision": {"type": "string"}, "value": {"type": "integer"},
+                           "omitted": {"type": "integer"}},
+            "additionalProperties": False,
+        }
+
+        for artifact_kind in ("schema", "inventory", "fixture"):
+            for substitution_kind in ("rename", "symlink"):
+                with self.subTest(artifact_kind=artifact_kind, substitution_kind=substitution_kind), \
+                        tempfile.TemporaryDirectory(prefix="acv1-artifact-parse-race-") as temp:
+                    root = Path(temp).resolve()
+                    manifest_path, evidence_path, evidence_sha = write_complete_synthetic_contract(
+                        root, schema_overrides={"none": schema_with_omitted})
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    evidence_errors: list[dict[str, str]] = []
+                    evidence = contracts.load_trusted_evidence_index(
+                        str(evidence_path), evidence_sha, ROOT, evidence_errors, allow_test_only=True)
+                    self.assertEqual(evidence_errors, [])
+                    self.assertIsNotNone(evidence)
+
+                    if artifact_kind == "schema":
+                        target = root / "package/schemas/none.json"
+                        pinned = target.read_bytes()
+                        substitute_schema = copy.deepcopy(schema_with_omitted)
+                        del substitute_schema["properties"]["omitted"]
+                        substitute = json.dumps(substitute_schema, sort_keys=True, separators=(",", ":")).encode()
+                    elif artifact_kind == "inventory":
+                        target = root / "package/field-inventory.json"
+                        pinned = target.read_bytes()
+                        changed_inventory = json.loads(pinned.decode("utf-8"))
+                        none_row = next(row for row in changed_inventory["schemas"]
+                                        if row["schema_id"] == "SYNTH-none")
+                        none_row["field_paths"].append("/omitted")
+                        substitute = json.dumps(changed_inventory, sort_keys=True, separators=(",", ":")).encode()
+                    else:
+                        target = root / "package/fixtures/current_valid.json"
+                        pinned = target.read_bytes()
+                        substitute = b"not-json"
+                    backup = target.with_name(target.name + ".pinned-backup")
+                    alternate = target.with_name(target.name + ".substitute")
+                    original_read = contracts.read_bounded_file
+                    swapped = False
+
+                    def swap_after_hash(read_path: Path, limit: int = contracts.MAX_ARTIFACT_BYTES) -> bytes:
+                        nonlocal swapped
+                        captured_bytes = original_read(read_path, limit)
+                        if Path(read_path) == target and not swapped:
+                            os.replace(target, backup)
+                            alternate.write_bytes(substitute)
+                            if substitution_kind == "symlink":
+                                target.symlink_to(alternate.name)
+                            else:
+                                os.replace(alternate, target)
+                            swapped = True
+                        return captured_bytes
+
+                    errors: list[dict[str, str]] = []
+                    try:
+                        with mock.patch.object(contracts, "read_bounded_file", side_effect=swap_after_hash), \
+                                mock.patch.object(contracts, "_sandbox_prerequisite_error",
+                                                  return_value="synthetic test stop before execution") as prereq, \
+                                mock.patch.object(contracts, "probe_sandbox", return_value=None) as sandbox, \
+                                mock.patch.object(contracts, "run_bounded", return_value={"ok": True}) as execute:
+                            contracts.validate_and_run(manifest, manifest_path, errors, evidence)
+                        codes = {item["code"] for item in errors}
+                        self.assertTrue(swapped)
+                        if artifact_kind == "fixture":
+                            self.assertNotIn("fixture_json_invalid", codes)
+                            self.assertNotIn("fixture_content_empty", codes)
+                        else:
+                            self.assertIn("schema_inventory_field_set_mismatch", codes)
+                            self.assertFalse(prereq.called)
+                        self.assertFalse(sandbox.called)
+                        self.assertFalse(execute.called)
+                    finally:
+                        if target.is_symlink() or target.exists():
+                            target.unlink()
+                        if backup.exists():
+                            os.replace(backup, target)
+                        if alternate.exists():
+                            alternate.unlink()
+                    self.assertEqual(target.read_bytes(), pinned)
+
     def test_fixture_adapter_echo_without_observed_bytes_is_rejected(self) -> None:
         fixture = {"schema_id": "SYNTH-SCHEMA", "sha256": "b" * 64, "contract_id": "SYNTH-CONTRACT",
                    "primitive": "none", "expected_outcome": "accepted", "serialized_sha256": "c" * 64}
@@ -852,6 +971,34 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             self.assertIsNone(reason)
             self.assertEqual(outside.read_bytes(), b"original synthetic host canary")
 
+    def test_child_filesystem_canary_distinguishes_exposed_host_content_from_private_shadow(self) -> None:
+        canary_function = next(node for node in ast.parse(
+            (ROOT / "tools/verify_contract_release.py").read_text(encoding="utf-8")).body
+                               if isinstance(node, ast.FunctionDef) and node.name == "_run_sandbox_canary")
+        child_code = next(ast.literal_eval(node.value) for node in canary_function.body
+                          if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "child_code"
+                                  for target in node.targets))
+        child_tree = ast.parse(child_code)
+        read_branches = [node for node in child_tree.body if isinstance(node, ast.Try)][:2]
+        self.assertEqual(len(read_branches), 2)
+        code = compile(ast.Module(body=read_branches, type_ignores=[]), "<synthetic-child-filesystem-canary>", "exec")
+        with tempfile.TemporaryDirectory(prefix="acv1-child-path-distinction-") as temp:
+            root = Path(temp)
+            host_path = root / "host-canary.txt"
+            shadow_path = root / "private-shadow.txt"
+            host_path.write_bytes(b"synthetic host-only bytes")
+            shadow_path.write_bytes(b"sandbox-shadow-write")
+            exposed = {"outside": str(host_path), "shadow": str(shadow_path)}
+            exec(code, exposed)
+            self.assertFalse(exposed["outside_blocked"])
+            self.assertTrue(exposed["private_shadow_visible"])
+            exposed = {"outside": str(root / "hidden-host-canary.txt"), "shadow": str(shadow_path)}
+            exec(code, exposed)
+            self.assertTrue(exposed["outside_blocked"])
+            self.assertTrue(exposed["private_shadow_visible"])
+            self.assertEqual(host_path.read_bytes(), b"synthetic host-only bytes")
+
     def test_sandbox_failure_diagnostics_are_classified_bounded_and_path_redacted(self) -> None:
         stderr = (b"bwrap: Creating new namespace failed: Operation not permitted "
                   b"at /home/runner/work/agent-harness/host-canary.txt")
@@ -885,8 +1032,13 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("/proc/self/attr/current", parent_code)
         self.assertIn("--unshare-all", command)
         self.assertIn("--cap-drop", command)
-        self.assertIn("nested_cap_sys_admin_available", parent_code)
-        self.assertIn("nested_mount_denied", parent_code)
+        self.assertIn("nested_userns_setup_complete", parent_code)
+        self.assertIn("nested_mount_attempted", parent_code)
+        self.assertIn("nested_mount_namespace_denied", parent_code)
+        self.assertNotIn("nested_cap_sys_admin_available", parent_code)
+        self.assertNotIn("'--mount'", parent_code)
+        self.assertIn("libc.unshare(0x00020000)", parent_code)
+        self.assertIn("private_shadow_visible", child_code)
         self.assertIn("loopback: failed rtm_newaddr: operation not permitted", parent_code)
         self.assertNotIn("--share-net", command)
         self.assertEqual(mocked_run.call_args.kwargs["timeout"], 20)
@@ -914,6 +1066,43 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             profile_setup.PROFILE_DEB_SHA256, source_text=record)
         self.assertEqual(parsed["APT-Sources"],
                          "https://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
+
+    def test_native_profile_setup_parses_labelled_dpkg_fields_without_control_order_assumptions(self) -> None:
+        labelled = (
+            "Architecture: all\n"
+            "Package: apparmor-profiles\n"
+            "Version: " + profile_setup.PROFILE_VERSION + "\n"
+        )
+        self.assertEqual(profile_setup.parse_dpkg_deb_fields(labelled), {
+            "Package": profile_setup.PROFILE_PACKAGE,
+            "Version": profile_setup.PROFILE_VERSION,
+            "Architecture": "all",
+        })
+        self.assertEqual(profile_setup.validate_profile_deb_metadata(labelled.encode("ascii")), {
+            "Package": profile_setup.PROFILE_PACKAGE,
+            "Version": profile_setup.PROFILE_VERSION,
+            "Architecture": "all",
+        })
+        invalid_outputs = (
+            "apparmor-profiles\n" + profile_setup.PROFILE_VERSION + "\nall\n",
+            "Package: apparmor-profiles\nPackage: apparmor-profiles\nVersion: "
+            + profile_setup.PROFILE_VERSION + "\nArchitecture: all\n",
+            "Package: apparmor-profiles\nVersion: " + profile_setup.PROFILE_VERSION + "\n",
+            "Package: apparmor-profiles\nVersion: " + profile_setup.PROFILE_VERSION
+            + "\nArchitecture: all\nStatus: install ok installed\n",
+        )
+        for output in invalid_outputs:
+            with self.subTest(output=output), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "downloaded_profile_package_metadata_invalid"):
+                profile_setup.parse_dpkg_deb_fields(output)
+        for mismatch in (
+            labelled.replace("Package: apparmor-profiles", "Package: other-package"),
+            labelled.replace(profile_setup.PROFILE_VERSION, "stale-version"),
+            labelled.replace("Architecture: all", "Architecture: amd64"),
+        ):
+            with self.subTest(mismatch=mismatch), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "downloaded_profile_package_metadata_mismatch"):
+                profile_setup.validate_profile_deb_metadata(mismatch.encode("ascii"))
 
     def test_native_profile_setup_reads_source_from_explicit_apt_cache_v2_record(self) -> None:
         metadata = (
@@ -1437,6 +1626,62 @@ class JevTargetReadinessTests(unittest.TestCase):
     def validate_synthetic(self, targets: dict, dataset: dict) -> dict:
         return jev.validate_targets(targets, dataset, test_only=True)
 
+    def run_production_shaped_synthetic_evidence(self, root: Path, *, index_classification: str | None,
+                                                 document_classification: str | None = None
+                                                 ) -> subprocess.CompletedProcess[str]:
+        targets, dataset = complete_synthetic_plan()
+        targets["status"] = "approved_for_evaluation_preparation"
+        dataset["status"] = "approved"
+        targets["metering_stage_inventory"]["status"] = "published"
+        targets["metering_stage_inventory"]["decision_ref"] = (
+            f"https://github.com/{jev.OWNER_ORG}/cost-intelligence/issues/1")
+        for question in targets["questions"]:
+            repository = question["definition_owner"]["repository"]
+            question["definition_owner"]["issue_url"] = (
+                f"https://github.com/{jev.OWNER_ORG}/{repository}/issues/1")
+        entries = []
+        for index, (_path, approval, role, repository, subject_id, subject_hash) in enumerate(
+                jev.approval_subjects(targets, dataset)):
+            if not isinstance(approval, dict):
+                continue
+            reference = f"https://github.com/{jev.OWNER_ORG}/{repository}/issues/1"
+            evidence_id = f"TEST-ONLY-{index}"
+            revision = "a" * 40
+            approval.update({"status": "accepted", "owner_role": role, "owner_repository": repository,
+                             "revision": revision, "decision_ref": reference, "subject_id": subject_id,
+                             "subject_sha256": subject_hash, "evidence_id": evidence_id})
+            document = {"format": jev.OWNER_EVIDENCE_FORMAT, "evidence_id": evidence_id,
+                        "owner": repository, "repository": repository, "revision": revision,
+                        "decision_ref": reference, "status": "accepted", "subjects": {subject_id: subject_hash}}
+            if document_classification is not None and not entries:
+                document["classification"] = document_classification
+            document_bytes = json.dumps(document, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=False).encode("utf-8")
+            document_name = evidence_id + ".json"
+            (root / document_name).write_bytes(document_bytes)
+            entries.append({**{key: value for key, value in document.items()
+                               if key not in {"format", "classification"}},
+                            "evidence_path": document_name, "evidence_sha256": sha(document_bytes)})
+        index = {"format": jev.OWNER_EVIDENCE_INDEX_FORMAT, "evidence": entries}
+        if index_classification is not None:
+            index["classification"] = index_classification
+        index_bytes = json.dumps(index, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=False).encode("utf-8")
+        index_path = root / "index.json"
+        index_path.write_bytes(index_bytes)
+        targets_path = root / "targets.json"
+        targets_path.write_text(json.dumps(targets, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        dataset_path = root / "dataset.json"
+        dataset_path.write_text(json.dumps(dataset, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(ROOT / "tools/validate_jev_targets.py"),
+             "--targets", str(targets_path), "--dataset", str(dataset_path),
+             "--owner-evidence-index", str(index_path), "--owner-evidence-sha256", sha(index_bytes)],
+            cwd=ROOT, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                           "PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C.UTF-8", "PYTHONHASHSEED": "0"},
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+
     def test_pending_owner_inventory_remains_blocked_with_exact_question_families(self) -> None:
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONDONTWRITEBYTECODE": "1",
                "LC_ALL": "C.UTF-8", "PYTHONHASHSEED": "0"}
@@ -1464,6 +1709,41 @@ class JevTargetReadinessTests(unittest.TestCase):
         self.assertEqual(report["question_count"], len(jev.REQUIRED_FAMILIES))
         self.assertNotEqual(dataset["status"], "approved")
         self.assertTrue(all(review["status"] == "synthetic_test_only_unverified" for review in targets["owner_reviews"]))
+
+    def test_production_jev_cli_rejects_explicitly_synthetic_owner_evidence_index(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-jev-synthetic-index-") as temp:
+            result = self.run_production_shaped_synthetic_evidence(
+                Path(temp), index_classification="synthetic_test_only")
+        self.assertEqual(result.returncode, 2, result.stdout[:3000])
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "blocked")
+        self.assertFalse(report["ready"])
+        self.assertFalse(report["owner_evidence_verified"])
+        self.assertIn("owner_evidence_index_classification_invalid",
+                      {item["code"] for item in report["errors"]})
+
+    def test_production_jev_cli_rejects_explicitly_synthetic_evidence_document(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-jev-synthetic-document-") as temp:
+            result = self.run_production_shaped_synthetic_evidence(
+                Path(temp), index_classification=None, document_classification="synthetic_test_only")
+        self.assertEqual(result.returncode, 2, result.stdout[:3000])
+        report = json.loads(result.stdout)
+        self.assertFalse(report["ready"])
+        self.assertFalse(report["owner_evidence_verified"])
+        self.assertIn("owner_evidence_artifact_classification_invalid",
+                      {item["code"] for item in report["errors"]})
+
+    def test_jev_test_only_marker_detection_covers_explicit_synthetic_and_test_labels(self) -> None:
+        for value in (
+            {"classification": "synthetic"},
+            {"classification": "synthetic_test_only"},
+            {"classification": "test-only"},
+            {"status": "test_only_synthetic"},
+            {"test_only": True},
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(jev._is_test_only_evidence(value))
+        self.assertFalse(jev._is_test_only_evidence({"classification": "owner_evidence_unverified_origin"}))
 
     def test_local_accepted_metadata_without_trusted_evidence_never_passes(self) -> None:
         targets, dataset = complete_synthetic_plan()

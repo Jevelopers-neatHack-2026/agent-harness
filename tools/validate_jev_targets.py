@@ -185,6 +185,19 @@ def _external_artifact(root: Path, relative: Any) -> Path | None:
         return None
 
 
+def _is_test_only_evidence(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("test_only") is True:
+        return True
+    for marker in (value.get("classification"), value.get("status")):
+        if isinstance(marker, str):
+            normalized = marker.strip().lower().replace("-", "_").replace(" ", "_")
+            if "synthetic" in normalized or "test_only" in normalized:
+                return True
+    return False
+
+
 def load_trusted_evidence_index(path_value: str | None, expected_sha: str | None,
                                 workspace_root: Path, errors: list[dict[str, str]]) -> dict[str, Any] | None:
     owner_action = "Provision an independently verified owner-evidence index outside the repository and pin its exact SHA-256 in trusted runner configuration; local manifest assertions and issue URLs are not approvals."
@@ -218,6 +231,11 @@ def load_trusted_evidence_index(path_value: str | None, expected_sha: str | None
     if not isinstance(data, dict) or data.get("format") != OWNER_EVIDENCE_INDEX_FORMAT:
         add_error(errors, "owner_evidence_index_format_invalid", "$.owner_evidence_index.format", "Agent and research", owner_action)
         return None
+    if _is_test_only_evidence(data):
+        add_error(errors, "owner_evidence_index_classification_invalid", "$.owner_evidence_index.classification",
+                  "Agent and research",
+                  "Production readiness rejects explicitly synthetic or test-only evidence indexes; those fixtures remain structure-only and cannot establish owner approval.")
+        return None
     entries = data.get("evidence")
     if not isinstance(entries, list) or not entries:
         add_error(errors, "owner_evidence_index_empty", "$.owner_evidence_index.evidence", "Agent and research", owner_action)
@@ -243,6 +261,10 @@ def load_trusted_evidence_index(path_value: str | None, expected_sha: str | None
                 or any(not isinstance(key, str) or not digest_ok(value) for key, value in subjects.items())):
             add_error(errors, "owner_evidence_record_invalid", ep, repository if isinstance(repository, str) else "Agent and research", owner_action)
             continue
+        if _is_test_only_evidence(entry):
+            add_error(errors, "owner_evidence_record_classification_invalid", ep, repository,
+                      "Production readiness rejects explicitly synthetic or test-only evidence records and documents.")
+            continue
         evidence_path = _external_artifact(root, entry.get("evidence_path"))
         evidence_sha = entry.get("evidence_sha256")
         if evidence_path is None or not digest_ok(evidence_sha):
@@ -258,7 +280,12 @@ def load_trusted_evidence_index(path_value: str | None, expected_sha: str | None
         expected_doc = {"format": OWNER_EVIDENCE_FORMAT, "evidence_id": evidence_id, "owner": repository,
                         "repository": repository, "revision": revision, "decision_ref": decision_ref,
                         "status": "accepted", "subjects": subjects}
-        if hashlib.sha256(evidence_bytes).hexdigest() != evidence_sha or evidence_doc != expected_doc:
+        if _is_test_only_evidence(evidence_doc):
+            add_error(errors, "owner_evidence_artifact_classification_invalid", ep, repository,
+                      "Production readiness rejects explicitly synthetic or test-only evidence documents.")
+            continue
+        if (hashlib.sha256(evidence_bytes).hexdigest() != evidence_sha
+                or evidence_doc != expected_doc):
             add_error(errors, "owner_evidence_artifact_mismatch", ep, repository, owner_action)
             continue
         records[evidence_id] = dict(entry)

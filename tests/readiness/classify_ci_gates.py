@@ -30,13 +30,15 @@ from tools import verify_contract_release as contracts  # noqa: E402
 
 FORMAT = "agent-creative.readiness-ci-evidence/v1"
 SANDBOX_OBSERVATION_KEYS = (
-    "outside_read_blocked", "sandbox_shadow_write_succeeded", "network_blocked",
+    "outside_read_blocked", "private_shadow_visible", "sandbox_shadow_write_succeeded", "network_blocked",
     "network_namespace_isolated", "sandbox_exec_capabilities_dropped", "apparmor_stack_verified",
     "payload_no_new_privs", "payload_capability_sets_zero", "python_reexec_stack_verified",
     "python_reexec_capabilities_zero", "python_reexec_no_new_privs", "other_exec_stack_verified",
     "other_exec_capabilities_zero", "other_exec_no_new_privs", "nested_userns_created",
-    "nested_userns_stack_verified", "nested_userns_no_new_privs", "nested_cap_sys_admin_available",
-    "nested_mount_denied", "nested_bwrap_denied", "child_isolated", "child_capabilities_dropped",
+    "nested_userns_setup_complete", "nested_userns_stack_verified", "nested_userns_no_new_privs",
+    "nested_capability_sets_observed", "nested_mount_attempted", "nested_mount_namespace_denied",
+    "nested_bwrap_denied",
+    "child_isolated", "child_capabilities_dropped",
 )
 EXPECTED_CONTRACT_CODES = {
     "canonical_release_not_published": 9,
@@ -309,6 +311,24 @@ def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
     for key in SANDBOX_OBSERVATION_KEYS:
         if type(observed.get(key)) is bool:
             result[key] = observed[key]
+    mount_created = observed.get("nested_mount_namespace_created")
+    if type(mount_created) is bool:
+        result["nested_mount_namespace_created"] = mount_created
+    nested_exit = observed.get("nested_userns_process_exit_code")
+    if type(nested_exit) is int and -255 <= nested_exit <= 255:
+        result["nested_userns_process_exit_code"] = nested_exit
+    nested_stderr = observed.get("nested_userns_stderr_class")
+    if nested_stderr in ("empty", "operation_not_permitted", "permission_denied", "missing_file", "other"):
+        result["nested_userns_stderr_class"] = nested_stderr
+    nested_errno = observed.get("nested_mount_errno_category")
+    if nested_errno in ("operation_not_permitted", "permission_denied", "other", "unavailable"):
+        result["nested_mount_errno_category"] = nested_errno
+    capability_names = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+    capability_sets = observed.get("nested_capability_sets")
+    if (isinstance(capability_sets, dict) and set(capability_sets) == set(capability_names)
+            and all(isinstance(capability_sets[name], str) and 1 <= len(capability_sets[name]) <= 32
+                    and re.fullmatch(r"[0-9a-fA-F]+", capability_sets[name]) for name in capability_names)):
+        result["nested_capability_sets"] = {name: capability_sets[name] for name in capability_names}
     for key in ("apparmor_label", "python_reexec_label", "other_exec_label", "nested_userns_label"):
         label = observed.get(key)
         if (isinstance(label, str) and len(label) <= 160 and "bwrap" in label
@@ -378,6 +398,8 @@ def classify_sandbox() -> Tuple[Dict[str, Any], List[str]]:
                        if evidence["canary"]["observations"].get(key) is not True]
             if evidence["canary"]["observations"].get("host_canary_unchanged") is not True:
                 missing.append("host_canary_unchanged")
+            if evidence["canary"]["observations"].get("nested_mount_namespace_created") is not False:
+                missing.append("nested_mount_namespace_created_false")
             if missing:
                 problems.append("bubblewrap_canary_evidence_incomplete")
                 evidence["canary"]["status"] = "failed"

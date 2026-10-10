@@ -38,7 +38,13 @@ class CICheckerClassificationTests(unittest.TestCase):
                              "python_reexec_label": "bwrap//unpriv_bwrap (enforce)",
                              "other_exec_label": "bwrap//unpriv_bwrap (enforce)",
                              "nested_userns_label": "bwrap//unpriv_bwrap (enforce)",
-                             "nested_cap_eff": "000001ffffffffff", "host_canary_unchanged": True})
+                             "nested_cap_eff": "000001ffffffffff", "nested_userns_process_exit_code": 0,
+                             "nested_userns_stderr_class": "empty",
+                             "nested_mount_errno_category": "operation_not_permitted",
+                             "nested_capability_sets": {name: "000001ffffffffff" for name in
+                                                        ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")},
+                             "nested_mount_namespace_created": False,
+                             "host_canary_unchanged": True})
 
         def successful_probe(_root, output):
             output.update(observations)
@@ -71,10 +77,13 @@ class CICheckerClassificationTests(unittest.TestCase):
                                              "capability": "sys_admin"}])
         self.assertNotIn("/synthetic/private/path", str(audit))
         self.assertEqual(audit["prior_loopback_failure_cause"], "unproven_from_frozen_CI_logs")
+        self.assertEqual(evidence["canary"]["observations"]["nested_mount_namespace_created"], False)
+        self.assertEqual(set(evidence["canary"]["observations"]["nested_capability_sets"]),
+                         {"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"})
 
     def test_sandbox_success_is_rejected_when_any_required_native_observation_is_missing(self):
         observations = {key: True for key in ci.SANDBOX_OBSERVATION_KEYS}
-        observations.pop("nested_mount_denied")
+        observations.pop("nested_mount_namespace_denied")
         observations.update({"apparmor_label": "bwrap//unpriv_bwrap (enforce)", "host_canary_unchanged": True})
 
         def incomplete_probe(_root, output):

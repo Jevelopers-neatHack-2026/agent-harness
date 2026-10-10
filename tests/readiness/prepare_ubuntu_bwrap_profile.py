@@ -324,6 +324,34 @@ def _package_record(package: str, version: str, sha256: str) -> dict[str, str]:
     return validate_apt_record(text, package, version, sha256, source_text=source_text)
 
 
+def parse_dpkg_deb_fields(output: str) -> dict[str, str]:
+    """Parse dpkg-deb -f's labelled fields without depending on control order."""
+    allowed = {"Package", "Version", "Architecture"}
+    fields: dict[str, str] = {}
+    for line in output.splitlines():
+        name, separator, value = line.partition(":")
+        if not separator or name not in allowed or name in fields:
+            raise SetupFailure("downloaded_profile_package_metadata_invalid")
+        normalized = value.strip()
+        if not normalized:
+            raise SetupFailure("downloaded_profile_package_metadata_invalid")
+        fields[name] = normalized
+    if set(fields) != allowed:
+        raise SetupFailure("downloaded_profile_package_metadata_invalid")
+    return fields
+
+
+def validate_profile_deb_metadata(output: bytes) -> dict[str, str]:
+    try:
+        text = output.decode("ascii", errors="strict")
+    except UnicodeError as exc:
+        raise SetupFailure("downloaded_profile_package_metadata_invalid") from exc
+    fields = parse_dpkg_deb_fields(text)
+    if fields != {"Package": PROFILE_PACKAGE, "Version": PROFILE_VERSION, "Architecture": "all"}:
+        raise SetupFailure("downloaded_profile_package_metadata_mismatch")
+    return fields
+
+
 def _public_apt_source(source: str) -> str:
     """Return useful source identity while omitting URL credentials and paths."""
     tokens = source.split()
@@ -603,9 +631,7 @@ def prepare(evidence_path: Path) -> int:
             if _sha256(deb) != PROFILE_DEB_SHA256:
                 raise SetupFailure("downloaded_profile_package_digest_mismatch")
             fields_out, _ = _command(["dpkg-deb", "-f", str(deb), "Package", "Version", "Architecture"], limit=8192)
-            package_fields = fields_out.decode("ascii", errors="strict").splitlines()
-            if package_fields != [PROFILE_PACKAGE, PROFILE_VERSION, "all"]:
-                raise SetupFailure("downloaded_profile_package_metadata_mismatch")
+            package_fields = validate_profile_deb_metadata(fields_out)
             extracted = work / "bwrap-userns-restrict"
             _extract_profile(deb, extracted)
             report["profile_package"]["download_sha256"] = PROFILE_DEB_SHA256

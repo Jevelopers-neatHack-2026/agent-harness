@@ -356,12 +356,15 @@ def _lexical_safe_path(base: Path, relative: Any, json_path: str, owner: str,
     return resolved
 
 
-def check_artifact(base: Path, item: Any, json_path: str, owner: str,
-                   errors: list[dict[str, str]]) -> tuple[Path | None, str | None]:
+def check_artifact_bytes(base: Path, item: Any, json_path: str, owner: str,
+                         errors: list[dict[str, str]],
+                         verified_artifacts: dict[Path, tuple[bytes, str]] | None = None
+                         ) -> tuple[Path | None, str | None, bytes | None]:
+    """Capture and hash one bounded artifact; callers parse and seal these same bytes."""
     if not isinstance(item, dict):
         add_error(errors, "artifact_descriptor_malformed", json_path, owner,
                   "Publish an artifact descriptor with an exact path and SHA-256.")
-        return None, None
+        return None, None, None
     path = _lexical_safe_path(base, item.get("path"), json_path + ".path", owner, errors)
     expected = item.get("sha256")
     if not digest_ok(expected):
@@ -369,30 +372,49 @@ def check_artifact(base: Path, item: Any, json_path: str, owner: str,
                   "Publish the SHA-256 of the exact owner artifact bytes.")
         expected = None
     if path is not None and expected is not None:
+        cached = verified_artifacts.get(path) if verified_artifacts is not None else None
+        if cached is not None:
+            raw, actual = cached
+            if actual != expected:
+                add_error(errors, "artifact_sha256_mismatch", json_path, owner,
+                          "Reuse an artifact path only when its descriptor pins the same exact verified bytes.")
+                return None, None, None
+            return path, actual, raw
         try:
             raw = read_bounded_file(path)
         except OSError as exc:
             code = "artifact_size_limit_exceeded" if "size bound" in str(exc) else "artifact_unreadable"
             add_error(errors, code, json_path + ".path", owner,
                       "Publish readable artifact bytes within the standalone verifier's fixed size limit.")
-            return None, None
+            return None, None, None
         if not raw:
             add_error(errors, "artifact_empty", json_path + ".path", owner,
                       "Publish nonempty canonical schema, fixture, adapter, or inventory bytes.")
-            return None, None
+            return None, None, None
         actual = sha256_bytes(raw)
         if actual != expected:
             add_error(errors, "artifact_sha256_mismatch", json_path, owner,
                       "Republish the descriptor with the exact owner artifact SHA-256.")
-            return None, None
-        return path, actual
-    return path, None
+            return None, None, None
+        if verified_artifacts is not None:
+            verified_artifacts[path] = (raw, actual)
+        return path, actual, raw
+    return path, None, None
+
+
+def check_artifact(base: Path, item: Any, json_path: str, owner: str,
+                   errors: list[dict[str, str]],
+                   verified_artifacts: dict[Path, tuple[bytes, str]] | None = None
+                   ) -> tuple[Path | None, str | None]:
+    path, digest, _raw = check_artifact_bytes(base, item, json_path, owner, errors, verified_artifacts)
+    return path, digest
 
 
 def _read_execution_artifacts(base: Path,
                               artifacts: list[tuple[Path | None, str | None, str]],
-                              errors: list[dict[str, str]]) -> dict[str, tuple[bytes, str]] | None:
-    """Read each execution input once more, require its pinned hash, and key by sandbox path."""
+                              errors: list[dict[str, str]],
+                              verified_artifacts: dict[Path, tuple[bytes, str]]) -> dict[str, tuple[bytes, str]] | None:
+    """Seal the exact already-parsed verified bytes without reopening mutable paths."""
     result: dict[str, tuple[bytes, str]] = {}
     total_size = 0
     for path, expected_sha, label in artifacts:
@@ -402,15 +424,18 @@ def _read_execution_artifacts(base: Path,
             continue
         try:
             relative = path.relative_to(base).as_posix()
-            raw = read_bounded_file(path)
         except (OSError, ValueError):
             add_error(errors, "execution_snapshot_input_unavailable", "$.canonical_release", "shared-contracts",
                       f"Keep the pinned {label} readable inside the canonical release package.")
             continue
-        if sha256_bytes(raw) != expected_sha:
+        captured = verified_artifacts.get(path)
+        if (not isinstance(captured, tuple) or len(captured) != 2
+                or not isinstance(captured[0], bytes) or captured[1] != expected_sha
+                or sha256_bytes(captured[0]) != expected_sha):
             add_error(errors, "execution_snapshot_pin_mismatch", "$.canonical_release", "shared-contracts",
-                      f"Restore the exact pinned {label} bytes before execution; changed package paths are never used.")
+                      f"Use the same exact hash-verified {label} bytes for validation and immutable execution.")
             continue
+        raw = captured[0]
         total_size += len(raw)
         if total_size > MAX_SEALED_SNAPSHOT_BYTES or len(result) >= MAX_SEALED_SNAPSHOT_FILES:
             add_error(errors, "execution_snapshot_limit_exceeded", "$.canonical_release", "shared-contracts",
@@ -612,13 +637,16 @@ def adapter_provenance_verified(adapter: Any, adapter_sha256: str | None,
                 and record.get("subjects", {}).get("contract-validator-adapter") == adapter_sha256)
 
 
-def _read_inventory(base: Path, descriptor: Any, errors: list[dict[str, str]]) -> tuple[dict[str, Any] | None, str | None, Path | None]:
-    path, digest = check_artifact(base, descriptor, "$.canonical_release.field_inventory", "shared-contracts", errors)
+def _read_inventory(base: Path, descriptor: Any, errors: list[dict[str, str]],
+                    verified_artifacts: dict[Path, tuple[bytes, str]] | None = None
+                    ) -> tuple[dict[str, Any] | None, str | None, Path | None]:
+    path, digest, raw = check_artifact_bytes(
+        base, descriptor, "$.canonical_release.field_inventory", "shared-contracts", errors, verified_artifacts)
     if path is None:
         return None, digest, None
     try:
-        data = parse_json_bytes(read_bounded_file(path))
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+        data = parse_json_bytes(raw or b"")
+    except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
         add_error(errors, "field_inventory_invalid_json", "$.canonical_release.field_inventory", "shared-contracts",
                   "Publish a bounded machine-readable field inventory generated from the exact canonical schema artifact bytes.")
         return None, digest, path
@@ -1031,7 +1059,9 @@ def validate_crosswalk(manifest: dict[str, Any], schemas: dict[str, dict[str, An
 
 
 def _validate_fixture_map(manifest: dict[str, Any], schemas: dict[str, dict[str, Any]], inventory: dict[str, Any] | None,
-                          base: Path, errors: list[dict[str, str]]) -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
+                          base: Path, errors: list[dict[str, str]],
+                          verified_artifacts: dict[Path, tuple[bytes, str]] | None = None
+                          ) -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
     fixture_rows = manifest.get("fixtures")
     if not isinstance(fixture_rows, list):
         fixture_rows = []
@@ -1062,7 +1092,8 @@ def _validate_fixture_map(manifest: dict[str, Any], schemas: dict[str, dict[str,
                       "Map each required acceptance case once to an owner-published fixture.")
             continue
         fixtures[case_id] = fixture
-        fixture_path, fixture_sha = check_artifact(base, fixture, path, "shared-contracts", errors)
+        fixture_path, fixture_sha, fixture_raw = check_artifact_bytes(
+            base, fixture, path, "shared-contracts", errors, verified_artifacts)
         schema_id, schema_sha = fixture.get("schema_id"), fixture.get("schema_sha256")
         contract_id, primitive = fixture.get("contract_id"), fixture.get("primitive")
         identity_values = (schema_id, schema_sha, contract_id, primitive)
@@ -1081,14 +1112,13 @@ def _validate_fixture_map(manifest: dict[str, Any], schemas: dict[str, dict[str,
         if not isinstance(classification, str) or classification not in {"synthetic", "sanitized_non_customer"}:
             add_error(errors, "fixture_data_classification_missing", path + ".data_classification", "shared-contracts",
                       "Mark fixtures synthetic or sanitized non-customer data; never include secrets or customer content.")
-        if fixture_path is not None:
+        if fixture_path is not None and fixture_raw is not None:
             fixture_paths[case_id] = fixture_path
             try:
-                raw = read_bounded_file(fixture_path)
                 media_type = fixture.get("media_type")
                 if ((isinstance(media_type, str) and "json" in media_type)
                         or fixture_path.suffix.lower() == ".json"):
-                    content = parse_json_bytes(raw)
+                    content = parse_json_bytes(fixture_raw)
                     if content is None or content == {} or content == []:
                         add_error(errors, "fixture_content_empty", path + ".path", "shared-contracts",
                                   "Publish a nonempty owner fixture that exercises real input bytes; an empty object is not a conformance case.")
@@ -1298,6 +1328,7 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
     if isinstance(report, dict):
         flags = {
             "outside_read_blocked": report.get("outside_read_blocked") is True,
+            "private_shadow_visible": report.get("private_shadow_visible") is True,
             "shadow_write_private": report.get("sandbox_shadow_write_succeeded") is True,
             "network_blocked": report.get("network_blocked") is True,
             "network_namespace_isolated": report.get("network_namespace_isolated") is True,
@@ -1307,8 +1338,10 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
             "python_reexec_stack": report.get("python_reexec_stack_verified") is True,
             "other_exec_stack": report.get("other_exec_stack_verified") is True,
             "nested_userns_created": report.get("nested_userns_created") is True,
-            "nested_capability_denied": (report.get("nested_cap_sys_admin_available") is True
-                                          and report.get("nested_mount_denied") is True),
+            "nested_capability_sets_observed": report.get("nested_capability_sets_observed") is True,
+            "nested_mount_attempted": report.get("nested_mount_attempted") is True,
+            "nested_capability_denied": report.get("nested_mount_namespace_denied") is True,
+            "nested_mount_namespace_created": report.get("nested_mount_namespace_created") is True,
             "nested_bwrap_denied": report.get("nested_bwrap_denied") is True,
             "child_isolated": report.get("child_isolated") is True,
         }
@@ -1319,6 +1352,16 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         allowed_stderr_classes = {"empty", "operation_not_permitted", "permission_denied", "missing_file",
                                   "python_dependency_import_failure", "python_traceback", "other"}
         flags["child_stderr_class"] = child_stderr_class if child_stderr_class in allowed_stderr_classes else "unavailable"
+        nested_exit = report.get("nested_userns_process_exit_code")
+        flags["nested_userns_exit_code"] = nested_exit if type(nested_exit) is int else "unavailable"
+        nested_stderr = report.get("nested_userns_stderr_class")
+        flags["nested_userns_stderr_class"] = nested_stderr if nested_stderr in allowed_stderr_classes else "unavailable"
+        nested_errno = report.get("nested_mount_errno_category")
+        flags["nested_mount_errno_category"] = nested_errno if nested_errno in {
+            "operation_not_permitted", "permission_denied", "other", "unavailable"} else "unavailable"
+        nested_cap_eff = report.get("nested_cap_eff")
+        flags["nested_cap_eff"] = nested_cap_eff if isinstance(nested_cap_eff, str) and len(nested_cap_eff) <= 32 \
+            and all(char in "0123456789abcdefABCDEF" for char in nested_cap_eff) else "unavailable"
     detail = {
         "process_code": code,
         "exit_code": exit_code,
@@ -1359,13 +1402,17 @@ def context():
   return {'label':label if stacked else 'unverified','stack':stacked,'no_new_privs':status.get('NoNewPrivs')=='1','caps_zero':all(value==0 for value in values.values())}
  except (OSError,ValueError,KeyError):
   return {'label':'unavailable','stack':False,'no_new_privs':False,'caps_zero':False}
-outside=sys.argv[1]
-host_net=int(sys.argv[2])
+outside=sys.argv[1];shadow=sys.argv[2]
+host_net=int(sys.argv[3])
 try:
- open(outside,'rb').read()
+ with open(outside,'rb') as source:source.read()
  outside_blocked=False
 except OSError:
  outside_blocked=True
+try:
+ with open(shadow,'rb') as source:private_shadow_visible=source.read()==b'sandbox-shadow-write'
+except OSError:
+ private_shadow_visible=False
 netns=os.stat('/proc/self/ns/net').st_ino != host_net
 s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.settimeout(0.2)
 try:
@@ -1373,11 +1420,12 @@ try:
 except OSError:
  network_blocked=True
 c=context()
-r={'outside_read_blocked':outside_blocked,'network_blocked':network_blocked,'network_namespace_isolated':netns,
+r={'outside_read_blocked':outside_blocked,'private_shadow_visible':private_shadow_visible,
+   'network_blocked':network_blocked,'network_namespace_isolated':netns,
    'apparmor_label':c['label'],'apparmor_stack_verified':c['stack'],'no_new_privs':c['no_new_privs'],
    'capabilities_zero':c['caps_zero']}
 print(json.dumps(r,sort_keys=True,separators=(',',':')))
-sys.exit(0 if all((outside_blocked,network_blocked,netns,c['stack'],c['no_new_privs'],c['caps_zero'])) else 7)
+sys.exit(0 if all((outside_blocked,private_shadow_visible,network_blocked,netns,c['stack'],c['no_new_privs'],c['caps_zero'])) else 7)
 '''
     parent_code = r'''import ctypes,errno,json,os,selectors,signal,socket,subprocess,sys,time
 CAPS=('CapInh','CapPrm','CapEff','CapBnd','CapAmb')
@@ -1433,7 +1481,8 @@ def parse_object(raw):
   return {}
 outside=sys.argv[1]; child_code=sys.argv[2]; host_net=int(sys.argv[3]); bwrap=sys.argv[4]
 parent=context()
-r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_blocked':False,
+r={'outside_read_blocked':False,'private_shadow_visible':False,
+   'sandbox_shadow_write_succeeded':False,'network_blocked':False,
    'network_namespace_isolated':os.stat('/proc/self/ns/net').st_ino != host_net,
    'sandbox_exec_capabilities_dropped':parent['caps_zero'],'apparmor_label':parent['label'],
    'apparmor_stack_verified':parent['stack'],'payload_no_new_privs':parent['no_new_privs'],
@@ -1441,9 +1490,13 @@ r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_
    'python_reexec_label':'unverified','python_reexec_capabilities_zero':False,'python_reexec_no_new_privs':False,
    'other_exec_label':'unverified',
    'other_exec_stack_verified':False,'other_exec_capabilities_zero':False,
-   'other_exec_no_new_privs':False,'nested_userns_created':False,'nested_userns_stack_verified':False,
-   'nested_userns_label':'unverified','nested_userns_no_new_privs':False,'nested_cap_sys_admin_available':False,
-   'nested_cap_eff':'','nested_mount_denied':False,'nested_bwrap_denied':False,
+   'other_exec_no_new_privs':False,'nested_userns_created':False,'nested_userns_setup_complete':False,
+   'nested_userns_stack_verified':False,'nested_userns_label':'unverified','nested_userns_no_new_privs':False,
+   'nested_userns_process_exit_code':None,'nested_userns_stderr_class':'not_run',
+   'nested_capability_sets_observed':False,'nested_capability_sets':{},
+   'nested_mount_attempted':False,'nested_mount_namespace_denied':False,
+   'nested_mount_namespace_created':False,'nested_mount_errno_category':'unavailable',
+   'nested_cap_eff':'','nested_bwrap_denied':False,
    'child_isolated':False,'child_capabilities_dropped':False,'child_exit_code':None,
    'child_stderr_present':False,'child_stderr_class':'not_run'}
 try:
@@ -1451,16 +1504,19 @@ try:
 except OSError:
  r['outside_read_blocked']=True
 try:
- os.makedirs(os.path.dirname(outside),exist_ok=True)
- with open(outside,'wb') as target:target.write(b'sandbox-shadow-write')
- with open(outside,'rb') as target:r['sandbox_shadow_write_succeeded']=(target.read()==b'sandbox-shadow-write')
+ shadow='/tmp/acv1-private-shadow-'+str(os.getpid())
+ if shadow!=outside and not os.path.lexists(shadow):
+  descriptor=os.open(shadow,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+  try:os.write(descriptor,b'sandbox-shadow-write')
+  finally:os.close(descriptor)
+  with open(shadow,'rb') as target:r['sandbox_shadow_write_succeeded']=(target.read()==b'sandbox-shadow-write')
 except OSError:
  pass
 try:
  s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.settimeout(0.2);s.connect(('198.18.0.1',9))
 except OSError:
  r['network_blocked']=True
-child=run_child([sys.executable,'-I','-B','-S','-c',child_code,outside,str(host_net)])
+child=run_child([sys.executable,'-I','-B','-S','-c',child_code,outside,shadow,str(host_net)])
 child_report=parse_object(child['stdout'])
 r['child_exit_code']=child['code'];r['child_stderr_present']=bool(child['stderr'])
 child_error=child['stderr'].decode('utf-8','replace').lower()
@@ -1468,8 +1524,10 @@ r['child_stderr_class']=('operation_not_permitted' if 'operation not permitted' 
  'permission_denied' if 'permission denied' in child_error else 'missing_file' if 'no such file or directory' in child_error else
  'python_dependency_import_failure' if 'modulenotfounderror' in child_error or 'no module named' in child_error else
  'python_traceback' if 'traceback' in child_error else 'other' if child_error else 'empty')
+r['private_shadow_visible']=child_report.get('private_shadow_visible') is True
 r['child_isolated']=(child['code']==0 and child['bounded'] and child_report.get('outside_read_blocked') is True
- and child_report.get('network_blocked') is True and child_report.get('network_namespace_isolated') is True
+ and r['private_shadow_visible'] and child_report.get('network_blocked') is True
+ and child_report.get('network_namespace_isolated') is True
  and child_report.get('apparmor_stack_verified') is True and child_report.get('no_new_privs') is True
  and child_report.get('capabilities_zero') is True)
 r['child_capabilities_dropped']=child_report.get('capabilities_zero') is True
@@ -1506,51 +1564,69 @@ except (KeyError,ValueError):
 nested_code=r"""import ctypes,errno,json,os,sys
 def status():return {line.split(':',1)[0]:line.split(':',1)[1].strip() for line in open('/proc/self/status',encoding='ascii') if ':' in line}
 try:
- label=open('/proc/self/attr/current',encoding='ascii').read(256).strip();s=status();cap_eff=int(s['CapEff'],16)
+ label=open('/proc/self/attr/current',encoding='ascii').read(256).strip();s=status()
  stacked=label.endswith('(enforce)') and 'bwrap' in label and 'unpriv_bwrap' in label
- libc=ctypes.CDLL(None,use_errno=True);libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_char_p]
- target=b'/tmp/acv1-capability-mount-probe';ctypes.set_errno(0)
- result=libc.mount(b'tmpfs',target,b'tmpfs',2|4,b'size=4096');error=ctypes.get_errno()
+ capabilities={name:s.get(name,'') for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')}
+ libc=ctypes.CDLL(None,use_errno=True);libc.unshare.argtypes=[ctypes.c_int]
+ ctypes.set_errno(0);result=libc.unshare(0x00020000);error=ctypes.get_errno()
  denied=result<0 and error in (errno.EPERM,errno.EACCES)
- if result==0:
-  libc.umount.argtypes=[ctypes.c_char_p];libc.umount(target)
-  try:os.rmdir(target.decode())
-  except OSError:pass
- report={'created':True,'label':label if stacked else 'unverified','stack':stacked,'no_new_privs':s.get('NoNewPrivs')=='1',
-         'cap_eff':format(cap_eff,'x'),'cap_sys_admin':bool(cap_eff & (1<<21)),'mount_denied':denied}
+ errno_category=('operation_not_permitted' if error==errno.EPERM else
+                 'permission_denied' if error==errno.EACCES else 'other' if result<0 else 'unavailable')
+ report={'created':True,'label':label if stacked else 'unverified','stack':stacked,
+         'no_new_privs':s.get('NoNewPrivs')=='1','capabilities':capabilities,
+         'cap_eff':capabilities['CapEff'],'mount_attempted':True,
+         'mount_namespace_created':result==0,'mount_denied':denied,
+         'mount_errno_category':errno_category}
  print(json.dumps(report,sort_keys=True,separators=(',',':')))
- sys.exit(0 if stacked and report['no_new_privs'] and report['cap_sys_admin'] and denied else 9)
+ sys.exit(0 if stacked and report['no_new_privs'] and denied else 9)
 except (OSError,ValueError,KeyError):
  print('{}');sys.exit(10)
 """
-try:os.mkdir('/tmp/acv1-capability-mount-probe')
-except FileExistsError:pass
 unshare=__import__('shutil').which('unshare')
 if unshare:
- nested=run_child([unshare,'--user','--map-root-user','--mount',sys.executable,'-I','-B','-S','-c',nested_code],timeout=4)
+ nested=run_child([unshare,'--user','--map-root-user',sys.executable,'-I','-B','-S','-c',nested_code],timeout=4)
  nested_report=parse_object(nested['stdout'])
  r['nested_userns_created']=nested_report.get('created') is True and nested['bounded']
+ r['nested_userns_setup_complete']=(nested_report.get('created') is True
+  and nested_report.get('mount_attempted') is True and isinstance(nested_report.get('capabilities'),dict)
+  and nested['bounded'])
  r['nested_userns_label']=nested_report.get('label','unverified')
  r['nested_userns_stack_verified']=nested_report.get('stack') is True
  r['nested_userns_no_new_privs']=nested_report.get('no_new_privs') is True
- r['nested_cap_sys_admin_available']=nested_report.get('cap_sys_admin') is True
- r['nested_cap_eff']=nested_report.get('cap_eff','') if isinstance(nested_report.get('cap_eff'),str) else ''
- r['nested_mount_denied']=nested_report.get('mount_denied') is True
+ capability_names=('CapInh','CapPrm','CapEff','CapBnd','CapAmb')
+ capability_sets=nested_report.get('capabilities')
+ if (isinstance(capability_sets,dict) and set(capability_sets)==set(capability_names)
+  and all(isinstance(capability_sets[name],str) and 1<=len(capability_sets[name])<=32
+   and all(char in '0123456789abcdefABCDEF' for char in capability_sets[name]) for name in capability_names)):
+  r['nested_capability_sets_observed']=True
+  r['nested_capability_sets']=capability_sets
+  r['nested_cap_eff']=capability_sets['CapEff']
+ r['nested_mount_attempted']=nested_report.get('mount_attempted') is True
+ r['nested_mount_namespace_denied']=nested_report.get('mount_denied') is True
+ r['nested_mount_namespace_created']=nested_report.get('mount_namespace_created') is True
+ if nested_report.get('mount_errno_category') in ('operation_not_permitted','permission_denied','other','unavailable'):
+  r['nested_mount_errno_category']=nested_report['mount_errno_category']
+ r['nested_userns_process_exit_code']=nested.get('code') if type(nested.get('code')) is int else None
+ nested_error=nested.get('stderr',b'').decode('utf-8','replace').lower()
+ r['nested_userns_stderr_class']=('operation_not_permitted' if 'operation not permitted' in nested_error else
+  'permission_denied' if 'permission denied' in nested_error else 'missing_file' if 'no such file or directory' in nested_error else
+  'other' if nested_error else 'empty')
 
 inner=run_child([bwrap,'--die-with-parent','--new-session','--unshare-all','--cap-drop','ALL','/usr/bin/true'],timeout=4)
 inner_error=inner['stderr'].decode('utf-8','replace').lower()
 r['nested_bwrap_denied']=(inner['bounded'] and inner['code'] is not None and inner['code']!=0
  and 'bwrap: loopback: failed rtm_newaddr: operation not permitted' in inner_error)
-try:os.rmdir('/tmp/acv1-capability-mount-probe')
-except OSError:pass
 print(json.dumps(r,sort_keys=True,separators=(',',':')))
 required=('outside_read_blocked','sandbox_shadow_write_succeeded','network_blocked','network_namespace_isolated',
+ 'private_shadow_visible',
  'sandbox_exec_capabilities_dropped','apparmor_stack_verified','payload_no_new_privs','payload_capability_sets_zero',
  'python_reexec_stack_verified','python_reexec_capabilities_zero','python_reexec_no_new_privs',
  'other_exec_stack_verified','other_exec_capabilities_zero','other_exec_no_new_privs','nested_userns_created',
- 'nested_userns_stack_verified','nested_userns_no_new_privs','nested_cap_sys_admin_available','nested_mount_denied',
+ 'nested_userns_setup_complete','nested_userns_stack_verified','nested_userns_no_new_privs',
+ 'nested_capability_sets_observed','nested_mount_attempted','nested_mount_namespace_denied',
  'nested_bwrap_denied','child_isolated','child_capabilities_dropped')
-sys.exit(0 if all(r.get(key) is True for key in required) and r['child_exit_code']==0
+sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_errno_category'] in ('operation_not_permitted','permission_denied')
+ and r['nested_userns_process_exit_code']==0 and r['nested_userns_stderr_class']=='empty' and r['child_exit_code']==0
  and not r['child_stderr_present'] and r['child_stderr_class']=='empty' else 8)
 '''
     try:
@@ -1573,15 +1649,19 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['child_exit_code
         observed.clear()
         if isinstance(report, dict):
             allowed = {
-                "outside_read_blocked", "sandbox_shadow_write_succeeded", "network_blocked",
+                "outside_read_blocked", "private_shadow_visible", "sandbox_shadow_write_succeeded", "network_blocked",
                 "network_namespace_isolated", "sandbox_exec_capabilities_dropped", "apparmor_label",
                 "python_reexec_label", "other_exec_label", "nested_userns_label",
                 "apparmor_stack_verified", "payload_no_new_privs", "payload_capability_sets_zero",
                 "python_reexec_stack_verified", "python_reexec_capabilities_zero",
                 "python_reexec_no_new_privs", "other_exec_stack_verified", "other_exec_capabilities_zero",
                 "other_exec_no_new_privs", "nested_userns_created", "nested_userns_stack_verified",
-                "nested_userns_no_new_privs", "nested_cap_sys_admin_available", "nested_cap_eff",
-                "nested_mount_denied", "nested_bwrap_denied", "child_isolated",
+                "nested_userns_no_new_privs", "nested_userns_setup_complete", "nested_cap_eff",
+                "nested_userns_process_exit_code", "nested_userns_stderr_class",
+                "nested_capability_sets_observed", "nested_capability_sets",
+                "nested_mount_attempted", "nested_mount_namespace_denied", "nested_mount_namespace_created",
+                "nested_mount_errno_category",
+                "nested_bwrap_denied", "child_isolated",
                 "child_capabilities_dropped", "child_exit_code", "child_stderr_present", "child_stderr_class",
             }
             observed.update({key: report[key] for key in allowed if key in report})
@@ -1590,6 +1670,7 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['child_exit_code
     if not run.get("ok"):
         return _sandbox_process_failure(run, report)
     if (not isinstance(report, dict) or report.get("outside_read_blocked") is not True
+            or report.get("private_shadow_visible") is not True
             or report.get("sandbox_shadow_write_succeeded") is not True
             or report.get("network_blocked") is not True
             or report.get("network_namespace_isolated") is not True
@@ -1604,10 +1685,16 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['child_exit_code
             or report.get("other_exec_capabilities_zero") is not True
             or report.get("other_exec_no_new_privs") is not True
             or report.get("nested_userns_created") is not True
+            or report.get("nested_userns_setup_complete") is not True
             or report.get("nested_userns_stack_verified") is not True
             or report.get("nested_userns_no_new_privs") is not True
-            or report.get("nested_cap_sys_admin_available") is not True
-            or report.get("nested_mount_denied") is not True
+            or report.get("nested_capability_sets_observed") is not True
+            or report.get("nested_mount_attempted") is not True
+            or report.get("nested_mount_namespace_denied") is not True
+            or report.get("nested_mount_namespace_created") is not False
+            or report.get("nested_mount_errno_category") not in {"operation_not_permitted", "permission_denied"}
+            or report.get("nested_userns_process_exit_code") != 0
+            or report.get("nested_userns_stderr_class") != "empty"
             or report.get("nested_bwrap_denied") is not True
             or report.get("child_isolated") is not True
             or report.get("child_capabilities_dropped") is not True
@@ -1857,6 +1944,7 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
                   "Provision the independently verified owner-evidence index outside the repository and pin its exact SHA-256 in trusted runner configuration; local manifest assertions are not approval evidence.")
 
     base = manifest_path.resolve().parent
+    verified_artifacts: dict[Path, tuple[bytes, str]] = {}
     release = manifest.get("canonical_release")
     if not isinstance(release, dict):
         release = {}
@@ -1882,12 +1970,13 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
     for index, artifact in enumerate(schema_rows):
         path = f"$.canonical_release.schema_artifacts[{index}]"
         schema_id = artifact.get("schema_id") if isinstance(artifact, dict) else None
-        artifact_path, digest = check_artifact(base, artifact, path, "shared-contracts", errors)
+        artifact_path, digest, artifact_bytes = check_artifact_bytes(
+            base, artifact, path, "shared-contracts", errors, verified_artifacts)
         if not isinstance(schema_id, str) or not schema_id.strip() or schema_id in schemas:
             add_error(errors, "schema_id_missing_or_duplicate", path + ".schema_id", "shared-contracts",
                       "Assign each actual owner-published schema a unique stable schema ID.")
             continue
-        if artifact_path is not None and digest is not None:
+        if artifact_path is not None and digest is not None and artifact_bytes is not None:
             media_type = artifact.get("media_type") if isinstance(artifact, dict) else None
             is_json = ((isinstance(media_type, str) and "json" in media_type)
                        or artifact_path.suffix.lower() == ".json")
@@ -1897,7 +1986,7 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
                           "Publish runtime schemas in a supported enumerable JSON Schema format so exact owner field inventory can be checked.")
             else:
                 try:
-                    schema_content = parse_json_bytes(read_bounded_file(artifact_path))
+                    schema_content = parse_json_bytes(artifact_bytes)
                     if not isinstance(schema_content, dict) or not schema_content:
                         add_error(errors, "canonical_schema_empty", path + ".path", "shared-contracts",
                                   "Publish nonempty actual canonical schema bytes; an empty object/array cannot describe a contract.")
@@ -1916,7 +2005,8 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
                                   "field_paths": field_paths}
             schema_hashes[schema_id] = digest
 
-    inventory, inventory_sha, inventory_path = _read_inventory(base, release.get("field_inventory"), errors)
+    inventory, inventory_sha, inventory_path = _read_inventory(
+        base, release.get("field_inventory"), errors, verified_artifacts)
     validate_crosswalk(manifest, schemas, inventory, evidence, errors)
 
     compatibility = release.get("compatibility")
@@ -1929,7 +2019,8 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
         add_error(errors, "additive_field_policy_missing", "$.canonical_release.compatibility.unknown_additive_fields", "shared-contracts",
                   "Record the owner-approved behavior for additive unknown fields.")
     adapter = release.get("validator_adapter")
-    adapter_path, adapter_sha = check_artifact(base, adapter, "$.canonical_release.validator_adapter", "shared-contracts", errors)
+    adapter_path, adapter_sha = check_artifact(
+        base, adapter, "$.canonical_release.validator_adapter", "shared-contracts", errors, verified_artifacts)
     dependency_paths: list[tuple[Path | None, str | None]] = []
     if not isinstance(adapter, dict) or adapter.get("protocol") != ADAPTER_PROTOCOL:
         add_error(errors, "validator_adapter_protocol_missing", "$.canonical_release.validator_adapter.protocol", "shared-contracts",
@@ -1941,14 +2032,16 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
     else:
         for index, dependency in enumerate(dependency_rows):
             dependency_path, dependency_sha = check_artifact(
-                base, dependency, f"$.canonical_release.validator_adapter.dependencies[{index}]", "shared-contracts", errors)
+                base, dependency, f"$.canonical_release.validator_adapter.dependencies[{index}]", "shared-contracts", errors,
+                verified_artifacts)
             dependency_paths.append((dependency_path, dependency_sha))
     if adapter_path is not None and adapter_sha is not None:
         if not adapter_provenance_verified(adapter, adapter_sha, evidence):
             add_error(errors, "validator_adapter_provenance_unverified", "$.canonical_release.validator_adapter", "shared-contracts",
                       "Bind adapter bytes to the independent shared-contracts owner evidence index before execution.")
 
-    fixtures, fixture_paths = _validate_fixture_map(manifest, schemas, inventory, base, errors)
+    fixtures, fixture_paths = _validate_fixture_map(
+        manifest, schemas, inventory, base, errors, verified_artifacts)
     # The owner-evidence digest binds exact publication bytes, not local status
     # text or a set of review references supplied by this descriptor.
     release_subject = canonical_hash({
@@ -2047,7 +2140,7 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
         return None
     snapshot_inputs.extend((path, digest, "declared adapter dependency")
                            for path, digest in dependency_paths)
-    artifact_bytes = _read_execution_artifacts(base, snapshot_inputs, errors)
+    artifact_bytes = _read_execution_artifacts(base, snapshot_inputs, errors, verified_artifacts)
     if artifact_bytes is None:
         return None
     snapshot, snapshot_error = _make_sealed_snapshot(artifact_bytes)
