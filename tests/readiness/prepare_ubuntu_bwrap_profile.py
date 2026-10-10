@@ -35,6 +35,14 @@ PROFILE_TABLE_MAX_BYTES = 128 * 1024
 APT_PROVENANCE_FAILURE_PHASES = frozenset({"metadata_v1", "source_v2", "index_targets"})
 APT_CACHE_DIAGNOSTIC_BYTES = 8 * 1024
 APT_INDEX_TARGETS_LIMIT = 128 * 1024
+SYSTEM_COMMAND_DIAGNOSTIC_OPERATIONS = frozenset({
+    "apparmor_parser_package_owner",
+    "apparmor_parser_version",
+    "apparmor_package_version",
+    "apparmor_package_integrity",
+    "bubblewrap_package_owner_after_profile_download",
+})
+SYSTEM_COMMAND_DIAGNOSTIC_BYTES = 8 * 1024
 APT_MIRROR_URI = "mirror+file:/etc/apt/apt-mirrors.txt"
 APT_MIRRORLIST_PATH = Path("/etc/apt/apt-mirrors.txt")
 UBUNTU_SOURCES_PATH = Path("/etc/apt/sources.list.d/ubuntu.sources")
@@ -174,6 +182,23 @@ def _apt_command_diagnostics(phase: str, failure_kind: str, *, return_code: int 
     return result
 
 
+def _system_command_diagnostics(operation: str, failure_kind: str, *,
+                                return_code: int | None = None,
+                                stdout_bytes: int = 0,
+                                stderr_bytes: int = 0) -> dict[str, Any]:
+    if operation not in SYSTEM_COMMAND_DIAGNOSTIC_OPERATIONS:
+        raise SetupFailure("system_command_diagnostic_operation_invalid")
+    result: dict[str, Any] = {
+        "operation": operation,
+        "failure_kind": failure_kind,
+        "stdout_bytes_capped": min(max(stdout_bytes, 0), SYSTEM_COMMAND_DIAGNOSTIC_BYTES + 1),
+        "stderr_bytes_capped": min(max(stderr_bytes, 0), SYSTEM_COMMAND_DIAGNOSTIC_BYTES + 1),
+    }
+    if return_code is not None:
+        result["return_code"] = max(-255, min(return_code, 255))
+    return result
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
@@ -184,9 +209,28 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 
 def _command(args: list[str], *, timeout: float = 20, limit: int = 128 * 1024,
              cwd: Path | None = None, apt_phase: str | None = None,
-             apt_config: Path | None = None) -> tuple[bytes, bytes]:
+             apt_config: Path | None = None,
+             diagnostic_id: str | None = None) -> tuple[bytes, bytes]:
     if apt_phase is not None and apt_phase not in APT_PROVENANCE_FAILURE_PHASES:
         raise SetupFailure("apt_cache_command_phase_invalid")
+    if diagnostic_id is not None:
+        if diagnostic_id not in SYSTEM_COMMAND_DIAGNOSTIC_OPERATIONS:
+            raise SetupFailure("system_command_diagnostic_operation_invalid")
+        if apt_phase is not None:
+            raise SetupFailure("command_diagnostic_context_conflict")
+
+    def failure_details(kind: str, *, return_code: int | None = None,
+                        stdout_bytes: int = 0, stderr_bytes: int = 0) -> dict[str, Any] | None:
+        if apt_phase:
+            return {"apt_command": _apt_command_diagnostics(
+                apt_phase, kind, return_code=return_code,
+                stdout_bytes=stdout_bytes, stderr_bytes=stderr_bytes)}
+        if diagnostic_id:
+            return {"system_command": _system_command_diagnostics(
+                diagnostic_id, kind, return_code=return_code,
+                stdout_bytes=stdout_bytes, stderr_bytes=stderr_bytes)}
+        return None
+
     try:
         command_env = None
         if apt_config is not None:
@@ -196,27 +240,28 @@ def _command(args: list[str], *, timeout: float = 20, limit: int = 128 * 1024,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 check=False, timeout=timeout, close_fds=True)
     except OSError as exc:
-        details = ({"apt_command": _apt_command_diagnostics(
-            apt_phase, "launch_failed", error_category="apt_tool_executable_unavailable")}
-                   if apt_phase else None)
+        details = failure_details("launch_failed")
+        if apt_phase and details:
+            details["apt_command"]["error_category"] = "apt_tool_executable_unavailable"
         raise SetupFailure("command_unavailable_or_timed_out", details=details) from exc
     except subprocess.TimeoutExpired as exc:
-        details = ({"apt_command": _apt_command_diagnostics(
-            apt_phase, "timed_out", error_category="apt_tool_command_timed_out")}
-                   if apt_phase else None)
+        details = failure_details("timed_out")
+        if apt_phase and details:
+            details["apt_command"]["error_category"] = "apt_tool_command_timed_out"
         raise SetupFailure("command_unavailable_or_timed_out", details=details) from exc
     if len(result.stdout) > limit or len(result.stderr) > 8 * 1024:
-        details = ({"apt_command": _apt_command_diagnostics(
-            apt_phase, "output_limit_exceeded", error_category="apt_tool_output_limit_exceeded",
-            stdout_bytes=len(result.stdout), stderr_bytes=len(result.stderr))}
-                   if apt_phase else None)
+        details = failure_details(
+            "output_limit_exceeded", stdout_bytes=len(result.stdout),
+            stderr_bytes=len(result.stderr))
+        if apt_phase and details:
+            details["apt_command"]["error_category"] = "apt_tool_output_limit_exceeded"
         raise SetupFailure("command_output_exceeded_bound", details=details)
     if result.returncode != 0:
-        details = ({"apt_command": _apt_command_diagnostics(
-            apt_phase, "nonzero_exit", return_code=result.returncode,
-            error_category=_apt_error_category(result.stderr),
-            stdout_bytes=len(result.stdout), stderr_bytes=len(result.stderr))}
-                   if apt_phase else None)
+        details = failure_details(
+            "nonzero_exit", return_code=result.returncode,
+            stdout_bytes=len(result.stdout), stderr_bytes=len(result.stderr))
+        if apt_phase and details:
+            details["apt_command"]["error_category"] = _apt_error_category(result.stderr)
         raise SetupFailure("command_failed", details=details)
     return result.stdout, result.stderr
 
@@ -2004,8 +2049,8 @@ def _extract_profile(deb: Path, destination: Path) -> None:
     destination.write_bytes(output)
 
 
-def _version(command: list[str], pattern: str) -> str:
-    output, _ = _command(command, limit=8192)
+def _version(command: list[str], pattern: str, *, diagnostic_id: str | None = None) -> str:
+    output, _ = _command(command, limit=8192, diagnostic_id=diagnostic_id)
     first_line = output.decode("utf-8", errors="strict").splitlines()[0]
     match = re.fullmatch(pattern, first_line.strip())
     if not match:
@@ -2013,8 +2058,9 @@ def _version(command: list[str], pattern: str) -> str:
     return match.group(1)
 
 
-def _package_version(name: str) -> str:
-    output, _ = _command(["dpkg-query", "-W", "-f=${Version}", name], limit=8192)
+def _package_version(name: str, *, diagnostic_id: str | None = None) -> str:
+    output, _ = _command(["dpkg-query", "-W", "-f=${Version}", name], limit=8192,
+                         diagnostic_id=diagnostic_id)
     return output.decode("ascii", errors="strict").strip()
 
 
@@ -2057,8 +2103,9 @@ def _apt_toolchain_evidence() -> dict[str, str]:
     }
 
 
-def _owner_of(path: str) -> str:
-    output, _ = _command(["dpkg-query", "-S", path], limit=8192)
+def _owner_of(path: str, *, diagnostic_id: str | None = None) -> str:
+    output, _ = _command(["dpkg-query", "-S", path], limit=8192,
+                         diagnostic_id=diagnostic_id)
     line = output.decode("utf-8", errors="strict").splitlines()[0]
     owner, separator, _ = line.partition(": ")
     if not separator:
@@ -2066,8 +2113,9 @@ def _owner_of(path: str) -> str:
     return owner
 
 
-def _verify_package(name: str) -> None:
-    output, _ = _command(["dpkg", "--verify", name], limit=8192)
+def _verify_package(name: str, *, diagnostic_id: str | None = None) -> None:
+    output, _ = _command(["dpkg", "--verify", name], limit=8192,
+                         diagnostic_id=diagnostic_id)
     if output.strip():
         raise SetupFailure("installed_system_package_file_verification_failed")
 
@@ -2214,15 +2262,21 @@ def prepare(evidence_path: Path) -> int:
             parser_realpath = os.path.realpath(parser_path)
             if not parser_realpath.startswith("/usr/"):
                 raise SetupFailure("apparmor_parser_is_not_a_system_binary")
-            parser_owner = _owner_of(parser_realpath)
+            parser_owner = _owner_of(
+                parser_realpath, diagnostic_id="apparmor_parser_package_owner")
             if parser_owner != "apparmor":
                 raise SetupFailure("apparmor_parser_package_owner_mismatch")
-            parser_version = _version([parser_realpath, "--version"], r"AppArmor parser version ([0-9.]+)")
+            parser_version = _version(
+                [parser_realpath, "--version"], r"AppArmor parser version ([0-9.]+)",
+                diagnostic_id="apparmor_parser_version")
             if not parser_version.startswith("4."):
                 raise SetupFailure("apparmor_parser_abi4_compatible_version_required")
-            parser_package_version = _package_version("apparmor")
-            _verify_package("apparmor")
-            if _owner_of("/usr/bin/bwrap") != "bubblewrap":
+            parser_package_version = _package_version(
+                "apparmor", diagnostic_id="apparmor_package_version")
+            _verify_package("apparmor", diagnostic_id="apparmor_package_integrity")
+            if _owner_of(
+                    "/usr/bin/bwrap",
+                    diagnostic_id="bubblewrap_package_owner_after_profile_download") != "bubblewrap":
                 raise SetupFailure("bubblewrap_package_ownership_changed")
             profile_bytes = extracted.read_bytes()
             if (b"abi <abi/4.0>" not in profile_bytes
@@ -2297,11 +2351,15 @@ def prepare(evidence_path: Path) -> int:
             apt_command = exc.details.get("apt_command")
             if apt_command:
                 report["apt_command_diagnostics"] = apt_command
+            system_command = exc.details.get("system_command")
+            if system_command:
+                report["system_command_diagnostics"] = system_command
             trust_file = exc.details.get("trust_file_diagnostics")
             if trust_file:
                 report["trust_file_diagnostics"] = trust_file
             candidate = {key: value for key, value in exc.details.items()
-                         if key not in {"apt_command", "trust_file_diagnostics"}}
+                         if key not in {"apt_command", "system_command",
+                                        "trust_file_diagnostics"}}
             if candidate:
                 report["candidate_diagnostics"] = candidate
         report["status"] = "blocked"
@@ -2309,7 +2367,8 @@ def prepare(evidence_path: Path) -> int:
         print("native profile setup blocked: " + exc.code, file=sys.stderr)
         diagnostic = {key: report[key] for key in
                       ("apt_command_diagnostics", "candidate_diagnostics",
-                       "trust_file_diagnostics") if key in report}
+                       "system_command_diagnostics", "trust_file_diagnostics")
+                      if key in report}
         output = {"status": report["status"], "stage": report["stage"],
                   "failure_code": exc.code, "artifact": str(evidence_path)}
         if diagnostic:

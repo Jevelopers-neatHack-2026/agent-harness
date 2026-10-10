@@ -2336,6 +2336,38 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             self.assertNotIn("mirror.invalid", serialized)
             self.assertNotIn(stderr.decode(), serialized)
 
+    def test_native_profile_setup_tags_allowlisted_system_command_failures_without_output(self) -> None:
+        private_stdout = b"private parser output"
+        private_stderr = b"private parser diagnostic"
+        with mock.patch.object(profile_setup.subprocess, "run", return_value=SimpleNamespace(
+                returncode=126, stdout=private_stdout, stderr=private_stderr)):
+            with self.assertRaises(profile_setup.SetupFailure) as raised:
+                profile_setup._command(
+                    ["/usr/bin/apparmor_parser", "--version"],
+                    diagnostic_id="apparmor_parser_version")
+        self.assertEqual(raised.exception.code, "command_failed")
+        diagnostic = raised.exception.details["system_command"]
+        self.assertEqual(diagnostic, {
+            "operation": "apparmor_parser_version",
+            "failure_kind": "nonzero_exit",
+            "return_code": 126,
+            "stdout_bytes_capped": len(private_stdout),
+            "stderr_bytes_capped": len(private_stderr),
+        })
+        serialized = json.dumps(diagnostic, sort_keys=True)
+        self.assertNotIn("private", serialized)
+        self.assertNotIn(private_stderr.decode(), serialized)
+
+    def test_native_profile_setup_system_command_diagnostic_context_is_fixed(self) -> None:
+        with mock.patch.object(profile_setup.subprocess, "run") as run:
+            with self.assertRaisesRegex(
+                    profile_setup.SetupFailure,
+                    "system_command_diagnostic_operation_invalid"):
+                profile_setup._command(
+                    ["/usr/bin/apparmor_parser", "--version"],
+                    diagnostic_id="/usr/bin/apparmor_parser --version")
+        run.assert_not_called()
+
     def test_native_profile_setup_preserves_source_command_phase_with_candidate_shape(self) -> None:
         metadata = (
             "Package: apparmor-profiles\n"
@@ -2399,7 +2431,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertNotIn("APT-Sources:", diagnostic)
         self.assertNotIn("noble-updates/main amd64 Packages", diagnostic)
 
-    def test_native_profile_setup_publishes_only_sanitized_apt_failure_diagnostic(self) -> None:
+    def test_native_profile_setup_publishes_only_sanitized_command_failure_diagnostics(self) -> None:
         state = {
             "apparmor_enabled": "Y", "kernel_lsm": "apparmor", "sysctls": {},
             "profile_count": 1, "profile_table_sha256": "a" * 64, "profile_table": [],
@@ -2408,6 +2440,9 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             "apt_command": profile_setup._apt_command_diagnostics(
                 "metadata_v1", "nonzero_exit", return_code=100,
                 error_category="unsupported_option", stderr_bytes=96),
+            "system_command": profile_setup._system_command_diagnostics(
+                "apparmor_parser_version", "nonzero_exit", return_code=126,
+                stderr_bytes=42),
         })
         original_read_text = Path.read_text
 
@@ -2445,6 +2480,15 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(artifact["stage"], "bubblewrap_package_record")
         self.assertEqual(artifact["apt_command_diagnostics"]["phase"], "metadata_v1")
         self.assertEqual(artifact["apt_command_diagnostics"]["return_code"], 100)
+        self.assertEqual(artifact["system_command_diagnostics"], {
+            "operation": "apparmor_parser_version",
+            "failure_kind": "nonzero_exit",
+            "return_code": 126,
+            "stdout_bytes_capped": 0,
+            "stderr_bytes_capped": 42,
+        })
+        self.assertEqual(logged["diagnostics"]["system_command_diagnostics"]["operation"],
+                         "apparmor_parser_version")
         self.assertEqual(logged["diagnostics"]["apt_command_diagnostics"]["error_category"],
                          "unsupported_option")
         self.assertEqual(stderr, "native profile setup blocked: command_failed\n")
