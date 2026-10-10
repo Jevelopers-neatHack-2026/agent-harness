@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -98,6 +99,12 @@ APT_SOURCE_FILE_LIMIT = 64
 APT_SOURCE_DIRECTORY_ENTRY_LIMIT = 512
 APT_SOURCE_FILE_BYTES = 64 * 1024
 APT_SOURCE_TOTAL_BYTES = 256 * 1024
+TRUST_FILE_DIAGNOSTIC_PATHS = {
+    "ubuntu_archive_keyring": (
+        UBUNTU_ARCHIVE_KEYRING,
+        ("usr", "share", "keyrings", "file"),
+    ),
+}
 LOCAL_OVERRIDES = (
     Path("/etc/apparmor.d/local/bwrap-userns-restrict"),
     Path("/etc/apparmor.d/local/unpriv_bwrap"),
@@ -587,59 +594,163 @@ def _validate_runner_mirror_configuration(source_file: bytes,
 
 
 def _read_root_owned_file(path: Path, *, limit: int, failure_code: str,
-                          missing_ok: bool = False) -> bytes | None:
+                          missing_ok: bool = False,
+                          diagnostic_id: str | None = None) -> bytes | None:
     """Read a fixed system trust file without following links or accepting writable custody."""
+    diagnostic_spec = TRUST_FILE_DIAGNOSTIC_PATHS.get(diagnostic_id or "")
+    if diagnostic_id is not None and (diagnostic_spec is None or path != diagnostic_spec[0]):
+        raise SetupFailure("root_owned_file_diagnostic_binding_invalid")
+
+    def reject(phase: str, component: str, failure_class: str,
+               observed: dict[str, Any] | None = None) -> None:
+        details: dict[str, Any] = {}
+        if diagnostic_id is not None:
+            details["trust_file_diagnostics"] = {
+                "path_id": diagnostic_id,
+                "phase": phase,
+                "component": component,
+                "failure_class": failure_class,
+                **({"observed": observed} if observed is not None else {}),
+            }
+        raise SetupFailure(failure_code, details=details)
+
+    def errno_class(exc: OSError) -> str:
+        if exc.errno == errno.ENOENT:
+            return "missing"
+        if exc.errno == errno.ENOTDIR:
+            return "not_directory"
+        if exc.errno == errno.ELOOP:
+            return "symlink_disallowed_or_loop"
+        if exc.errno in {errno.EACCES, errno.EPERM}:
+            return "permission_denied"
+        if exc.errno in {errno.EIO, getattr(errno, "ESTALE", -1)}:
+            return "io_or_stale_error"
+        return "filesystem_error"
+
+    def summarize(st: os.stat_result, *, directory: bool) -> dict[str, Any]:
+        mode = st.st_mode
+        if stat.S_ISDIR(mode):
+            object_type = "directory"
+        elif stat.S_ISREG(mode):
+            object_type = "regular_file"
+        elif stat.S_ISLNK(mode):
+            object_type = "symlink"
+        else:
+            object_type = "other"
+        result: dict[str, Any] = {
+            "object_type": object_type,
+            "owner": "root" if st.st_uid == 0 else "non_root",
+            "group": "root" if st.st_gid == 0 else "non_root",
+            "group_writable": bool(mode & stat.S_IWGRP),
+            "world_writable": bool(mode & stat.S_IWOTH),
+        }
+        if not directory:
+            if st.st_size == 0:
+                result["size_class"] = "empty"
+            elif st.st_size > limit:
+                result["size_class"] = "over_limit"
+            else:
+                result["size_class"] = "within_limit"
+        return result
+
     current = Path("/")
-    try:
-        for part in path.parts[1:-1]:
-            current = current / part
+    parent_labels = diagnostic_spec[1][:-1] if diagnostic_spec else ()
+    for index, part in enumerate(path.parts[1:-1]):
+        current = current / part
+        component = (parent_labels[index] if index < len(parent_labels) else "parent")
+        try:
             parent = current.lstat()
-            if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
-                    or parent.st_uid != 0 or parent.st_mode & 0o022):
-                raise SetupFailure(failure_code)
+        except OSError as exc:
+            if missing_ok and exc.errno == errno.ENOENT:
+                return None
+            reject("parent_lstat", component, errno_class(exc))
+        observed_parent = summarize(parent, directory=True)
+        if stat.S_ISLNK(parent.st_mode):
+            reject("parent_lstat", component, "symlink_disallowed", observed_parent)
+        if not stat.S_ISDIR(parent.st_mode):
+            reject("parent_lstat", component, "not_directory", observed_parent)
+        if parent.st_uid != 0:
+            reject("parent_lstat", component, "non_root_owner", observed_parent)
+        if parent.st_mode & 0o022:
+            reject("parent_lstat", component, "writable_parent", observed_parent)
+
+    try:
         before = path.lstat()
-        if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
-                or before.st_uid != 0 or before.st_gid != 0 or before.st_mode & 0o022
-                or before.st_size > limit):
-            raise SetupFailure(failure_code)
-        if not hasattr(os, "O_NOFOLLOW"):
-            raise SetupFailure(failure_code)
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    except OSError as exc:
+        if missing_ok and exc.errno == errno.ENOENT:
+            return None
+        reject("file_lstat", "file", errno_class(exc))
+    observed_file = summarize(before, directory=False)
+    if stat.S_ISLNK(before.st_mode):
+        reject("file_lstat", "file", "symlink_disallowed", observed_file)
+    if not stat.S_ISREG(before.st_mode):
+        reject("file_lstat", "file", "not_regular_file", observed_file)
+    if before.st_uid != 0:
+        reject("file_lstat", "file", "non_root_owner", observed_file)
+    if before.st_gid != 0:
+        reject("file_lstat", "file", "non_root_group", observed_file)
+    if before.st_mode & 0o022:
+        reject("file_lstat", "file", "writable_file", observed_file)
+    if before.st_size > limit:
+        reject("file_lstat", "file", "file_over_limit", observed_file)
+    if not hasattr(os, "O_NOFOLLOW"):
+        reject("file_open", "file", "nofollow_unsupported", observed_file)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    try:
         descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        reject("file_open", "file", errno_class(exc), observed_file)
+    try:
         try:
             opened = os.fstat(descriptor)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0
-                    or opened.st_gid != 0 or opened.st_mode & 0o022
-                    or (opened.st_dev, opened.st_ino) !=
-                    (before.st_dev, before.st_ino)):
-                raise SetupFailure(failure_code)
-            chunks: list[bytes] = []
-            remaining = limit + 1
-            while remaining:
+        except OSError as exc:
+            reject("descriptor_stat", "file", errno_class(exc), observed_file)
+        observed_opened = summarize(opened, directory=False)
+        if not stat.S_ISREG(opened.st_mode):
+            reject("descriptor_stat", "file", "not_regular_file", observed_opened)
+        if opened.st_uid != 0:
+            reject("descriptor_stat", "file", "non_root_owner", observed_opened)
+        if opened.st_gid != 0:
+            reject("descriptor_stat", "file", "non_root_group", observed_opened)
+        if opened.st_mode & 0o022:
+            reject("descriptor_stat", "file", "writable_file", observed_opened)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            reject("descriptor_stat", "file", "path_replaced_before_open", observed_opened)
+        if opened.st_size > limit:
+            reject("descriptor_stat", "file", "file_over_limit", observed_opened)
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            try:
                 chunk = os.read(descriptor, min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            data = b"".join(chunks)
+            except OSError as exc:
+                reject("file_read", "file", errno_class(exc), observed_opened)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        try:
             after = os.fstat(descriptor)
-            if (len(data) > limit or (opened.st_dev, opened.st_ino, opened.st_size,
-                                     opened.st_mtime_ns, opened.st_ctime_ns, opened.st_uid,
-                                     opened.st_gid, opened.st_mode) !=
-                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
-                     after.st_ctime_ns, after.st_uid, after.st_gid, after.st_mode)):
-                raise SetupFailure(failure_code)
-            return data
-        finally:
+        except OSError as exc:
+            reject("descriptor_recheck", "file", errno_class(exc), observed_opened)
+        observed_after = summarize(after, directory=False)
+        if len(data) > limit:
+            reject("file_read", "file", "file_over_limit", observed_after)
+        if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+             opened.st_ctime_ns, opened.st_uid, opened.st_gid, opened.st_mode)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                    after.st_ctime_ns, after.st_uid, after.st_gid, after.st_mode)):
+            reject("descriptor_recheck", "file", "file_changed_during_read", observed_after)
+        return data
+    finally:
+        close_failed = sys.exc_info()[0] is None
+        try:
             os.close(descriptor)
-    except SetupFailure:
-        raise
-    except FileNotFoundError as exc:
-        if missing_ok:
-            return None
-        raise SetupFailure(failure_code) from exc
-    except OSError as exc:
-        raise SetupFailure(failure_code) from exc
+        except OSError as exc:
+            if close_failed:
+                observed = locals().get("observed_after", locals().get("observed_opened"))
+                reject("descriptor_close", "file", errno_class(exc), observed)
 
 
 def _runner_mirror_configuration() -> dict[str, Any]:
@@ -652,7 +763,8 @@ def _runner_mirror_configuration() -> dict[str, Any]:
     evidence = _validate_runner_mirror_configuration(source_file, mirrorlist)
     keyring = _read_root_owned_file(
         UBUNTU_ARCHIVE_KEYRING, limit=1024 * 1024,
-        failure_code="ubuntu_archive_keyring_unavailable")
+        failure_code="ubuntu_archive_keyring_unavailable",
+        diagnostic_id="ubuntu_archive_keyring")
     if not keyring:
         raise SetupFailure("ubuntu_archive_keyring_unverified")
     if _owner_of(str(UBUNTU_ARCHIVE_KEYRING)) != "ubuntu-keyring":
@@ -1613,15 +1725,19 @@ def prepare(evidence_path: Path) -> int:
             apt_command = exc.details.get("apt_command")
             if apt_command:
                 report["apt_command_diagnostics"] = apt_command
+            trust_file = exc.details.get("trust_file_diagnostics")
+            if trust_file:
+                report["trust_file_diagnostics"] = trust_file
             candidate = {key: value for key, value in exc.details.items()
-                         if key != "apt_command"}
+                         if key not in {"apt_command", "trust_file_diagnostics"}}
             if candidate:
                 report["candidate_diagnostics"] = candidate
         report["status"] = "blocked"
         _write_json(evidence_path, report)
         print("native profile setup blocked: " + exc.code, file=sys.stderr)
         diagnostic = {key: report[key] for key in
-                      ("apt_command_diagnostics", "candidate_diagnostics") if key in report}
+                      ("apt_command_diagnostics", "candidate_diagnostics",
+                       "trust_file_diagnostics") if key in report}
         output = {"status": report["status"], "stage": report["stage"],
                   "failure_code": exc.code, "artifact": str(evidence_path)}
         if diagnostic:

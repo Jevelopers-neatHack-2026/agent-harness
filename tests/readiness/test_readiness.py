@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import base64
 import copy
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import hashlib
 import io
 import itertools
@@ -1419,6 +1419,151 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                                             "synthetic_trust_file_rejected"):
                     profile_setup._read_root_owned_file(
                         target, limit=64, failure_code="synthetic_trust_file_rejected")
+
+    def test_native_profile_setup_classifies_fixed_keyring_read_failures_without_paths(self) -> None:
+        keyring = profile_setup.UBUNTU_ARCHIVE_KEYRING
+        expected_parents = {
+            "/usr": SimpleNamespace(st_mode=profile_setup.stat.S_IFDIR | 0o755, st_uid=0,
+                                     st_gid=0, st_size=0),
+            "/usr/share": SimpleNamespace(st_mode=profile_setup.stat.S_IFDIR | 0o755, st_uid=0,
+                                           st_gid=0, st_size=0),
+            "/usr/share/keyrings": SimpleNamespace(
+                st_mode=profile_setup.stat.S_IFDIR | 0o755, st_uid=0, st_gid=0, st_size=0),
+        }
+        regular_file = SimpleNamespace(
+            st_mode=profile_setup.stat.S_IFREG | 0o644, st_uid=0, st_gid=0,
+            st_size=128, st_dev=1, st_ino=2, st_mtime_ns=3, st_ctime_ns=4,
+        )
+        symlink_file = SimpleNamespace(
+            st_mode=profile_setup.stat.S_IFLNK | 0o777, st_uid=0, st_gid=0,
+            st_size=128, st_dev=1, st_ino=2, st_mtime_ns=3, st_ctime_ns=4,
+        )
+
+        def read_with(final_stat=None, *, missing=False, open_error=None):
+            def fake_lstat(path):
+                if str(path) in expected_parents:
+                    return expected_parents[str(path)]
+                if path == keyring:
+                    if missing:
+                        raise FileNotFoundError(profile_setup.errno.ENOENT, "private path detail")
+                    return final_stat
+                raise AssertionError("unexpected stat path")
+
+            with mock.patch.object(Path, "lstat", new=fake_lstat):
+                if open_error is None:
+                    return profile_setup._read_root_owned_file(
+                        keyring, limit=1024 * 1024,
+                        failure_code="ubuntu_archive_keyring_unavailable",
+                        diagnostic_id="ubuntu_archive_keyring")
+                with mock.patch.object(profile_setup.os, "open", side_effect=open_error):
+                    return profile_setup._read_root_owned_file(
+                        keyring, limit=1024 * 1024,
+                        failure_code="ubuntu_archive_keyring_unavailable",
+                        diagnostic_id="ubuntu_archive_keyring")
+
+        for case, kwargs, expected_phase, expected_component, expected_class in (
+            ("missing", {"missing": True}, "file_lstat", "file", "missing"),
+            ("symlink", {"final_stat": symlink_file}, "file_lstat", "file",
+             "symlink_disallowed"),
+            ("permission", {"final_stat": regular_file,
+                            "open_error": PermissionError(profile_setup.errno.EACCES,
+                                                           "private path detail")},
+             "file_open", "file", "permission_denied"),
+        ):
+            with self.subTest(case=case), self.assertRaises(profile_setup.SetupFailure) as raised:
+                read_with(**kwargs)
+            self.assertEqual(raised.exception.code, "ubuntu_archive_keyring_unavailable")
+            diagnostic = raised.exception.details["trust_file_diagnostics"]
+            self.assertEqual(diagnostic["path_id"], "ubuntu_archive_keyring")
+            self.assertEqual(diagnostic["phase"], expected_phase)
+            self.assertEqual(diagnostic["component"], expected_component)
+            self.assertEqual(diagnostic["failure_class"], expected_class)
+            rendered = json.dumps(diagnostic, sort_keys=True)
+            self.assertNotIn("/usr/share/keyrings", rendered)
+            self.assertNotIn("ubuntu-archive-keyring.gpg", rendered)
+            self.assertNotIn("private path detail", rendered)
+
+    def test_native_profile_setup_classifies_keyring_parent_custody_rejection(self) -> None:
+        keyring = profile_setup.UBUNTU_ARCHIVE_KEYRING
+        def fake_lstat(path):
+            if str(path) == "/usr":
+                return SimpleNamespace(st_mode=profile_setup.stat.S_IFDIR | 0o755,
+                                       st_uid=0, st_gid=0, st_size=0)
+            if str(path) == "/usr/share":
+                return SimpleNamespace(st_mode=profile_setup.stat.S_IFDIR | 0o755,
+                                       st_uid=0, st_gid=0, st_size=0)
+            if str(path) == "/usr/share/keyrings":
+                return SimpleNamespace(st_mode=profile_setup.stat.S_IFLNK | 0o777,
+                                       st_uid=0, st_gid=0, st_size=0)
+            raise AssertionError("keyring file must not be read after parent rejection")
+
+        with mock.patch.object(Path, "lstat", new=fake_lstat):
+            with self.assertRaises(profile_setup.SetupFailure) as raised:
+                profile_setup._read_root_owned_file(
+                    keyring, limit=1024 * 1024,
+                    failure_code="ubuntu_archive_keyring_unavailable",
+                    diagnostic_id="ubuntu_archive_keyring")
+        self.assertEqual(raised.exception.details["trust_file_diagnostics"], {
+            "path_id": "ubuntu_archive_keyring",
+            "phase": "parent_lstat",
+            "component": "keyrings",
+            "failure_class": "symlink_disallowed",
+            "observed": {
+                "object_type": "symlink", "owner": "root", "group": "root",
+                "group_writable": True, "world_writable": True,
+            },
+        })
+
+    def test_native_profile_setup_publishes_only_sanitized_keyring_failure_diagnostics(self) -> None:
+        diagnostic = {
+            "path_id": "ubuntu_archive_keyring",
+            "phase": "file_lstat",
+            "component": "file",
+            "failure_class": "missing",
+        }
+        original_read_text = Path.read_text
+
+        def fake_read_text(path, *args, **kwargs):
+            if path == Path("/etc/os-release"):
+                return "ID=ubuntu\nVERSION_ID=24.04\n"
+            return original_read_text(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="acv1-keyring-evidence-") as temporary:
+            evidence_path = Path(temporary) / "profile-provenance.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    profile_setup.platform, "system", return_value="Linux"))
+                stack.enter_context(mock.patch.object(
+                    profile_setup.platform, "machine", return_value="x86_64"))
+                stack.enter_context(mock.patch.object(Path, "read_text", new=fake_read_text))
+                stack.enter_context(mock.patch.object(
+                    profile_setup, "_apt_toolchain_evidence", return_value={}))
+                stack.enter_context(mock.patch.object(
+                    profile_setup, "_state_snapshot", return_value={}))
+                stack.enter_context(mock.patch.object(
+                    profile_setup, "_public_state", return_value={}))
+                stack.enter_context(mock.patch.object(
+                    profile_setup, "_apt_signature_configuration", return_value={}))
+                stack.enter_context(mock.patch.object(
+                    profile_setup, "_runner_mirror_configuration",
+                    side_effect=profile_setup.SetupFailure(
+                        "ubuntu_archive_keyring_unavailable",
+                        details={"trust_file_diagnostics": diagnostic})))
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = profile_setup.prepare(evidence_path)
+
+            artifact = json.loads(evidence_path.read_text(encoding="utf-8"))
+            console = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(artifact["failure_code"], "ubuntu_archive_keyring_unavailable")
+        self.assertEqual(artifact["trust_file_diagnostics"], diagnostic)
+        self.assertEqual(console["diagnostics"]["trust_file_diagnostics"], diagnostic)
+        rendered = json.dumps({"artifact": artifact, "console": console}, sort_keys=True)
+        self.assertNotIn("/usr/share/keyrings", rendered)
+        self.assertNotIn("ubuntu-archive-keyring.gpg", rendered)
+        self.assertNotIn("key bytes", rendered)
 
     def test_native_profile_setup_binds_candidate_to_authenticated_apt_release_target(self) -> None:
         transport = synthetic_apt_transport()
