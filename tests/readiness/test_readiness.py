@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import base64
 import copy
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import io
 import json
 import os
 import platform
@@ -15,6 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -935,11 +938,114 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(parsed["APT-Sources"],
                          "https://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
         self.assertEqual(command.call_args_list[0].args[0], [
-            "apt-cache", "-f", "-o", "APT::Cache::Show::Version=1", "show",
+            "apt-cache", "-o", "APT::Cache::ShowFull=true",
+            "-o", "APT::Cache::Show::Version=1", "show",
             "apparmor-profiles=4.0.1really4.0.1-0ubuntu0.24.04.8"])
         self.assertEqual(command.call_args_list[1].args[0], [
-            "apt-cache", "-f", "-o", "APT::Cache::Show::Version=2", "show",
+            "apt-cache", "-o", "APT::Cache::ShowFull=true",
+            "-o", "APT::Cache::Show::Version=2", "show",
             "apparmor-profiles=4.0.1really4.0.1-0ubuntu0.24.04.8"])
+        self.assertEqual(command.call_args_list[0].kwargs["apt_phase"], "metadata_v1")
+        self.assertEqual(command.call_args_list[1].kwargs["apt_phase"], "source_v2")
+        self.assertNotIn("-f", command.call_args_list[0].args[0])
+        self.assertNotIn("-f", command.call_args_list[1].args[0])
+
+    def test_native_profile_setup_classifies_apt_command_failures_without_raw_output(self) -> None:
+        cases = (
+            (b"E: Command line option 'f' [from -f] is not understood in this command", "unsupported_option"),
+            (b"E: No packages found matching bubblewrap=stale-version", "pinned_package_or_version_unavailable"),
+            (b"W: Failed to fetch https://user:secret@mirror.invalid/private/Packages", "apt_cache_or_index_infrastructure_failure"),
+            (b"APT failed with an unrecognized condition", "unclassified_apt_cache_failure"),
+        )
+        for stderr, expected_category in cases:
+            with self.subTest(expected_category=expected_category), \
+                    mock.patch.object(profile_setup.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=100, stdout=b"private package record", stderr=stderr)):
+                with self.assertRaises(profile_setup.SetupFailure) as raised:
+                    profile_setup._command(
+                        ["apt-cache", "fixed", "arguments"], apt_phase="source_v2")
+            self.assertEqual(raised.exception.code, "command_failed")
+            diagnostic = raised.exception.details["apt_command"]
+            self.assertEqual(diagnostic["tool"], "apt-cache")
+            self.assertEqual(diagnostic["phase"], "source_v2")
+            self.assertEqual(diagnostic["failure_kind"], "nonzero_exit")
+            self.assertEqual(diagnostic["return_code"], 100)
+            self.assertEqual(diagnostic["error_category"], expected_category)
+            serialized = json.dumps(diagnostic, sort_keys=True)
+            self.assertNotIn("secret", serialized)
+            self.assertNotIn("private", serialized)
+            self.assertNotIn("mirror.invalid", serialized)
+            self.assertNotIn(stderr.decode(), serialized)
+
+    def test_native_profile_setup_preserves_source_command_phase_with_candidate_shape(self) -> None:
+        metadata = (
+            "Package: apparmor-profiles\n"
+            "Version: 4.0.1really4.0.1-0ubuntu0.24.04.8\n"
+            "Architecture: all\n"
+            "Filename: pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.8_all.deb\n"
+            "SHA256: 4e7d728322f899a7a06e71bedd4f4bd1f20c21f0b3361120f34cf5c0feec849e\n"
+        )
+        failure = profile_setup.SetupFailure("command_failed", details={
+            "apt_command": profile_setup._apt_command_diagnostics(
+                "source_v2", "nonzero_exit", return_code=100,
+                error_category="apt_cache_or_index_infrastructure_failure",
+                stderr_bytes=91),
+        })
+        with mock.patch.object(profile_setup, "_command", side_effect=[
+                (metadata.encode(), b""), failure]):
+            with self.assertRaises(profile_setup.SetupFailure) as raised:
+                profile_setup._package_record(
+                    profile_setup.PROFILE_PACKAGE, profile_setup.PROFILE_VERSION,
+                    profile_setup.PROFILE_DEB_SHA256)
+        self.assertEqual(raised.exception.details["apt_command"]["phase"], "source_v2")
+        self.assertEqual(raised.exception.details["metadata_record"]["exact_candidate_count"], 1)
+        serialized = json.dumps(raised.exception.details)
+        self.assertNotIn("Failed to fetch", serialized)
+        self.assertNotIn("mirror.invalid", serialized)
+
+    def test_native_profile_setup_publishes_only_sanitized_apt_failure_diagnostic(self) -> None:
+        state = {
+            "apparmor_enabled": "Y", "kernel_lsm": "apparmor", "sysctls": {},
+            "profile_count": 1, "profile_table_sha256": "a" * 64, "profile_table": [],
+        }
+        failure = profile_setup.SetupFailure("command_failed", details={
+            "apt_command": profile_setup._apt_command_diagnostics(
+                "metadata_v1", "nonzero_exit", return_code=100,
+                error_category="unsupported_option", stderr_bytes=96),
+        })
+        original_read_text = Path.read_text
+
+        def read_text(path: Path, *args, **kwargs):
+            if path == Path("/etc/os-release"):
+                return 'ID=ubuntu\nVERSION_ID="24.04"\n'
+            return original_read_text(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="acv1-apt-diagnostic-") as temporary, \
+                mock.patch.object(profile_setup.platform, "system", return_value="Linux"), \
+                mock.patch.object(profile_setup.platform, "machine", return_value="x86_64"), \
+                mock.patch.object(Path, "read_text", autospec=True, side_effect=read_text), \
+                mock.patch.object(profile_setup, "_state_snapshot", return_value=state), \
+                mock.patch.object(profile_setup, "_apt_signature_configuration", return_value={
+                    "signed_repository_checks_enabled": True, "unsafe_overrides": []}), \
+                mock.patch.object(profile_setup, "_quiet_command"), \
+                mock.patch.object(profile_setup, "_package_record", side_effect=failure), \
+                redirect_stdout(io.StringIO()) as captured, \
+                redirect_stderr(io.StringIO()) as captured_error:
+            evidence_path = Path(temporary) / "profile-evidence.json"
+            exit_code = profile_setup.prepare(evidence_path)
+            stdout = captured.getvalue()
+            stderr = captured_error.getvalue()
+            artifact = json.loads(evidence_path.read_text(encoding="utf-8"))
+        logged = json.loads(stdout)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(artifact["status"], "blocked")
+        self.assertEqual(artifact["stage"], "bubblewrap_package_record")
+        self.assertEqual(artifact["apt_command_diagnostics"]["phase"], "metadata_v1")
+        self.assertEqual(artifact["apt_command_diagnostics"]["return_code"], 100)
+        self.assertEqual(logged["diagnostics"]["apt_command_diagnostics"]["error_category"],
+                         "unsupported_option")
+        self.assertEqual(stderr, "native profile setup blocked: command_failed\n")
+        self.assertLessEqual(len(stdout.encode("utf-8")), 4096)
 
     def test_native_profile_setup_keeps_sanitized_diagnostics_when_source_is_unrecognized(self) -> None:
         metadata = (

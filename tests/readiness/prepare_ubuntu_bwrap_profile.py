@@ -27,6 +27,8 @@ BWRAP_VERSION = "0.9.0-1ubuntu0.3"
 INSTALLED_PROFILE = Path("/run/acv1-native-profile/bwrap-userns-restrict")
 APPARMOR_PROFILES = Path("/sys/kernel/security/apparmor/profiles")
 PROFILE_TABLE_MAX_BYTES = 128 * 1024
+APT_CACHE_FAILURE_PHASES = frozenset({"metadata_v1", "source_v2"})
+APT_CACHE_DIAGNOSTIC_BYTES = 8 * 1024
 LOCAL_OVERRIDES = (
     Path("/etc/apparmor.d/local/bwrap-userns-restrict"),
     Path("/etc/apparmor.d/local/unpriv_bwrap"),
@@ -46,6 +48,43 @@ class SetupFailure(Exception):
         self.details = details or {}
 
 
+def _apt_cache_error_category(stderr: bytes) -> str:
+    """Classify a bounded APT diagnostic without returning its contents."""
+    text = stderr[:APT_CACHE_DIAGNOSTIC_BYTES].decode("utf-8", "replace").lower()
+    if any(marker in text for marker in (
+            "not understood", "unknown option", "invalid option", "unrecognized option")):
+        return "unsupported_option"
+    if any(marker in text for marker in (
+            "no packages found", "unable to locate package", "version "
+            "was not found", "couldn't find any package")):
+        return "pinned_package_or_version_unavailable"
+    if any(marker in text for marker in (
+            "could not open file", "cannot open", "failed to fetch", "some index files failed",
+            "hash sum mismatch", "temporary failure resolving", "cache file is corrupted",
+            "could not get lock", "unable to acquire the dpkg frontend lock")):
+        return "apt_cache_or_index_infrastructure_failure"
+    return "unclassified_apt_cache_failure"
+
+
+def _apt_command_diagnostics(phase: str, failure_kind: str, *, return_code: int | None = None,
+                             error_category: str | None = None, stdout_bytes: int = 0,
+                             stderr_bytes: int = 0) -> dict[str, Any]:
+    if phase not in APT_CACHE_FAILURE_PHASES:
+        raise SetupFailure("apt_cache_command_phase_invalid")
+    result: dict[str, Any] = {
+        "tool": "apt-cache",
+        "phase": phase,
+        "failure_kind": failure_kind,
+        "stdout_bytes_capped": min(max(stdout_bytes, 0), 128 * 1024 + 1),
+        "stderr_bytes_capped": min(max(stderr_bytes, 0), APT_CACHE_DIAGNOSTIC_BYTES + 1),
+    }
+    if return_code is not None:
+        result["return_code"] = max(-255, min(return_code, 255))
+    if error_category is not None:
+        result["error_category"] = error_category
+    return result
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
@@ -55,17 +94,36 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _command(args: list[str], *, timeout: float = 20, limit: int = 128 * 1024,
-             cwd: Path | None = None) -> tuple[bytes, bytes]:
+             cwd: Path | None = None, apt_phase: str | None = None) -> tuple[bytes, bytes]:
+    if apt_phase is not None and apt_phase not in APT_CACHE_FAILURE_PHASES:
+        raise SetupFailure("apt_cache_command_phase_invalid")
     try:
         result = subprocess.run(args, cwd=cwd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 check=False, timeout=timeout, close_fds=True)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SetupFailure("command_unavailable_or_timed_out") from exc
+    except OSError as exc:
+        details = ({"apt_command": _apt_command_diagnostics(
+            apt_phase, "launch_failed", error_category="apt_cache_executable_unavailable")}
+                   if apt_phase else None)
+        raise SetupFailure("command_unavailable_or_timed_out", details=details) from exc
+    except subprocess.TimeoutExpired as exc:
+        details = ({"apt_command": _apt_command_diagnostics(
+            apt_phase, "timed_out", error_category="apt_cache_command_timed_out")}
+                   if apt_phase else None)
+        raise SetupFailure("command_unavailable_or_timed_out", details=details) from exc
     if len(result.stdout) > limit or len(result.stderr) > 8 * 1024:
-        raise SetupFailure("command_output_exceeded_bound")
+        details = ({"apt_command": _apt_command_diagnostics(
+            apt_phase, "output_limit_exceeded", error_category="apt_cache_output_limit_exceeded",
+            stdout_bytes=len(result.stdout), stderr_bytes=len(result.stderr))}
+                   if apt_phase else None)
+        raise SetupFailure("command_output_exceeded_bound", details=details)
     if result.returncode != 0:
-        raise SetupFailure("command_failed")
+        details = ({"apt_command": _apt_command_diagnostics(
+            apt_phase, "nonzero_exit", return_code=result.returncode,
+            error_category=_apt_cache_error_category(result.stderr),
+            stdout_bytes=len(result.stdout), stderr_bytes=len(result.stderr))}
+                   if apt_phase else None)
+        raise SetupFailure("command_failed", details=details)
     return result.stdout, result.stderr
 
 
@@ -238,17 +296,26 @@ def validate_apt_record(text: str, package: str, version: str,
 def _package_record(package: str, version: str, sha256: str) -> dict[str, str]:
     # APT's default show format (v1) preserves the package-index fields we pin,
     # but does not synthesize APT-Sources. Request v2 separately for provenance.
-    output, _ = _command(["apt-cache", "-f", "-o", "APT::Cache::Show::Version=1",
-                          "show", package + "=" + version], limit=128 * 1024)
+    # In APT 2.7.14, -f/--full is registered only for `search`; `show` gets the
+    # same full-record behavior through the generic configuration option.
+    output, _ = _command(["apt-cache", "-o", "APT::Cache::ShowFull=true",
+                          "-o", "APT::Cache::Show::Version=1", "show",
+                          package + "=" + version], limit=128 * 1024,
+                         apt_phase="metadata_v1")
     try:
         text = output.decode("utf-8")
     except UnicodeError as exc:
         raise SetupFailure("signed_apt_package_record_encoding_invalid") from exc
     try:
-        source_output, _ = _command(["apt-cache", "-f", "-o", "APT::Cache::Show::Version=2",
-                                     "show", package + "=" + version], limit=128 * 1024)
+        source_output, _ = _command(["apt-cache", "-o", "APT::Cache::ShowFull=true",
+                                     "-o", "APT::Cache::Show::Version=2", "show",
+                                     package + "=" + version], limit=128 * 1024,
+                                    apt_phase="source_v2")
     except SetupFailure as exc:
-        exc.details = _candidate_record_diagnostics(text, None, package, version)
+        diagnostics = _candidate_record_diagnostics(text, None, package, version)
+        if exc.details.get("apt_command"):
+            diagnostics["apt_command"] = exc.details["apt_command"]
+        exc.details = diagnostics
         raise
     try:
         source_text = source_output.decode("utf-8")
@@ -634,13 +701,23 @@ def prepare(evidence_path: Path) -> int:
     except SetupFailure as exc:
         report["failure_code"] = exc.code
         if exc.details:
-            report["candidate_diagnostics"] = exc.details
+            apt_command = exc.details.get("apt_command")
+            if apt_command:
+                report["apt_command_diagnostics"] = apt_command
+            candidate = {key: value for key, value in exc.details.items()
+                         if key != "apt_command"}
+            if candidate:
+                report["candidate_diagnostics"] = candidate
         report["status"] = "blocked"
         _write_json(evidence_path, report)
         print("native profile setup blocked: " + exc.code, file=sys.stderr)
-        print(json.dumps({"status": report["status"], "stage": report["stage"],
-                          "failure_code": exc.code, "artifact": str(evidence_path)},
-                         sort_keys=True, separators=(",", ":")))
+        diagnostic = {key: report[key] for key in
+                      ("apt_command_diagnostics", "candidate_diagnostics") if key in report}
+        output = {"status": report["status"], "stage": report["stage"],
+                  "failure_code": exc.code, "artifact": str(evidence_path)}
+        if diagnostic:
+            output["diagnostics"] = diagnostic
+        print(json.dumps(output, sort_keys=True, separators=(",", ":")))
         return 1
     except Exception:
         report["failure_code"] = "unexpected_setup_error"
