@@ -32,15 +32,57 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install bubblewrap from the Ubuntu runner package repository
+      - name: Install bubblewrap and the Ubuntu confined user namespace profile
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
-      - name: Verify required Linux sandbox runtime
+          sudo apt-get install --no-install-recommends --yes apparmor apparmor-profiles bubblewrap
+      - name: Load and verify Ubuntu's restricted bubblewrap profile
+        shell: bash
         run: |
+          set -euo pipefail
           python3 --version
           command -v bwrap
           bwrap --version
+          bwrap_path=$(readlink -f "$(command -v bwrap)")
+          if [[ "$bwrap_path" != "/usr/bin/bwrap" ]]; then
+            echo "::error::The packaged AppArmor policy only covers /usr/bin/bwrap; refusing a different executable path."
+            exit 1
+          fi
+          command -v apparmor_parser
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          if [[ ! -r "$profile" ]] || ! dpkg-query -S "$profile" | grep -q '^apparmor-profiles:'; then
+            echo "::error::The Ubuntu apparmor-profiles package did not provide its bwrap-userns-restrict policy."
+            exit 1
+          fi
+          for local_override in /etc/apparmor.d/local/bwrap-userns-restrict /etc/apparmor.d/local/unpriv_bwrap; do
+            if [[ -e "$local_override" || -L "$local_override" ]]; then
+              echo "::error::Refusing an unreviewed local override of the Ubuntu bubblewrap confinement policy."
+              exit 1
+            fi
+          done
+          if [[ ! -r /sys/kernel/security/apparmor/profiles ]]; then
+            echo "::error::The runner does not expose the AppArmor profile status interface."
+            exit 1
+          fi
+          sudo apparmor_parser -r "$profile"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          required = {"bwrap", "unpriv_bwrap"}
+          loaded = {}
+          for line in Path("/sys/kernel/security/apparmor/profiles").read_text(encoding="utf-8").splitlines():
+              try:
+                  name, mode = line.rsplit(" ", 1)
+              except ValueError:
+                  continue
+              if name in required:
+                  loaded[name] = mode.strip("()")
+          if loaded != {name: "enforce" for name in required}:
+              raise SystemExit("Required Ubuntu bubblewrap profiles are not both loaded in enforce mode.")
+          print(json.dumps({"status": "ubuntu_bwrap_restricted_profile_loaded",
+                            "profiles": dict(sorted(loaded.items()))}, sort_keys=True,
+                           separators=(",", ":")))
+          PY
       - name: Run standalone readiness checker tests without skips
         env:
           ACV1_REQUIRE_BWRAP: "1"
@@ -107,10 +149,56 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install bubblewrap from the Ubuntu runner package repository
+      - name: Install bubblewrap and the Ubuntu confined user namespace profile
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
+          sudo apt-get install --no-install-recommends --yes apparmor apparmor-profiles bubblewrap
+      - name: Load and verify Ubuntu's restricted bubblewrap profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v bwrap
+          bwrap --version
+          bwrap_path=$(readlink -f "$(command -v bwrap)")
+          if [[ "$bwrap_path" != "/usr/bin/bwrap" ]]; then
+            echo "::error::The packaged AppArmor policy only covers /usr/bin/bwrap; refusing a different executable path."
+            exit 1
+          fi
+          command -v apparmor_parser
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          if [[ ! -r "$profile" ]] || ! dpkg-query -S "$profile" | grep -q '^apparmor-profiles:'; then
+            echo "::error::The Ubuntu apparmor-profiles package did not provide its bwrap-userns-restrict policy."
+            exit 1
+          fi
+          for local_override in /etc/apparmor.d/local/bwrap-userns-restrict /etc/apparmor.d/local/unpriv_bwrap; do
+            if [[ -e "$local_override" || -L "$local_override" ]]; then
+              echo "::error::Refusing an unreviewed local override of the Ubuntu bubblewrap confinement policy."
+              exit 1
+            fi
+          done
+          if [[ ! -r /sys/kernel/security/apparmor/profiles ]]; then
+            echo "::error::The runner does not expose the AppArmor profile status interface."
+            exit 1
+          fi
+          sudo apparmor_parser -r "$profile"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          required = {"bwrap", "unpriv_bwrap"}
+          loaded = {}
+          for line in Path("/sys/kernel/security/apparmor/profiles").read_text(encoding="utf-8").splitlines():
+              try:
+                  name, mode = line.rsplit(" ", 1)
+              except ValueError:
+                  continue
+              if name in required:
+                  loaded[name] = mode.strip("()")
+          if loaded != {name: "enforce" for name in required}:
+              raise SystemExit("Required Ubuntu bubblewrap profiles are not both loaded in enforce mode.")
+          print(json.dumps({"status": "ubuntu_bwrap_restricted_profile_loaded",
+                            "profiles": dict(sorted(loaded.items()))}, sort_keys=True,
+                           separators=(",", ":")))
+          PY
       - name: Require Linux bubblewrap filesystem, network, and descendant canaries
         run: python3 tests/readiness/classify_ci_gates.py --gate sandbox --output "$RUNNER_TEMP/sandbox-canaries.json"
       - name: Publish real synthetic sandbox canary evidence

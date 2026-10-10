@@ -853,6 +853,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="acv1-sandbox-diagnostic-") as temp, \
                 mock.patch.object(contracts.shutil, "which", return_value="/usr/bin/bwrap"), \
                 mock.patch.object(contracts.sys, "executable", "/usr/bin/python3"), \
+                mock.patch.object(contracts.os, "stat", return_value=mock.Mock(st_ino=42)), \
                 mock.patch.object(contracts, "run_bounded", return_value={
                     "ok": False, "code": "adapter_nonzero_exit", "returncode": 1,
                     "stdout": b"", "stderr": stderr,
@@ -866,6 +867,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("<path>", reason or "")
         self.assertNotIn("/home/runner", reason or "")
         self.assertLessEqual(len(reason or ""), 640)
+        loopback_category, loopback_excerpt = contracts._sandbox_stderr_summary(
+            b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted")
+        self.assertEqual(loopback_category, "network_namespace_loopback_setup_denied")
+        self.assertIn("RTM_NEWADDR", loopback_excerpt)
 
     def test_sandbox_command_imports_only_declared_sealed_dependency_root(self) -> None:
         with tempfile.TemporaryDirectory(prefix="acv1-dependency-import-root-") as temp, \

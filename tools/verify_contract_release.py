@@ -1253,6 +1253,8 @@ def _sandbox_stderr_summary(stderr: bytes) -> tuple[str, str]:
     normalized = text.lower()
     if "setting up uid map" in normalized or "uid map" in normalized:
         category = "user_namespace_mapping_failure"
+    elif "loopback" in normalized and "rtm_newaddr" in normalized and "operation not permitted" in normalized:
+        category = "network_namespace_loopback_setup_denied"
     elif "namespace" in normalized and "operation not permitted" in normalized:
         category = "namespace_operation_not_permitted"
     elif "operation not permitted" in normalized:
@@ -1294,7 +1296,9 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         run.get("stderr") if isinstance(run.get("stderr"), bytes) else b"")
     flags = {}
     if isinstance(report, dict):
-        for key in ("outside_read_blocked", "sandbox_shadow_write_succeeded", "network_blocked", "child_isolated"):
+        for key in ("outside_read_blocked", "sandbox_shadow_write_succeeded", "network_blocked",
+                    "network_namespace_isolated", "sandbox_exec_capabilities_dropped",
+                    "child_isolated", "child_capabilities_dropped"):
             flags[key] = report.get(key) is True
         child_code = report.get("child_exit_code")
         flags["child_exit_code"] = child_code if type(child_code) is int else "unavailable"
@@ -1332,39 +1336,59 @@ def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
                    "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8"])
     child_code = (
         "import socket,sys\n"
+        "def capabilities_are_empty():\n"
+        " try:\n"
+        "  status={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in open('/proc/self/status',encoding='ascii') if ':' in line}\n"
+        "  return all(name in status and int(status[name],16)==0 for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))\n"
+        " except (OSError,ValueError): return False\n"
         "read_blocked=False\n"
         "try: open(sys.argv[1],'rb').read()\n"
         "except OSError: read_blocked=True\n"
+        "network_namespace_isolated=(__import__('os').stat('/proc/self/ns/net').st_ino != int(sys.argv[2]))\n"
+        "capabilities_dropped=capabilities_are_empty()\n"
         "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2)\n"
         "try: s.connect(('198.18.0.1',9)); net_blocked=False\n"
         "except OSError: net_blocked=True\n"
-        "print('child-read-blocked='+str(read_blocked)+' child-network-blocked='+str(net_blocked))\n"
-        "sys.exit(0 if read_blocked and net_blocked else 7)\n"
+        "print('child-read-blocked='+str(read_blocked)+' child-network-blocked='+str(net_blocked)+' child-network-namespace-isolated='+str(network_namespace_isolated)+' child-capabilities-dropped='+str(capabilities_dropped))\n"
+        "sys.exit(0 if read_blocked and net_blocked and network_namespace_isolated and capabilities_dropped else 7)\n"
     )
     parent_code = (
         "import json,os,socket,subprocess,sys\n"
-        "r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_blocked':False,'child_isolated':False,'child_exit_code':None,'child_stderr_present':False,'child_stderr_class':'not_run'}\n"
+        "r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_blocked':False,'network_namespace_isolated':False,'sandbox_exec_capabilities_dropped':False,'child_isolated':False,'child_capabilities_dropped':False,'child_exit_code':None,'child_stderr_present':False,'child_stderr_class':'not_run'}\n"
+        "def capabilities_are_empty():\n"
+        " try:\n"
+        "  status={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in open('/proc/self/status',encoding='ascii') if ':' in line}\n"
+        "  return all(name in status and int(status[name],16)==0 for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))\n"
+        " except (OSError,ValueError): return False\n"
+        "host_network_namespace=int(sys.argv[3])\n"
+        "r['network_namespace_isolated']=(os.stat('/proc/self/ns/net').st_ino != host_network_namespace)\n"
+        "r['sandbox_exec_capabilities_dropped']=capabilities_are_empty()\n"
         "try: open(sys.argv[1],'rb').read()\n"
         "except OSError: r['outside_read_blocked']=True\n"
         "try:\n"
         " s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2); s.connect(('198.18.0.1',9))\n"
         "except OSError: r['network_blocked']=True\n"
-        "p=subprocess.run([sys.executable,'-I','-B','-S','-c',sys.argv[2],sys.argv[1]],capture_output=True,timeout=2)\n"
+        "p=subprocess.run([sys.executable,'-I','-B','-S','-c',sys.argv[2],sys.argv[1],sys.argv[3]],capture_output=True,timeout=2)\n"
         "r['child_exit_code']=p.returncode\n"
         "r['child_stderr_present']=bool(p.stderr)\n"
         "child_error=p.stderr.decode('utf-8','replace').lower()\n"
         "r['child_stderr_class']=('operation_not_permitted' if 'operation not permitted' in child_error else 'permission_denied' if 'permission denied' in child_error else 'missing_file' if 'no such file or directory' in child_error else 'python_dependency_import_failure' if 'modulenotfounderror' in child_error or 'no module named' in child_error else 'python_traceback' if 'traceback' in child_error else 'other' if child_error else 'empty')\n"
-        "r['child_isolated']=(p.returncode==0 and b'child-read-blocked=True child-network-blocked=True' in p.stdout)\n"
+        "r['child_isolated']=(p.returncode==0 and b'child-read-blocked=True child-network-blocked=True child-network-namespace-isolated=True child-capabilities-dropped=True' in p.stdout)\n"
+        "r['child_capabilities_dropped']=b'child-capabilities-dropped=True' in p.stdout\n"
         "try:\n"
         " os.makedirs(os.path.dirname(sys.argv[1]),exist_ok=True)\n"
         " with open(sys.argv[1],'wb') as f: f.write(b'sandbox-shadow-write')\n"
         " with open(sys.argv[1],'rb') as f: r['sandbox_shadow_write_succeeded']=(f.read()==b'sandbox-shadow-write')\n"
         "except OSError: pass\n"
         "print(json.dumps(r,sort_keys=True,separators=(',',':')))\n"
-        "sys.exit(0 if all(r[k] for k in ('outside_read_blocked','sandbox_shadow_write_succeeded','network_blocked','child_isolated')) else 8)\n"
+        "sys.exit(0 if all(r[k] for k in ('outside_read_blocked','sandbox_shadow_write_succeeded','network_blocked','network_namespace_isolated','sandbox_exec_capabilities_dropped','child_isolated','child_capabilities_dropped')) else 8)\n"
     )
+    try:
+        host_network_namespace = os.stat("/proc/self/ns/net").st_ino
+    except OSError:
+        return "The host network namespace identity cannot be inspected; no owner adapter is executed."
     command = prefix + [python_exe, "-I", "-B", "-S", "-c", parent_code,
-                        str(outside), child_code]
+                        str(outside), child_code, str(host_network_namespace)]
     run = run_bounded(command, cwd=package_root,
                       env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
                            "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"},
@@ -1379,7 +1403,11 @@ def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
         return _sandbox_process_failure(run, report)
     if (not isinstance(report, dict) or report.get("outside_read_blocked") is not True
             or report.get("sandbox_shadow_write_succeeded") is not True
-            or report.get("network_blocked") is not True or report.get("child_isolated") is not True
+            or report.get("network_blocked") is not True
+            or report.get("network_namespace_isolated") is not True
+            or report.get("sandbox_exec_capabilities_dropped") is not True
+            or report.get("child_isolated") is not True
+            or report.get("child_capabilities_dropped") is not True
             or type(report.get("child_exit_code")) is not int or report.get("child_exit_code") != 0
             or report.get("child_stderr_present") is not False or report.get("child_stderr_class") != "empty"):
         return _sandbox_process_failure({"code": "adapter_nonzero_exit", "returncode": 0, "stderr": b""}, report)
