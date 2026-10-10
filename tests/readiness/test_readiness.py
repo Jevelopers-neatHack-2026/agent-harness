@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import resource
 import shutil
 import subprocess
 import sys
@@ -370,6 +371,177 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("fixture_content_empty", codes)
         self.assertIn("additive_field_policy_missing", codes)
 
+    def test_schema_subset_traverses_array_applicators_and_rejects_unsupported_keywords(self) -> None:
+        schema = {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+            "$defs": {
+                "payload": {
+                    "type": "object",
+                    "properties": {"hidden": {"type": "integer"}},
+                    "additionalProperties": False,
+                },
+            },
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "prefixItems": [{"$ref": "#/$defs/payload"}],
+                    "contains": {"$ref": "#/$defs/payload"},
+                },
+            },
+            "additionalProperties": False,
+        }
+        self.assertEqual(contracts._schema_field_paths(schema), {
+            "/items", "/items/0/hidden", "/items/*/hidden",
+        })
+
+        unsupported = [
+            {**schema, "$schema": "http://json-schema.org/draft-07/schema#"},
+            {**schema, "dependencies": {"items": {"properties": {"legacy": {"type": "string"}}}}},
+            {
+                "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+                "type": "object",
+                "properties": {"known": {"type": "integer"}},
+                "additionalProperties": False,
+                "unevaluatedProperties": {"properties": {"hidden": {"type": "string"}}},
+            },
+            {
+                "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+                "type": "object",
+                "properties": {"known": {"type": "integer"}},
+                "additionalProperties": False,
+                "$dynamicRef": "#/$defs/payload",
+            },
+        ]
+        for candidate in unsupported:
+            with self.subTest(candidate=sorted(candidate)):
+                with self.assertRaises(contracts.UnsupportedSchema):
+                    contracts._schema_field_paths(candidate)
+
+    def test_schema_walker_bounds_fields_and_reference_expansion(self) -> None:
+        definitions = {"n0": {"type": "object", "properties": {"leaf": {"type": "integer"}},
+                              "additionalProperties": False}}
+        for level in range(1, 31):
+            definitions[f"n{level}"] = {
+                "type": "object",
+                "properties": {"left": {"$ref": f"#/$defs/n{level - 1}"},
+                               "right": {"$ref": f"#/$defs/n{level - 1}"}},
+                "additionalProperties": False,
+            }
+        dag = {"$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+               "$defs": definitions, "$ref": "#/$defs/n30"}
+        with self.assertRaises(contracts.SchemaTraversalLimit):
+            contracts._schema_field_paths(dag)
+
+        recursive = {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {"child": {"$ref": "#"}},
+            "additionalProperties": False,
+        }
+        with self.assertRaises(contracts.SchemaTraversalLimit):
+            contracts._schema_field_paths(recursive)
+
+    def test_schema_walker_applies_field_path_and_aggregate_byte_limits(self) -> None:
+        two_fields = {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "string"}},
+            "additionalProperties": False,
+        }
+        with mock.patch.object(contracts, "MAX_SCHEMA_FIELDS", 1):
+            with self.assertRaises(contracts.SchemaTraversalLimit):
+                contracts._schema_field_paths(two_fields)
+        with mock.patch.object(contracts, "MAX_SCHEMA_AGGREGATE_PATH_BYTES", 3):
+            with self.assertRaises(contracts.SchemaTraversalLimit):
+                contracts._schema_field_paths(two_fields)
+
+        nested = {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {"a": {
+                "type": "object",
+                "properties": {"b": {"type": "integer"}},
+                "additionalProperties": False,
+            }},
+            "additionalProperties": False,
+        }
+        with mock.patch.object(contracts, "MAX_SCHEMA_PATH_BYTES", 2):
+            with self.assertRaises(contracts.SchemaTraversalLimit):
+                contracts._schema_field_paths(nested)
+
+        overescaped = {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {"~" * 3000: {"type": "integer"}},
+            "additionalProperties": False,
+        }
+        with self.assertRaises(contracts.SchemaTraversalLimit):
+            contracts._schema_field_paths(overescaped)
+
+        referenced = {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+            "$defs": {"item": {
+                "type": "object", "properties": {"value": {"type": "integer"}},
+                "additionalProperties": False,
+            }},
+            "$ref": "#/$defs/item",
+        }
+        with mock.patch.object(contracts, "MAX_SCHEMA_REFERENCE_EXPANSIONS", 0):
+            with self.assertRaises(contracts.SchemaTraversalLimit):
+                contracts._schema_field_paths(referenced)
+
+    def test_schema_traversal_limits_return_typed_cli_blocker_under_resource_guard(self) -> None:
+        definitions = {"n0": {"type": "object", "properties": {"leaf": {"type": "integer"}},
+                              "additionalProperties": False}}
+        for level in range(1, 31):
+            definitions[f"n{level}"] = {
+                "type": "object",
+                "properties": {"left": {"$ref": f"#/$defs/n{level - 1}"},
+                               "right": {"$ref": f"#/$defs/n{level - 1}"}},
+                "additionalProperties": False,
+            }
+        candidates = {
+            "branching-dag": {"$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+                              "$defs": definitions, "$ref": "#/$defs/n30"},
+            "recursive-ref": {
+                "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
+                "type": "object",
+                "properties": {"child": {"$ref": "#"}},
+                "additionalProperties": False,
+            },
+        }
+
+        def limit_child_resources() -> None:
+            resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
+            if platform.system() == "Linux":
+                memory_limit = 256 * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+
+        for name, schema in candidates.items():
+            with self.subTest(schema=name), tempfile.TemporaryDirectory(prefix="acv1-schema-cli-bound-") as temp:
+                manifest_path, evidence_path, evidence_sha = write_complete_synthetic_contract(
+                    Path(temp), schema_overrides={"none": schema},
+                    adapter_source=b"raise SystemExit(77)  # TEST ONLY: must not execute\n")
+                started = time.monotonic()
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "tools/verify_contract_release.py"),
+                     "--manifest", str(manifest_path), "--offline", "--test-only-synthetic",
+                     "--owner-evidence-index", str(evidence_path), "--owner-evidence-sha256", evidence_sha],
+                    cwd=ROOT,
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONDONTWRITEBYTECODE": "1",
+                         "LC_ALL": "C.UTF-8", "PYTHONHASHSEED": "0"},
+                    text=True, capture_output=True, check=False, timeout=5, preexec_fn=limit_child_resources,
+                )
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertEqual(result.returncode, 2, result.stdout[:2000])
+                report = json.loads(result.stdout)
+                self.assertEqual(report["status"], "blocked")
+                self.assertFalse(report["ready"])
+                self.assertIn("canonical_schema_traversal_limit",
+                              {item["code"] for item in report["errors"]})
+                self.assertNotIn("adapter_nonzero_exit", {item["code"] for item in report["errors"]})
+
     def test_invalid_and_older_consumer_additive_cases_require_owner_serialization_hashes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="acv1-required-serialization-") as temp:
             root = Path(temp)
@@ -675,6 +847,56 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             self.assertIsNone(reason)
             self.assertEqual(outside.read_bytes(), b"original synthetic host canary")
 
+    def test_sandbox_failure_diagnostics_are_classified_bounded_and_path_redacted(self) -> None:
+        stderr = (b"bwrap: Creating new namespace failed: Operation not permitted "
+                  b"at /home/runner/work/agent-harness/host-canary.txt")
+        with tempfile.TemporaryDirectory(prefix="acv1-sandbox-diagnostic-") as temp, \
+                mock.patch.object(contracts.shutil, "which", return_value="/usr/bin/bwrap"), \
+                mock.patch.object(contracts.sys, "executable", "/usr/bin/python3"), \
+                mock.patch.object(contracts, "run_bounded", return_value={
+                    "ok": False, "code": "adapter_nonzero_exit", "returncode": 1,
+                    "stdout": b"", "stderr": stderr,
+                }) as mocked_run:
+            reason = contracts._run_sandbox_canary(Path(temp), Path(temp) / "host-canary.txt")
+            command = mocked_run.call_args.args[0]
+        compile(command[command.index("-c") + 1], "<synthetic-canary-parent>", "exec")
+        compile(command[-1], "<synthetic-canary-child>", "exec")
+        self.assertIsNotNone(reason)
+        self.assertIn("namespace_operation_not_permitted", reason or "")
+        self.assertIn("<path>", reason or "")
+        self.assertNotIn("/home/runner", reason or "")
+        self.assertLessEqual(len(reason or ""), 640)
+
+    def test_sandbox_command_imports_only_declared_sealed_dependency_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-dependency-import-root-") as temp, \
+                mock.patch.object(contracts.platform, "system", return_value="Linux"), \
+                mock.patch.object(contracts.shutil, "which", return_value="/usr/bin/bwrap"), \
+                mock.patch.object(contracts.sys, "executable", "/usr/bin/python3"):
+            root = Path(temp)
+            snapshot = contracts.SealedSnapshot({
+                "adapter.py": 101,
+                "declared_dep.py": 102,
+                "fixtures/unlisted_module.py": 103,
+                "schemas/schema.json": 104,
+            })
+            command, error = contracts._sandbox_command(
+                root, root / "adapter.py", b"{}", snapshot, ("declared_dep.py",))
+            self.assertIsNone(error)
+            self.assertIsNotNone(command)
+            assert command is not None
+            bootstrap = command[command.index("-c") + 1]
+            self.assertEqual(command[command.index("-I") + 1:command.index("-I") + 4], ["-B", "-S", "-c"])
+            self.assertIn("sys.path.insert(0, '/acv1-dependencies')", bootstrap)
+            self.assertNotIn("sys.path.insert(0, '/release')", bootstrap)
+            self.assertIn("/acv1-dependencies/declared_dep.py", command)
+            self.assertNotIn("/release/declared_dep.py", command)
+            self.assertIn("/release/fixtures/unlisted_module.py", command)
+            self.assertNotIn("/acv1-dependencies/fixtures/unlisted_module.py", command)
+            missing, missing_error = contracts._sandbox_command(
+                root, root / "adapter.py", b"{}", snapshot, ("unlisted_module.py",))
+            self.assertIsNone(missing)
+            self.assertIn("absent or outside", missing_error or "")
+
     def test_native_cli_runs_complete_multischema_synthetic_release_through_sealed_sandbox(self) -> None:
         self.require_native_sandbox()
         with tempfile.TemporaryDirectory(prefix="acv1-contract-cli-sandbox-") as temp:
@@ -705,15 +927,21 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="acv1-sealed-snapshot-race-") as temp:
             root = Path(temp)
             originals = {
-                "schema.json": b'{"type":"object","properties":{"value":{"type":"integer"}}}',
+                "schema.json": (
+                    b'{"$schema":"https://json-schema.org/draft/2020-12/schema",'
+                    b'"type":"object","properties":{"value":{"type":"integer"}},'
+                    b'"additionalProperties":false}'
+                ),
                 "fixture.json": b'{"value":7}',
                 "snapshot_dep.py": (
                     b"import hashlib\nfrom pathlib import Path\n"
                     b"def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()\n"
                     b"def observe():\n"
-                    b" root=Path(__file__).parent\n"
+                    b" root=Path('/release')\n"
+                    b" import importlib.util\n"
                     b" return {'dependency':digest(__file__),'adapter':digest(root/'adapter.py'),"
-                    b"'schema':digest(root/'schema.json'),'fixture':digest(root/'fixture.json)}\n"
+                    b"'schema':digest(root/'schema.json'),'fixture':digest(root/'fixture.json'),"
+                    b"'undeclared_blocked':importlib.util.find_spec('acv1_unlisted_dependency_probe') is None}\n"
                 ),
                 "adapter.py": (
                     b"import json\nfrom snapshot_dep import observe\n"
@@ -722,16 +950,20 @@ class ContractReleaseReadinessTests(unittest.TestCase):
             }
             for name, raw in originals.items():
                 (root / name).write_bytes(raw)
+            (root / "acv1_unlisted_dependency_probe.py").write_text(
+                "raise RuntimeError('undeclared host module was imported')\n", encoding="utf-8")
             expected_observation = {
                 "dependency": sha(originals["snapshot_dep.py"]),
                 "adapter": sha(originals["adapter.py"]),
                 "schema": sha(originals["schema.json"]),
                 "fixture": sha(originals["fixture.json"]),
+                "undeclared_blocked": True,
             }
             replacements = {
                 "adapter.py": (b"print('replacement adapter executed')\n", False),
                 "schema.json": (b'{"type":"object","properties":{"wrong":{"type":"string"}}}', True),
                 "fixture.json": (b'{"value":999}', True),
+                "snapshot_dep.py": (b"def observe(): return {'dependency':'replacement'}\n", True),
             }
             for name, (replacement, use_symlink) in replacements.items():
                 snapshot_inputs = {path: (raw, sha(raw)) for path, raw in originals.items()}
@@ -742,7 +974,12 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 target = root / name
                 backup = root / (name + ".authentic")
                 evil = root / (name + ".replacement")
-                command, command_error = contracts._sandbox_command(root, root / "adapter.py", b"{}", snapshot)
+                dependency_request = json.dumps({"dependencies": [{
+                    "path": contracts.DEPENDENCY_IMPORT_ROOT + "/snapshot_dep.py",
+                    "sha256": sha(originals["snapshot_dep.py"]),
+                }]}).encode("utf-8")
+                command, command_error = contracts._sandbox_command(
+                    root, root / "adapter.py", dependency_request, snapshot, ("snapshot_dep.py",))
                 self.assertIsNotNone(command)
                 self.assertIsNone(command_error)
                 try:

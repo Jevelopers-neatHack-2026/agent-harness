@@ -39,6 +39,14 @@ MAX_SEALED_SNAPSHOT_FILES = 512
 MAX_ADAPTER_STDOUT = 2 * 1024 * 1024
 MAX_ADAPTER_STDERR = 64 * 1024
 ADAPTER_TIMEOUT_SECONDS = 60
+SUPPORTED_JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+MAX_SCHEMA_WALK_STEPS = 20_000
+MAX_SCHEMA_FIELDS = 10_000
+MAX_SCHEMA_PATH_BYTES = 4096
+MAX_SCHEMA_AGGREGATE_PATH_BYTES = 1024 * 1024
+MAX_SCHEMA_REFERENCE_EXPANSIONS = 2048
+MAX_SCHEMA_REFERENCE_BYTES = 4096
+DEPENDENCY_IMPORT_ROOT = "/acv1-dependencies"
 
 # Required scenarios are issue #5 acceptance inputs. They are not schema fields
 # and the expected results remain owner supplied in the pinned release.
@@ -137,6 +145,14 @@ class InputProblem(Exception):
     def __init__(self, code: str, path: str, owner: str, action: str):
         super().__init__(code)
         self.item = {"code": code, "path": path, "owner": owner, "action": action}
+
+
+class UnsupportedSchema(ValueError):
+    """A valid-looking schema uses a dialect or keyword outside the checked subset."""
+
+
+class SchemaTraversalLimit(ValueError):
+    """Schema field inventory traversal exceeded fixed work or output bounds."""
 
 
 class SealedSnapshot:
@@ -614,109 +630,285 @@ def _read_inventory(base: Path, descriptor: Any, errors: list[dict[str, str]]) -
 
 
 def _schema_field_paths(document: Any) -> set[str]:
-    """Return the statically declared JSON Schema property paths.
+    """Enumerate property paths for the bounded Draft 2020-12 subset.
 
-    Paths use JSON Pointer escaping. Internal references and composed schemas
-    are followed; schemas whose property names cannot be enumerated statically
-    are rejected so an inventory cannot claim incomplete coverage.
+    Supported schema applicators are followed iteratively, including
+    ``prefixItems`` and ``contains``. Local JSON Pointer references, including
+    references inside those applicators, are supported. Unknown keywords,
+    legacy dialects, external/dynamic references, pattern fields, and open
+    dynamically named property schemas fail closed. Work and output have hard
+    limits so a small reference DAG cannot expand without bound.
     """
     from urllib.parse import unquote
 
+    supported_keywords = {
+        "$schema", "$defs", "$ref", "$comment",
+        "title", "description", "default", "deprecated", "readOnly", "writeOnly", "examples",
+        "type", "enum", "const", "multipleOf", "maximum", "exclusiveMaximum", "minimum",
+        "exclusiveMinimum", "maxLength", "minLength", "pattern", "format", "contentEncoding",
+        "contentMediaType", "maxItems", "minItems", "uniqueItems", "maxContains", "minContains",
+        "maxProperties", "minProperties", "required", "dependentRequired", "properties",
+        "patternProperties", "additionalProperties", "allOf", "anyOf", "oneOf", "not", "if",
+        "then", "else", "dependentSchemas", "prefixItems", "items", "contains",
+        "unevaluatedItems", "unevaluatedProperties",
+    }
     if not isinstance(document, dict):
-        raise ValueError("schema root is not an object")
+        raise UnsupportedSchema("schema root is not an object")
+    if document.get("$schema") != SUPPORTED_JSON_SCHEMA_DIALECT:
+        raise UnsupportedSchema("schema dialect is not the supported Draft 2020-12 dialect")
+
     paths: set[str] = set()
     root_fields: set[str] = set()
     root_required: set[str] = set()
-    visited: set[tuple[int, str]] = set()
+    visited: set[tuple[int, str, bool]] = set()
+    stack: list[tuple[Any, str, int, bool]] = [(document, "", 0, True)]
+    work_steps = 0
+    enqueued = 1
+    reference_expansions = 0
+    aggregate_path_bytes = 0
+
+    def charge_step(count: int = 1) -> None:
+        nonlocal work_steps
+        work_steps += count
+        if work_steps > MAX_SCHEMA_WALK_STEPS:
+            raise SchemaTraversalLimit("schema traversal step limit exceeded")
+
+    def enqueue(node: Any, prefix: str, prefix_bytes: int, collect_fields: bool) -> None:
+        nonlocal enqueued
+        enqueued += 1
+        if enqueued > MAX_SCHEMA_WALK_STEPS:
+            raise SchemaTraversalLimit("schema pending-node limit exceeded")
+        stack.append((node, prefix, prefix_bytes, collect_fields))
+
+    def append_segment(prefix: str, prefix_bytes: int, segment: str) -> tuple[str, int]:
+        try:
+            segment_bytes = len(segment.encode("utf-8", errors="strict"))
+        except UnicodeError as exc:
+            raise UnsupportedSchema("schema path contains invalid Unicode") from exc
+        path_bytes = prefix_bytes + 1 + segment_bytes
+        if path_bytes > MAX_SCHEMA_PATH_BYTES:
+            raise SchemaTraversalLimit("schema field path length limit exceeded")
+        return prefix + "/" + segment, path_bytes
+
+    def property_segment(name: Any) -> str:
+        if not isinstance(name, str) or not name:
+            raise UnsupportedSchema("schema property name is invalid")
+        try:
+            original_size = len(name.encode("utf-8", errors="strict"))
+        except UnicodeError as exc:
+            raise UnsupportedSchema("schema property name contains invalid Unicode") from exc
+        if original_size > MAX_SCHEMA_PATH_BYTES:
+            raise SchemaTraversalLimit("schema property name length limit exceeded")
+        escaped_size = original_size + name.count("~") + name.count("/")
+        if escaped_size > MAX_SCHEMA_PATH_BYTES:
+            raise SchemaTraversalLimit("schema property path length limit exceeded")
+        escaped = name.replace("~", "~0").replace("/", "~1")
+        return escaped
 
     def decode_pointer_part(part: str) -> str:
-        decoded = unquote(part)
+        try:
+            decoded = unquote(part, errors="strict")
+        except (UnicodeError, ValueError) as exc:
+            raise UnsupportedSchema("schema reference pointer encoding is invalid") from exc
         index = 0
         while index < len(decoded):
             if decoded[index] == "~":
                 if index + 1 >= len(decoded) or decoded[index + 1] not in "01":
-                    raise ValueError("invalid schema reference pointer")
+                    raise UnsupportedSchema("schema reference pointer escape is invalid")
                 index += 2
             else:
                 index += 1
         return decoded.replace("~1", "/").replace("~0", "~")
 
     def resolve_local_ref(reference: Any) -> Any:
-        if not isinstance(reference, str) or not reference.startswith("#"):
-            raise ValueError("external schema reference requires an explicitly published dependency")
+        if not isinstance(reference, str) or len(reference.encode("utf-8", errors="replace")) > MAX_SCHEMA_REFERENCE_BYTES:
+            raise UnsupportedSchema("schema reference is invalid or too long")
+        if not reference.startswith("#"):
+            raise UnsupportedSchema("external schema references are unsupported")
         if reference == "#":
             return document
         if not reference.startswith("#/"):
-            raise ValueError("unsupported schema reference")
+            raise UnsupportedSchema("only local JSON Pointer schema references are supported")
         target: Any = document
         for segment in reference[2:].split("/"):
             key = decode_pointer_part(segment)
-            if not isinstance(target, dict) or key not in target:
-                raise ValueError("unresolved schema reference")
-            target = target[key]
+            if isinstance(target, dict) and key in target:
+                target = target[key]
+            elif isinstance(target, list) and key.isascii() and key.isdigit() and (key == "0" or not key.startswith("0")):
+                index = int(key)
+                if index >= len(target):
+                    raise UnsupportedSchema("schema reference pointer is unresolved")
+                target = target[index]
+            else:
+                raise UnsupportedSchema("schema reference pointer is unresolved")
         return target
 
-    def walk(node: Any, prefix: str) -> None:
+    while stack:
+        node, prefix, prefix_bytes, collect_fields = stack.pop()
+        charge_step()
         if isinstance(node, bool):
-            return
+            continue
         if not isinstance(node, dict):
-            raise ValueError("schema node is not an object")
-        marker = (id(node), prefix)
+            raise UnsupportedSchema("schema node is not an object or boolean")
+        marker = (id(node), prefix if collect_fields else "", collect_fields)
         if marker in visited:
-            return
+            continue
         visited.add(marker)
+        for keyword in node:
+            charge_step()
+            if keyword not in supported_keywords:
+                raise UnsupportedSchema("schema keyword is outside the supported Draft 2020-12 subset")
+        if "$schema" in node and node is not document:
+            raise UnsupportedSchema("nested schema dialect changes are unsupported")
+        if "$defs" in node:
+            definitions = node["$defs"]
+            if not isinstance(definitions, dict):
+                raise UnsupportedSchema("schema $defs must be an object")
+            for name, definition in definitions.items():
+                charge_step()
+                if not isinstance(name, str):
+                    raise UnsupportedSchema("schema definition name is invalid")
+                enqueue(definition, "", 0, False)
         if "$ref" in node:
-            walk(resolve_local_ref(node["$ref"]), prefix)
+            reference_expansions += 1
+            if reference_expansions > MAX_SCHEMA_REFERENCE_EXPANSIONS:
+                raise SchemaTraversalLimit("schema reference expansion limit exceeded")
+            enqueue(resolve_local_ref(node["$ref"]), prefix, prefix_bytes, collect_fields)
+
         properties = node.get("properties", {})
         if not isinstance(properties, dict):
-            raise ValueError("schema properties is not an object")
+            raise UnsupportedSchema("schema properties is not an object")
         for name, child in properties.items():
-            if not isinstance(name, str) or not name:
-                raise ValueError("schema property name is invalid")
-            escaped = name.replace("~", "~0").replace("/", "~1")
-            property_path = prefix + "/" + escaped
-            paths.add(property_path)
-            if not prefix:
-                root_fields.add(property_path)
-            walk(child, property_path)
-        if node.get("patternProperties"):
-            raise ValueError("patternProperties cannot be inventoried as exact field paths")
-        additional = node.get("additionalProperties")
-        if isinstance(additional, dict):
-            raise ValueError("schema allows dynamically named additional properties")
+            charge_step()
+            segment = property_segment(name)
+            if collect_fields:
+                property_path, property_path_bytes = append_segment(prefix, prefix_bytes, segment)
+                if property_path not in paths:
+                    if len(paths) >= MAX_SCHEMA_FIELDS:
+                        raise SchemaTraversalLimit("schema generated-field limit exceeded")
+                    aggregate_path_bytes += property_path_bytes
+                    if aggregate_path_bytes > MAX_SCHEMA_AGGREGATE_PATH_BYTES:
+                        raise SchemaTraversalLimit("schema aggregate field-path byte limit exceeded")
+                    paths.add(property_path)
+                if not prefix:
+                    root_fields.add(property_path)
+                enqueue(child, property_path, property_path_bytes, True)
+            else:
+                enqueue(child, "", 0, False)
+
+        pattern_properties = node.get("patternProperties", {})
+        if not isinstance(pattern_properties, dict):
+            raise UnsupportedSchema("schema patternProperties is malformed")
+        if pattern_properties:
+            raise UnsupportedSchema("patternProperties cannot be inventoried as exact field paths")
+        if "additionalProperties" in node and node["additionalProperties"] is not False:
+            raise UnsupportedSchema("schema allows dynamically named additional properties")
+        if properties and "additionalProperties" not in node:
+            raise UnsupportedSchema("object properties require explicit additionalProperties false")
+        if "unevaluatedProperties" in node and node["unevaluatedProperties"] is not False:
+            raise UnsupportedSchema("schema unevaluatedProperties is dynamic and unsupported")
+
         required = node.get("required", [])
-        if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
-            raise ValueError("schema required list is malformed")
-        if not prefix:
-            root_required.update("/" + item.replace("~", "~0").replace("/", "~1") for item in required)
+        if not isinstance(required, list):
+            raise UnsupportedSchema("schema required list is malformed")
+        for name in required:
+            charge_step()
+            segment = property_segment(name)
+            required_path, _ = append_segment("", 0, segment)
+            if collect_fields and not prefix:
+                root_required.add(required_path)
+
+        dependent_required = node.get("dependentRequired", {})
+        if not isinstance(dependent_required, dict):
+            raise UnsupportedSchema("schema dependentRequired is malformed")
+        for name, required_names in dependent_required.items():
+            charge_step()
+            property_segment(name)
+            if not isinstance(required_names, list):
+                raise UnsupportedSchema("schema dependentRequired entry is malformed")
+            for required_name in required_names:
+                charge_step()
+                property_segment(required_name)
+
+        if "dependentSchemas" in node:
+            dependent = node["dependentSchemas"]
+            if not isinstance(dependent, dict):
+                raise UnsupportedSchema("schema dependentSchemas is malformed")
+            for name, branch in dependent.items():
+                charge_step()
+                property_segment(name)
+                enqueue(branch, prefix, prefix_bytes, collect_fields)
+
         for keyword in ("allOf", "anyOf", "oneOf"):
-            branches = node.get(keyword, [])
+            if keyword not in node:
+                continue
+            branches = node[keyword]
             if not isinstance(branches, list):
-                raise ValueError("schema composition is malformed")
+                raise UnsupportedSchema("schema composition is malformed")
             for branch in branches:
-                walk(branch, prefix)
+                charge_step()
+                enqueue(branch, prefix, prefix_bytes, collect_fields)
         for keyword in ("not", "if", "then", "else"):
             if keyword in node:
-                walk(node[keyword], prefix)
-        dependent = node.get("dependentSchemas", {})
-        if not isinstance(dependent, dict):
-            raise ValueError("schema dependentSchemas is malformed")
-        for branch in dependent.values():
-            walk(branch, prefix)
-        items = node.get("items")
-        if isinstance(items, dict) or isinstance(items, bool):
-            walk(items, prefix + "/*")
-        elif isinstance(items, list):
-            for index, item in enumerate(items):
-                walk(item, prefix + "/" + str(index))
-        elif items is not None:
-            raise ValueError("schema items is malformed")
+                enqueue(node[keyword], prefix, prefix_bytes, collect_fields)
 
-    walk(document, "")
+        if "prefixItems" in node:
+            prefix_items = node["prefixItems"]
+            if not isinstance(prefix_items, list):
+                raise UnsupportedSchema("schema prefixItems must be an array")
+            for index, item in enumerate(prefix_items):
+                charge_step()
+                if item is True:
+                    raise UnsupportedSchema("open prefixItems entries are not enumerable")
+                if collect_fields:
+                    item_path, item_path_bytes = append_segment(prefix, prefix_bytes, str(index))
+                    enqueue(item, item_path, item_path_bytes, True)
+                else:
+                    enqueue(item, "", 0, False)
+
+        if "items" in node:
+            items = node["items"]
+            if items is True:
+                raise UnsupportedSchema("open items schemas are not enumerable")
+            if isinstance(items, list):
+                raise UnsupportedSchema("legacy tuple-form items is outside the supported dialect")
+            if isinstance(items, (dict, bool)):
+                if collect_fields:
+                    item_path, item_path_bytes = append_segment(prefix, prefix_bytes, "*")
+                    enqueue(items, item_path, item_path_bytes, True)
+                else:
+                    enqueue(items, "", 0, False)
+            else:
+                raise UnsupportedSchema("schema items is malformed")
+
+        if "contains" in node:
+            contains = node["contains"]
+            if isinstance(contains, (dict, bool)):
+                if collect_fields:
+                    item_path, item_path_bytes = append_segment(prefix, prefix_bytes, "*")
+                    enqueue(contains, item_path, item_path_bytes, True)
+                else:
+                    enqueue(contains, "", 0, False)
+            else:
+                raise UnsupportedSchema("schema contains is malformed")
+
+        if "unevaluatedItems" in node:
+            unevaluated_items = node["unevaluatedItems"]
+            if unevaluated_items is True:
+                raise UnsupportedSchema("open unevaluatedItems schemas are not enumerable")
+            if isinstance(unevaluated_items, (dict, bool)):
+                if collect_fields:
+                    item_path, item_path_bytes = append_segment(prefix, prefix_bytes, "*")
+                    enqueue(unevaluated_items, item_path, item_path_bytes, True)
+                else:
+                    enqueue(unevaluated_items, "", 0, False)
+            else:
+                raise UnsupportedSchema("schema unevaluatedItems is malformed")
+
     if not root_required.issubset(root_fields):
-        raise ValueError("root required property is not declared")
+        raise UnsupportedSchema("root required property is not declared")
     if not paths:
-        raise ValueError("schema declares no runtime fields")
+        raise UnsupportedSchema("schema declares no runtime fields")
     return paths
 
 
@@ -973,7 +1165,8 @@ def _sandbox_prerequisite_error() -> str | None:
 
 
 def _sandbox_command(package_root: Path, adapter: Path, request_bytes: bytes,
-                     snapshot: SealedSnapshot | None = None) -> tuple[list[str] | None, str | None]:
+                     snapshot: SealedSnapshot | None = None,
+                     dependency_paths: tuple[str, ...] = ()) -> tuple[list[str] | None, str | None]:
     prerequisite = _sandbox_prerequisite_error()
     if prerequisite is not None:
         return None, prerequisite
@@ -990,6 +1183,21 @@ def _sandbox_command(package_root: Path, adapter: Path, request_bytes: bytes,
         return None, "The pinned adapter path is outside the canonical package."
     if adapter_relative not in snapshot.files:
         return None, "The pinned adapter is absent from the sealed execution snapshot."
+    if not isinstance(dependency_paths, tuple) or any(not isinstance(path, str) for path in dependency_paths):
+        return None, "The declared adapter dependency list is invalid; only exact sealed dependency paths may be imported."
+    normalized_dependencies: list[str] = []
+    for relative in dependency_paths:
+        path = PurePosixPath(relative)
+        if (path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts)
+                or path.as_posix() not in snapshot.files or path.as_posix() == adapter_relative):
+            return None, "A declared adapter dependency is absent or outside the sealed snapshot."
+        normalized_dependencies.append(path.as_posix())
+    if len(normalized_dependencies) != len(set(normalized_dependencies)):
+        return None, "The declared adapter dependency list contains duplicate paths."
+    dependency_set = set(normalized_dependencies)
+    release_paths = set(snapshot.files) - dependency_set
+    if adapter_relative not in release_paths:
+        return None, "The pinned adapter cannot also be a dependency import."
     bwrap = shutil.which("bwrap")
     assert bwrap is not None
     command = [
@@ -1000,22 +1208,109 @@ def _sandbox_command(package_root: Path, adapter: Path, request_bytes: bytes,
     for system_dir in ("/lib", "/lib64", "/bin", "/sbin"):
         if os.path.exists(system_dir):
             command.extend(["--dir", system_dir, "--ro-bind", system_dir, system_dir])
-    command.extend(["--dir", "/release", "--tmpfs", "/release"])
+    command.extend(["--dir", "/release", "--tmpfs", "/release",
+                    "--dir", DEPENDENCY_IMPORT_ROOT, "--tmpfs", DEPENDENCY_IMPORT_ROOT])
     directories: set[str] = set()
-    for relative in snapshot.files:
+    dependency_directories: set[str] = set()
+    for relative in release_paths:
         path = PurePosixPath(relative)
         for depth in range(1, len(path.parts)):
             directories.add("/release/" + "/".join(path.parts[:depth]))
+    for relative in dependency_set:
+        path = PurePosixPath(relative)
+        for depth in range(1, len(path.parts)):
+            dependency_directories.add(DEPENDENCY_IMPORT_ROOT + "/" + "/".join(path.parts[:depth]))
     for directory in sorted(directories, key=lambda value: (value.count("/"), value)):
         command.extend(["--dir", directory])
-    for relative in sorted(snapshot.files):
+    for directory in sorted(dependency_directories, key=lambda value: (value.count("/"), value)):
+        command.extend(["--dir", directory])
+    for relative in sorted(release_paths):
         command.extend(["--ro-bind-data", str(snapshot.files[relative]), "/release/" + relative])
+    for relative in sorted(dependency_set):
+        command.extend(["--ro-bind-data", str(snapshot.files[relative]),
+                        DEPENDENCY_IMPORT_ROOT + "/" + relative])
     command.extend([
-        "--remount-ro", "/release", "--chdir", "/release", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
+        "--remount-ro", "/release", "--remount-ro", DEPENDENCY_IMPORT_ROOT,
+        "--chdir", "/", "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
         "--setenv", "HOME", "/nonexistent", "--setenv", "LC_ALL", "C.UTF-8",
-        python_exe, "-I", "-B", "-S", "/release/" + adapter_relative,
+        python_exe, "-I", "-B", "-S", "-c",
+        "import sys\n"
+        "sys.path.insert(0, '" + DEPENDENCY_IMPORT_ROOT + "')\n"
+        "adapter_path = sys.argv.pop(1)\n"
+        "sys.argv = [adapter_path]\n"
+        "with open(adapter_path, 'rb') as source_file: source_bytes = source_file.read()\n"
+        "exec(compile(source_bytes, adapter_path, 'exec'), {'__name__': '__main__', '__file__': adapter_path})\n",
+        "/release/" + adapter_relative,
     ])
     return command, None
+
+
+def _sandbox_stderr_summary(stderr: bytes) -> tuple[str, str]:
+    """Classify bounded internal-canary stderr and return a path-redacted excerpt."""
+    import re
+
+    text = stderr[:4096].decode("utf-8", errors="replace")
+    normalized = text.lower()
+    if "setting up uid map" in normalized or "uid map" in normalized:
+        category = "user_namespace_mapping_failure"
+    elif "namespace" in normalized and "operation not permitted" in normalized:
+        category = "namespace_operation_not_permitted"
+    elif "operation not permitted" in normalized:
+        category = "operation_not_permitted"
+    elif "permission denied" in normalized:
+        category = "permission_denied"
+    elif "no such file or directory" in normalized:
+        category = "missing_file"
+    elif "invalid argument" in normalized:
+        category = "invalid_argument"
+    elif "unknown option" in normalized or "unrecognized option" in normalized:
+        category = "unsupported_bubblewrap_option"
+    elif "modulenotfounderror" in normalized or "no module named" in normalized:
+        category = "python_dependency_import_failure"
+    elif "traceback" in normalized:
+        category = "python_traceback"
+    elif text.strip():
+        category = "unclassified_synthetic_stderr"
+    else:
+        category = "empty_stderr"
+
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"(?<![A-Za-z0-9])/(?:[A-Za-z0-9._+~-]+/)*[A-Za-z0-9._+~-]*", "<path>", text)
+    text = re.sub(r"\b(?:authorization|password|secret|token|api[_ -]?key)\b\s*[:=]\s*\S+",
+                  "<redacted>", text, flags=re.IGNORECASE)
+    text = " ".join("".join(char if char >= " " and char != "\x7f" else " " for char in text).split())
+    return category, text[:240]
+
+
+def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
+    code = run.get("code")
+    if code not in {"execution_timeout", "execution_output_limit_exceeded", "execution_start_failed",
+                    "adapter_nonzero_exit", "ok"}:
+        code = "unclassified_process_result"
+    exit_code = run.get("returncode")
+    if type(exit_code) is not int:
+        exit_code = "unavailable"
+    stderr_category, stderr_excerpt = _sandbox_stderr_summary(
+        run.get("stderr") if isinstance(run.get("stderr"), bytes) else b"")
+    flags = {}
+    if isinstance(report, dict):
+        for key in ("outside_read_blocked", "sandbox_shadow_write_succeeded", "network_blocked", "child_isolated"):
+            flags[key] = report.get(key) is True
+        child_code = report.get("child_exit_code")
+        flags["child_exit_code"] = child_code if type(child_code) is int else "unavailable"
+        flags["child_stderr_present"] = report.get("child_stderr_present") is True
+        child_stderr_class = report.get("child_stderr_class")
+        allowed_stderr_classes = {"empty", "operation_not_permitted", "permission_denied", "missing_file",
+                                  "python_dependency_import_failure", "python_traceback", "other"}
+        flags["child_stderr_class"] = child_stderr_class if child_stderr_class in allowed_stderr_classes else "unavailable"
+    detail = {
+        "process_code": code,
+        "exit_code": exit_code,
+        "stderr_class": stderr_category,
+        "stderr": stderr_excerpt or "<empty>",
+        "canary": flags,
+    }
+    return "bubblewrap internal canary failed: " + json.dumps(detail, sort_keys=True, separators=(",", ":"))
 
 
 def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
@@ -1048,13 +1343,17 @@ def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
     )
     parent_code = (
         "import json,os,socket,subprocess,sys\n"
-        "r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_blocked':False,'child_isolated':False}\n"
+        "r={'outside_read_blocked':False,'sandbox_shadow_write_succeeded':False,'network_blocked':False,'child_isolated':False,'child_exit_code':None,'child_stderr_present':False,'child_stderr_class':'not_run'}\n"
         "try: open(sys.argv[1],'rb').read()\n"
         "except OSError: r['outside_read_blocked']=True\n"
         "try:\n"
         " s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.2); s.connect(('198.18.0.1',9))\n"
         "except OSError: r['network_blocked']=True\n"
         "p=subprocess.run([sys.executable,'-I','-B','-S','-c',sys.argv[2],sys.argv[1]],capture_output=True,timeout=2)\n"
+        "r['child_exit_code']=p.returncode\n"
+        "r['child_stderr_present']=bool(p.stderr)\n"
+        "child_error=p.stderr.decode('utf-8','replace').lower()\n"
+        "r['child_stderr_class']=('operation_not_permitted' if 'operation not permitted' in child_error else 'permission_denied' if 'permission denied' in child_error else 'missing_file' if 'no such file or directory' in child_error else 'python_dependency_import_failure' if 'modulenotfounderror' in child_error or 'no module named' in child_error else 'python_traceback' if 'traceback' in child_error else 'other' if child_error else 'empty')\n"
         "r['child_isolated']=(p.returncode==0 and b'child-read-blocked=True child-network-blocked=True' in p.stdout)\n"
         "try:\n"
         " os.makedirs(os.path.dirname(sys.argv[1]),exist_ok=True)\n"
@@ -1062,7 +1361,7 @@ def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
         " with open(sys.argv[1],'rb') as f: r['sandbox_shadow_write_succeeded']=(f.read()==b'sandbox-shadow-write')\n"
         "except OSError: pass\n"
         "print(json.dumps(r,sort_keys=True,separators=(',',':')))\n"
-        "sys.exit(0 if all(r.values()) else 8)\n"
+        "sys.exit(0 if all(r[k] for k in ('outside_read_blocked','sandbox_shadow_write_succeeded','network_blocked','child_isolated')) else 8)\n"
     )
     command = prefix + [python_exe, "-I", "-B", "-S", "-c", parent_code,
                         str(outside), child_code]
@@ -1070,16 +1369,20 @@ def _run_sandbox_canary(package_root: Path, outside: Path) -> str | None:
                       env={"PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8", "PYTHONHASHSEED": "0",
                            "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8"},
                       input_bytes=b"", timeout=5, stdout_limit=4096, stderr_limit=4096)
-    if not run.get("ok"):
-        return "bubblewrap isolation canary failed; host path, host-write, child containment, or network namespace policy did not hold."
+    report = None
     try:
-        report = parse_json_bytes(run["stdout"])
+        if run.get("stdout"):
+            report = parse_json_bytes(run["stdout"])
     except (ValueError, UnicodeError, json.JSONDecodeError, RecursionError):
-        return "bubblewrap isolation canary returned invalid diagnostics; the owner adapter is not executed."
+        report = None
+    if not run.get("ok"):
+        return _sandbox_process_failure(run, report)
     if (not isinstance(report, dict) or report.get("outside_read_blocked") is not True
             or report.get("sandbox_shadow_write_succeeded") is not True
-            or report.get("network_blocked") is not True or report.get("child_isolated") is not True):
-        return "bubblewrap isolation canary did not prove read, shadow-write, socket, and descendant boundaries; the owner adapter is not executed."
+            or report.get("network_blocked") is not True or report.get("child_isolated") is not True
+            or type(report.get("child_exit_code")) is not int or report.get("child_exit_code") != 0
+            or report.get("child_stderr_present") is not False or report.get("child_stderr_class") != "empty"):
+        return _sandbox_process_failure({"code": "adapter_nonzero_exit", "returncode": 0, "stderr": b""}, report)
     return None
 
 
@@ -1365,6 +1668,12 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
                                   "Publish nonempty actual canonical schema bytes; an empty object/array cannot describe a contract.")
                     else:
                         field_paths = _schema_field_paths(schema_content)
+                except SchemaTraversalLimit:
+                    add_error(errors, "canonical_schema_traversal_limit", path + ".path", "shared-contracts",
+                              "Reduce the owner schema's traversal, reference expansion, field count, and aggregate field-path size to the verifier's fixed limits.")
+                except UnsupportedSchema:
+                    add_error(errors, "canonical_schema_unsupported", path + ".path", "shared-contracts",
+                              "Publish a Draft 2020-12 schema within the documented enumerable subset; unsupported applicators, dynamic fields, references, and legacy keywords fail closed.")
                 except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
                     add_error(errors, "canonical_schema_json_invalid", path + ".path", "shared-contracts",
                               "Publish valid bounded JSON Schema bytes whose declared runtime fields can be enumerated without external references or dynamic field names.")
@@ -1469,7 +1778,7 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
                "release_version": release["version"], "field_inventory_sha256": inventory_sha,
                "fixtures": request_fixtures}
     request["dependencies"] = [
-        {"path": "/release/" + path.relative_to(base).as_posix(), "sha256": digest}
+        {"path": DEPENDENCY_IMPORT_ROOT + "/" + path.relative_to(base).as_posix(), "sha256": digest}
         for path, digest in dependency_paths if path is not None and digest_ok(digest)
     ]
     if adapter_path is None:
@@ -1488,6 +1797,19 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
         if fixture_path not in seen_fixture_paths:
             snapshot_inputs.append((fixture_path, fixtures[case_id].get("sha256"), "owner fixture"))
             seen_fixture_paths.add(fixture_path)
+    dependency_relatives = {
+        path.relative_to(base).as_posix() for path, digest in dependency_paths if path is not None and digest_ok(digest)
+    }
+    release_relatives = {
+        path.relative_to(base).as_posix()
+        for path, digest, _ in snapshot_inputs
+        if path is not None
+    }
+    if dependency_relatives & release_relatives:
+        add_error(errors, "execution_snapshot_path_collision", "$.canonical_release.validator_adapter.dependencies",
+                  "shared-contracts",
+                  "Give each adapter dependency a unique package path separate from the adapter, inventory, schemas, and fixtures.")
+        return None
     snapshot_inputs.extend((path, digest, "declared adapter dependency")
                            for path, digest in dependency_paths)
     artifact_bytes = _read_execution_artifacts(base, snapshot_inputs, errors)
@@ -1498,7 +1820,8 @@ def validate_and_run(manifest: Any, manifest_path: Path, errors: list[dict[str, 
         add_error(errors, "execution_snapshot_unavailable", "$.canonical_release.validator_adapter", "shared-contracts",
                   snapshot_error or "Provision Linux immutable sealed snapshots before executing owner bytes.")
         return None
-    command, sandbox_error = _sandbox_command(base, adapter_path, json.dumps(request).encode("utf-8"), snapshot)
+    command, sandbox_error = _sandbox_command(
+        base, adapter_path, json.dumps(request).encode("utf-8"), snapshot, tuple(sorted(dependency_relatives)))
     if command is None:
         snapshot.close()
         add_error(errors, "execution_sandbox_unavailable", "$.canonical_release.validator_adapter", "shared-contracts",

@@ -15,7 +15,8 @@ def _json_bytes(value: object) -> bytes:
                       allow_nan=False).encode("utf-8")
 
 
-def write_complete_synthetic_contract(root: Path) -> tuple[Path, Path, str]:
+def write_complete_synthetic_contract(root: Path, *, schema_overrides: dict[str, dict] | None = None,
+                                      adapter_source: bytes | None = None) -> tuple[Path, Path, str]:
     """Write a multi-schema, multi-fixture release plus explicitly synthetic evidence."""
     package = root / "package"
     evidence_root = root / "synthetic-evidence"
@@ -78,7 +79,8 @@ def write_complete_synthetic_contract(root: Path) -> tuple[Path, Path, str]:
     for primitive in ("none", "choice", "score", "noul"):
         schema_id = "SYNTH-" + primitive
         contract_id = "SYNTH-CONTRACT-" + primitive
-        schema = {
+        schema = (schema_overrides or {}).get(primitive, {
+            "$schema": contracts.SUPPORTED_JSON_SCHEMA_DIALECT,
             "type": "object",
             "required": ["decision", "value"],
             "properties": {
@@ -86,7 +88,7 @@ def write_complete_synthetic_contract(root: Path) -> tuple[Path, Path, str]:
                 "value": {"type": "integer"},
             },
             "additionalProperties": False,
-        }
+        })
         schema_raw = _json_bytes(schema)
         schema_artifact = artifact("schemas/" + primitive + ".json", schema_raw,
                                    schema_id=schema_id, media_type="application/json")
@@ -131,7 +133,7 @@ def write_complete_synthetic_contract(root: Path) -> tuple[Path, Path, str]:
                                  "schemas": inventory_schemas})
     inventory_descriptor = artifact("field-inventory.json", inventory_raw)
 
-    adapter_source = r'''import base64,hashlib,json,sys
+    default_adapter_source = r'''import base64,hashlib,json,sys
 def digest(raw): return hashlib.sha256(raw).hexdigest()
 def canonical(value):
     return json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode("utf-8")
@@ -162,6 +164,8 @@ for item in request["fixtures"]:
 print(json.dumps({"protocol":"agent-creative.contract-fixture-adapter/v2",
     "release_revision":request["release_revision"],"results":results},sort_keys=True,separators=(",",":")))
 '''.encode("utf-8")
+    if adapter_source is None:
+        adapter_source = default_adapter_source
     adapter_descriptor = artifact("adapter.py", adapter_source,
                                   protocol=contracts.ADAPTER_PROTOCOL, dependencies=[])
     adapter_approval = make_approval(

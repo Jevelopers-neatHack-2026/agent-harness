@@ -310,7 +310,7 @@ def classify_sandbox() -> Tuple[Dict[str, Any], List[str]]:
             problems.append("bubblewrap_canary_failed")
             evidence["canary"]["status"] = "failed"
             # The verifier reason is constant sanitized text; cap it before publication.
-            evidence["canary"]["details"] = _bounded_string(reason, 320)
+            evidence["canary"]["details"] = _bounded_string(reason, 640)
     evidence["check_diagnostics"] = sorted(set(problems))
     return evidence, problems
 
@@ -347,13 +347,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (OSError, UnicodeError, TypeError, ValueError):
         print("readiness CI evidence could not be written", file=sys.stderr)
         return 1
-    print(json.dumps({
+    summary = {
         "gate": args.gate,
         "implementation_check": evidence.get("implementation_check"),
         "readiness": evidence.get("readiness"),
         "diagnostic_count": evidence.get("diagnostics", {}).get("count"),
         "artifact": str(args.output),
-    }, sort_keys=True, separators=(",", ":")))
+    }
+    if args.gate == "sandbox":
+        summary["canary"] = evidence.get("canary")
+        summary["check_diagnostics"] = evidence.get("check_diagnostics", [])
+    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
     return 1 if problems else 0
 
 

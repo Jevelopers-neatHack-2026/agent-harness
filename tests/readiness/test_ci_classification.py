@@ -1,11 +1,37 @@
 """Direct tests for CI's expected-pending classifier behavior."""
 
 import unittest
+from unittest import mock
 
 import classify_ci_gates as ci
+from tools import verify_contract_release as contracts
 
 
 class CICheckerClassificationTests(unittest.TestCase):
+    def test_sandbox_artifact_preserves_only_bounded_sanitized_failure_detail(self):
+        reason = contracts._sandbox_process_failure({
+            "ok": False,
+            "code": "adapter_nonzero_exit",
+            "returncode": 1,
+            "stderr": b"bwrap: Creating new namespace failed: Operation not permitted at /home/runner/host.txt",
+        })
+        with mock.patch.object(ci.platform, "system", return_value="Linux"), \
+                mock.patch.object(ci.shutil, "which", return_value="/usr/bin/bwrap"), \
+                mock.patch.object(ci.os, "access", return_value=True), \
+                mock.patch.object(ci.contracts, "run_bounded", return_value={
+                    "ok": True, "stdout": b"bubblewrap 0.9.0", "stderr": b"",
+                }), \
+                mock.patch.object(ci.contracts, "probe_sandbox", return_value=reason):
+            evidence, problems = ci.classify_sandbox()
+
+        self.assertIn("bubblewrap_canary_failed", problems)
+        self.assertEqual(evidence["canary"]["status"], "failed")
+        detail = evidence["canary"]["details"]
+        self.assertIn("namespace_operation_not_permitted", detail)
+        self.assertIn('"exit_code":1', detail)
+        self.assertNotIn("/home/runner", detail)
+        self.assertLessEqual(len(detail), 640)
+
     def test_checked_in_release_is_classified_blocked_with_exit_two(self):
         observed = ci._run_checker("contracts")
         evidence, problems = ci.classify_readiness_report(
