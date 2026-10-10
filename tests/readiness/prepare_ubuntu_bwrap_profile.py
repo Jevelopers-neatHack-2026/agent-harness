@@ -8,7 +8,9 @@ import hashlib
 import json
 import os
 import platform
+import posixpath
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -56,13 +58,46 @@ APT_INDEXTARGETS_FORMAT = (
     "Origin: $(ORIGIN)\n"
     "Label: $(LABEL)\n"
     "Trusted: $(TRUSTED)\n"
-    "Signed-By: $(SIGNED_BY)\n"
-    "Repo-URI: $(REPO_URI)\n\n"
+    "Repo-URI: $(REPO_URI)\n"
+    "URI: $(URI)\n\n"
 )
 APT_INDEX_TARGET_FIELDS = frozenset({
     "identifier", "metakey", "target-of", "architecture", "component", "suite",
-    "codename", "origin", "label", "trusted", "signed-by", "repo-uri",
+    "codename", "origin", "label", "trusted", "repo-uri", "uri",
 })
+APT_PACKAGE_IDENTITY_FIELDS = frozenset({
+    "package", "version", "architecture", "filename", "sha256", "apt-sources",
+})
+APT_PACKAGE_RECORD_FIELDS = APT_PACKAGE_IDENTITY_FIELDS
+APT_SECURITY_BOOLEAN_OPTIONS = {
+    "trusted": "reject_true",
+    "allow-insecure": "reject_true",
+    "allow-weak": "reject_true",
+    "allow-downgrade-to-insecure": "reject_true",
+    "check-valid-until": "reject_false",
+    "check-date": "reject_false",
+}
+APT_SECURITY_CONFIG_KEYS = {
+    "apt::get::allowunauthenticated": "reject_true",
+    "acquire::allowinsecurerepositories": "reject_true",
+    "acquire::allowweakrepositories": "reject_true",
+    "acquire::allowdowngradetoinsecurerepositories": "reject_true",
+    "acquire::check-valid-until": "reject_false",
+    "acquire::check-date": "reject_false",
+}
+APT_SUPPORTED_PACKAGE_VERSIONS = {
+    "2.7.14build2": "2.7.14",
+    "2.8.3": "2.8.3",
+}
+APT_GET_PATH = "/usr/bin/apt-get"
+APT_CACHE_PATH = "/usr/bin/apt-cache"
+APT_CONFIG_PATH = "/usr/bin/apt-config"
+APT_SOURCES_LIST_PATH = Path("/etc/apt/sources.list")
+APT_SOURCES_PARTS_PATH = Path("/etc/apt/sources.list.d")
+APT_SOURCE_FILE_LIMIT = 64
+APT_SOURCE_DIRECTORY_ENTRY_LIMIT = 512
+APT_SOURCE_FILE_BYTES = 64 * 1024
+APT_SOURCE_TOTAL_BYTES = 256 * 1024
 LOCAL_OVERRIDES = (
     Path("/etc/apparmor.d/local/bwrap-userns-restrict"),
     Path("/etc/apparmor.d/local/unpriv_bwrap"),
@@ -201,12 +236,34 @@ def _candidate_record_diagnostics(metadata_text: str, source_text: str | None,
     )
 
     def summarize(text: str | None) -> dict[str, Any]:
-        rows = _stanzas(text or "")
+        if not text:
+            return {
+                "record_count": 0, "record_count_capped": False,
+                "exact_candidate_count": 0, "exact_candidate_count_capped": False,
+                "fields_present": [], "source_token_count": 0,
+                "source_scheme": "missing", "source_host_class": "missing",
+                "source_release_component": "missing", "source_index_architecture": "missing",
+                "source_index_type": "missing", "parse_status": "missing",
+            }
+        try:
+            rows = _parse_deb822_records(
+                text, failure_code="apt_package_record_invalid", max_bytes=128 * 1024,
+                allow_comments=False, reject_continued_fields=APT_PACKAGE_IDENTITY_FIELDS,
+            )
+        except SetupFailure:
+            return {
+                "record_count": 0, "record_count_capped": False,
+                "exact_candidate_count": 0, "exact_candidate_count_capped": False,
+                "fields_present": [], "source_token_count": 0,
+                "source_scheme": "invalid", "source_host_class": "invalid",
+                "source_release_component": "invalid", "source_index_architecture": "invalid",
+                "source_index_type": "invalid", "parse_status": "invalid",
+            }
         matches = [row for row in rows
-                   if _apt_package_matches(row.get("Package", ""), package)
-                   and row.get("Version") == version]
+                   if _apt_package_matches(row.get("package", ""), package)
+                   and row.get("version") == version]
         row = matches[0] if len(matches) == 1 else {}
-        source = row.get("APT-Sources", "")
+        source = row.get("apt-sources", "")
         tokens = source.split()
         try:
             uri = urlparse(tokens[0]) if tokens else None
@@ -241,7 +298,7 @@ def _candidate_record_diagnostics(metadata_text: str, source_text: str | None,
             "record_count_capped": len(rows) > 99,
             "exact_candidate_count": min(len(matches), 99),
             "exact_candidate_count_capped": len(matches) > 99,
-            "fields_present": [field for field in allowed_fields if field in row],
+            "fields_present": [field for field in allowed_fields if field.lower() in row],
             "source_token_count": min(len(tokens), 8),
             "source_scheme": source_scheme,
             "source_host_class": host_class,
@@ -257,6 +314,7 @@ def _candidate_record_diagnostics(metadata_text: str, source_text: str | None,
                 tokens[3] if len(tokens) > 3 and tokens[3] == "Packages"
                 else ("other" if len(tokens) > 3 else "missing")
             ),
+            "parse_status": "valid",
         }
 
     return {"metadata_record": summarize(metadata_text),
@@ -294,8 +352,12 @@ def _validated_apt_source(source: str) -> str:
 
 
 def _parse_deb822_records(text: str, *, failure_code: str,
-                          max_bytes: int = APT_INDEX_TARGETS_LIMIT) -> list[dict[str, str]]:
-    if len(text.encode("utf-8")) > max_bytes:
+                          max_bytes: int = APT_INDEX_TARGETS_LIMIT,
+                          allow_comments: bool = True,
+                          reject_continued_fields: frozenset[str] = frozenset()) -> list[dict[str, str]]:
+    # Check the character count before encoding so a caller cannot make the
+    # parser allocate an unbounded UTF-8 copy just to enforce its byte limit.
+    if len(text) > max_bytes or len(text.encode("utf-8")) > max_bytes or "\x00" in text:
         raise SetupFailure(failure_code)
     records: list[dict[str, str]] = []
     current: dict[str, str] = {}
@@ -309,18 +371,22 @@ def _parse_deb822_records(text: str, *, failure_code: str,
         last_key = None
 
     for line in text.splitlines():
+        if len(line) > max_bytes:
+            raise SetupFailure(failure_code)
         if not line.strip():
             finish()
             continue
-        if line.lstrip().startswith("#"):
-            continue
+        if line.startswith("#"):
+            if allow_comments:
+                continue
+            raise SetupFailure(failure_code)
         if line[:1].isspace():
-            if last_key is None:
+            if last_key is None or last_key in reject_continued_fields:
                 raise SetupFailure(failure_code)
             current[last_key] += " " + line.strip()
             continue
         name, separator, value = line.partition(":")
-        key = name.strip().lower()
+        key = name.lower()
         if (not separator or not re.fullmatch(r"[a-z][a-z0-9-]*", key)
                 or key in current):
             raise SetupFailure(failure_code)
@@ -463,7 +529,8 @@ def _validate_runner_mirror_configuration(source_file: bytes,
     }
 
 
-def _read_root_owned_file(path: Path, *, limit: int, failure_code: str) -> bytes:
+def _read_root_owned_file(path: Path, *, limit: int, failure_code: str,
+                          missing_ok: bool = False) -> bytes | None:
     """Read a fixed system trust file without following links or accepting writable custody."""
     current = Path("/")
     try:
@@ -510,6 +577,10 @@ def _read_root_owned_file(path: Path, *, limit: int, failure_code: str) -> bytes
             os.close(descriptor)
     except SetupFailure:
         raise
+    except FileNotFoundError as exc:
+        if missing_ok:
+            return None
+        raise SetupFailure(failure_code) from exc
     except OSError as exc:
         raise SetupFailure(failure_code) from exc
 
@@ -567,7 +638,13 @@ def _apt_index_target_diagnostics(text: str, source: str,
     label = row.get("label", "")
     suite = row.get("suite", "")
     codename = row.get("codename", "")
-    signed_by = row.get("signed-by", "")
+    signer_binding = (
+        "root_owned_source_stanza"
+        if transport.get("signed_by") == "ubuntu_archive_keyring_package"
+        and re.fullmatch(r"[0-9a-f]{64}", str(transport.get("source_file_sha256", "")))
+        and re.fullmatch(r"[0-9a-f]{64}", str(transport.get("ubuntu_archive_keyring_sha256", "")))
+        else "missing_or_unverified"
+    )
     return {
         "target_record_count": min(len(records), 99),
         "target_record_count_capped": len(records) > 99,
@@ -578,8 +655,8 @@ def _apt_index_target_diagnostics(text: str, source: str,
         "release_label": "Ubuntu" if label == "Ubuntu" else ("other" if label else "missing"),
         "release_suite": "noble-updates" if suite == "noble-updates" else ("other" if suite else "missing"),
         "release_codename": "noble" if codename == "noble" else ("other" if codename else "missing"),
-        "signed_by": ("ubuntu_archive_keyring" if signed_by == str(UBUNTU_ARCHIVE_KEYRING)
-                      else ("other" if signed_by else "missing")),
+        "source_keyring_binding": signer_binding,
+        "apt_package_version": str(transport.get("apt_package_version", "unavailable")),
         "repo_transport": (
             "runner_mirrorlist" if row.get("repo-uri", "").rstrip("/") == APT_MIRROR_URI
             else ("ubuntu_archive_endpoint" if row else "missing_or_unrecognized")
@@ -590,13 +667,22 @@ def _apt_index_target_diagnostics(text: str, source: str,
 def _validate_signed_apt_index_target(text: str, source: str,
                                       transport: dict[str, Any]) -> dict[str, str]:
     diagnostics = _apt_index_target_diagnostics(text, source, transport)
+    if "$(" in text:
+        raise SetupFailure("apt_signed_release_target_unexpanded_format_variable",
+                           details={"apt_release_target_diagnostics": diagnostics})
     try:
-        records = _parse_deb822_records(text, failure_code="apt_signed_release_target_record_invalid")
+        records = _parse_deb822_records(
+            text, failure_code="apt_signed_release_target_record_invalid",
+            allow_comments=False,
+        )
     except SetupFailure as exc:
         exc.details = {"apt_release_target_diagnostics": diagnostics}
         raise
     if any(set(row) != APT_INDEX_TARGET_FIELDS for row in records):
         raise SetupFailure("apt_signed_release_target_record_fields_invalid",
+                           details={"apt_release_target_diagnostics": diagnostics})
+    if diagnostics["source_keyring_binding"] != "root_owned_source_stanza":
+        raise SetupFailure("apt_signed_release_source_keyring_binding_missing",
                            details={"apt_release_target_diagnostics": diagnostics})
     source_uri = source.split()[0] if source.split() else ""
     allowed_repositories: set[str] = set()
@@ -621,9 +707,13 @@ def _validate_signed_apt_index_target(text: str, source: str,
         raise SetupFailure("apt_signed_release_target_missing_or_ambiguous",
                            details={"apt_release_target_diagnostics": diagnostics})
     row = matches[0]
+    repository_uri = row["repo-uri"].rstrip("/")
+    expected_index_uri = (
+        repository_uri + "/dists/noble-updates/" + row["metakey"]
+    )
     if (row.get("codename") != "noble" or row.get("origin") != "Ubuntu"
-            or row.get("label") != "Ubuntu" or row.get("trusted", "").lower() != "yes"
-            or row.get("signed-by") != str(UBUNTU_ARCHIVE_KEYRING)):
+            or row.get("label") != "Ubuntu" or row.get("trusted") != "yes"
+            or not row.get("uri") or row.get("uri") != expected_index_uri):
         raise SetupFailure("apt_signed_release_metadata_not_ubuntu_noble_updates",
                            details={"apt_release_target_diagnostics": diagnostics})
     return {
@@ -631,41 +721,56 @@ def _validate_signed_apt_index_target(text: str, source: str,
         "origin": row["origin"], "label": row["label"],
         "suite": row["suite"], "codename": row["codename"],
         "component": row["component"], "architecture": row["architecture"],
-        "trusted": row["trusted"].lower(), "signed_by": str(UBUNTU_ARCHIVE_KEYRING),
+        "trusted": row["trusted"],
+        "signed_by": str(UBUNTU_ARCHIVE_KEYRING),
+        "signer_binding": "root_owned_source_stanza",
+        "apt_package_version": str(transport.get("apt_package_version", "unavailable")),
         "transport": diagnostics["repo_transport"],
     }
 
 
 def validate_apt_record(text: str, package: str, version: str,
                         sha256: str, *, source_text: str) -> dict[str, str]:
-    exact = _stanzas(text)
-    matches = [row for row in exact
-               if _apt_package_matches(row.get("Package", ""), package)
-               and row.get("Version") == version]
     diagnostics = _candidate_record_diagnostics(text, source_text, package, version)
+    try:
+        exact = _parse_deb822_records(
+            text, failure_code="apt_package_record_invalid", max_bytes=128 * 1024,
+            allow_comments=False, reject_continued_fields=APT_PACKAGE_IDENTITY_FIELDS,
+        )
+        source_records = _parse_deb822_records(
+            source_text, failure_code="apt_package_source_record_invalid", max_bytes=128 * 1024,
+            allow_comments=False, reject_continued_fields=APT_PACKAGE_IDENTITY_FIELDS,
+        )
+    except SetupFailure as exc:
+        details = diagnostics
+        details["record_parse_status"] = "invalid"
+        raise SetupFailure(exc.code, details=details) from exc
+    matches = [row for row in exact
+               if _apt_package_matches(row.get("package", ""), package)
+               and row.get("version") == version]
     if len(matches) != 1:
         raise SetupFailure("exact_signed_apt_package_record_missing_or_ambiguous",
                            details=diagnostics)
     row = matches[0]
     expected_architecture = "all" if package == PROFILE_PACKAGE else "amd64"
-    if (row.get("Architecture") != expected_architecture
-            or not re.fullmatch(r"[0-9a-f]{64}", row.get("SHA256", ""))
-            or (sha256 and row.get("SHA256") != sha256)):
+    if (row.get("architecture") != expected_architecture
+            or not re.fullmatch(r"[0-9a-f]{64}", row.get("sha256", ""))
+            or (sha256 and row.get("sha256") != sha256)):
         raise SetupFailure("signed_apt_package_identity_or_digest_mismatch",
                            details=diagnostics)
-    source_matches = [candidate for candidate in _stanzas(source_text)
-                      if _apt_package_matches(candidate.get("Package", ""), package)
-                      and candidate.get("Version") == version]
+    source_matches = [candidate for candidate in source_records
+                      if _apt_package_matches(candidate.get("package", ""), package)
+                      and candidate.get("version") == version]
     if len(source_matches) != 1:
         raise SetupFailure("exact_signed_apt_source_record_missing_or_ambiguous",
                            details=diagnostics)
     source_row = source_matches[0]
-    if (source_row.get("Filename") != row.get("Filename")
-            or source_row.get("SHA256") != row.get("SHA256")
-            or (source_row.get("Architecture") is not None
-                and source_row.get("Architecture") != row.get("Architecture"))):
+    if (source_row.get("filename") != row.get("filename")
+            or source_row.get("sha256") != row.get("sha256")
+            or (source_row.get("architecture") is not None
+                and source_row.get("architecture") != row.get("architecture"))):
         raise SetupFailure("signed_apt_source_record_metadata_mismatch", details=diagnostics)
-    source = source_row.get("APT-Sources", "")
+    source = source_row.get("apt-sources", "")
     if not source:
         raise SetupFailure("signed_apt_package_origin_missing", details=diagnostics)
     try:
@@ -673,13 +778,15 @@ def validate_apt_record(text: str, package: str, version: str,
     except SetupFailure as exc:
         exc.details = diagnostics
         raise
-    filename = row.get("Filename", "")
+    filename = row.get("filename", "")
     expected_prefix = ("pool/main/a/apparmor/" if package == PROFILE_PACKAGE
                        else "pool/main/b/bubblewrap/")
     if not filename.startswith(expected_prefix):
         raise SetupFailure("signed_apt_package_filename_mismatch", details=diagnostics)
-    result = {key: row[key] for key in (
-        "Package", "Version", "Architecture", "Filename", "SHA256",
+    result = {external: row[internal] for external, internal in (
+        ("Package", "package"), ("Version", "version"),
+        ("Architecture", "architecture"), ("Filename", "filename"),
+        ("SHA256", "sha256"),
     )}
     result["APT-Sources"] = source
     return result
@@ -691,7 +798,7 @@ def _package_record(package: str, version: str, sha256: str, *,
     # but does not synthesize APT-Sources. Request v2 separately for provenance.
     # In APT 2.7.14, -f/--full is registered only for `search`; `show` gets the
     # same full-record behavior through the generic configuration option.
-    output, _ = _command(["apt-cache", "-o", "APT::Cache::ShowFull=true",
+    output, _ = _command([APT_CACHE_PATH, "-o", "APT::Cache::ShowFull=true",
                           "-o", "APT::Cache::Show::Version=1", "show",
                           package + "=" + version], limit=128 * 1024,
                          apt_phase="metadata_v1")
@@ -700,7 +807,7 @@ def _package_record(package: str, version: str, sha256: str, *,
     except UnicodeError as exc:
         raise SetupFailure("signed_apt_package_record_encoding_invalid") from exc
     try:
-        source_output, _ = _command(["apt-cache", "-o", "APT::Cache::ShowFull=true",
+        source_output, _ = _command([APT_CACHE_PATH, "-o", "APT::Cache::ShowFull=true",
                                      "-o", "APT::Cache::Show::Version=2", "show",
                                      package + "=" + version], limit=128 * 1024,
                                     apt_phase="source_v2")
@@ -717,7 +824,8 @@ def _package_record(package: str, version: str, sha256: str, *,
     record = validate_apt_record(text, package, version, sha256, source_text=source_text)
     try:
         target_output, _ = _command(
-            ["apt-get", "indextargets", "--format", APT_INDEXTARGETS_FORMAT],
+            [APT_GET_PATH, "-o", "APT::Get::IndexTargets::ReleaseInfo=true",
+             "indextargets", "--format", APT_INDEXTARGETS_FORMAT],
             limit=APT_INDEX_TARGETS_LIMIT, apt_phase="index_targets")
     except SetupFailure as exc:
         diagnostics = _candidate_record_diagnostics(text, source_text, package, version)
@@ -778,33 +886,239 @@ def _public_apt_source(source: str) -> str:
     return f"{parsed.scheme.lower()}://{host}/[path-redacted] {' '.join(tokens[1:])}"
 
 
+def _apt_boolean_value(value: str) -> bool | None:
+    """Mirror APT 2.7/2.8 StringToBool spellings; None means invalid/unknown."""
+    normalized = value.strip().casefold()
+    if normalized in {"yes", "true", "with", "on", "enable"}:
+        return True
+    if normalized in {"no", "false", "without", "off", "disable"}:
+        return False
+    numeric = re.fullmatch(r"([+-]?)(0[xX][0-9a-f]+|0[0-7]*|[1-9][0-9]*)", normalized)
+    if not numeric:
+        return None
+    sign, digits = numeric.groups()
+    if digits.startswith("0x"):
+        number = int(digits[2:], 16)
+    elif len(digits) > 1 and digits.startswith("0"):
+        number = int(digits, 8)
+    else:
+        number = int(digits, 10)
+    if sign == "-":
+        number = -number
+    return bool(number) if number in {0, 1} else None
+
+
+def _check_apt_security_boolean(name: str, value: str, policy: str) -> None:
+    parsed = _apt_boolean_value(value)
+    if parsed is None:
+        raise SetupFailure("apt_security_option_value_unrecognized")
+    if policy == "reject_true" and parsed:
+        raise SetupFailure("apt_source_configuration_bypasses_signature_checks")
+    if policy == "reject_false" and not parsed:
+        raise SetupFailure("apt_source_configuration_disables_freshness_checks")
+
+
+def _parse_apt_config_dump(text: str) -> tuple[dict[str, str], dict[str, str]]:
+    if len(text) > 256 * 1024 or "\x00" in text:
+        raise SetupFailure("apt_security_configuration_invalid")
+    booleans: dict[str, str] = {}
+    paths: dict[str, str] = {}
+    path_keys = {"dir", "dir::etc", "dir::etc::sourcelist", "dir::etc::sourceparts"}
+    assignment = re.compile(r'^\s*([^\s;{}]+)\s+(?:"([^"\\]*)"|([^\s;]+))\s*;\s*$')
+    for line in text.splitlines():
+        if len(line) > 4096 or "\x00" in line:
+            raise SetupFailure("apt_security_configuration_invalid")
+        if not line.strip():
+            continue
+        match = assignment.fullmatch(line)
+        if not match:
+            first = re.match(r"^\s*([^\s;{}]+)", line)
+            key = first.group(1).casefold() if first else ""
+            if key in APT_SECURITY_CONFIG_KEYS or key in path_keys:
+                raise SetupFailure("apt_security_configuration_invalid")
+            continue
+        key = match.group(1).casefold()
+        value = match.group(2) if match.group(2) is not None else match.group(3)
+        if key in APT_SECURITY_CONFIG_KEYS:
+            if key in booleans:
+                raise SetupFailure("apt_security_configuration_duplicate_option")
+            _check_apt_security_boolean(key, value, APT_SECURITY_CONFIG_KEYS[key])
+            booleans[key] = value
+        elif key in path_keys:
+            if key in paths:
+                raise SetupFailure("apt_security_configuration_duplicate_option")
+            paths[key] = value
+
+    apt_root = paths.get("dir", "/")
+    if posixpath.normpath(apt_root) != "/":
+        raise SetupFailure("apt_source_configuration_path_unverified")
+    etc_value = paths.get("dir::etc", "etc/apt")
+    etc_path = posixpath.normpath(
+        etc_value if posixpath.isabs(etc_value) else posixpath.join(apt_root, etc_value)
+    )
+    if etc_path != "/etc/apt":
+        raise SetupFailure("apt_source_configuration_path_unverified")
+    source_list = paths.get("dir::etc::sourcelist", "sources.list")
+    source_parts = paths.get("dir::etc::sourceparts", "sources.list.d")
+    source_list_path = posixpath.normpath(
+        source_list if posixpath.isabs(source_list) else posixpath.join(etc_path, source_list)
+    )
+    source_parts_path = posixpath.normpath(
+        source_parts if posixpath.isabs(source_parts) else posixpath.join(etc_path, source_parts)
+    )
+    if (source_list_path != str(APT_SOURCES_LIST_PATH)
+            or source_parts_path != str(APT_SOURCES_PARTS_PATH)):
+        raise SetupFailure("apt_source_configuration_path_unverified")
+    return booleans, paths
+
+
+def _validate_source_boolean_fields(records: list[dict[str, str]]) -> None:
+    for record in records:
+        for name, policy in APT_SECURITY_BOOLEAN_OPTIONS.items():
+            if name in record:
+                _check_apt_security_boolean(name, record[name], policy)
+
+
+def _parse_one_line_source_security(text: str) -> None:
+    if len(text) > APT_SOURCE_FILE_BYTES or "\x00" in text:
+        raise SetupFailure("apt_source_configuration_invalid")
+    entry = re.compile(r"^(?:deb|deb-src)(?:\s+\[([^\[\]]*)\])?\s+\S+\s+\S+(?:\s+.*)?$")
+    for line in text.splitlines():
+        if len(line) > 8192:
+            raise SetupFailure("apt_source_configuration_invalid")
+        uncommented = line.split("#", 1)[0].strip()
+        if not uncommented:
+            continue
+        match = entry.fullmatch(uncommented)
+        if not match:
+            raise SetupFailure("apt_source_configuration_invalid")
+        option_text = match.group(1)
+        if option_text is None:
+            if "[" in uncommented or "]" in uncommented:
+                raise SetupFailure("apt_source_configuration_invalid")
+            continue
+        try:
+            options = shlex.split(option_text, comments=False, posix=True)
+        except ValueError as exc:
+            raise SetupFailure("apt_source_configuration_invalid") from exc
+        seen: set[str] = set()
+        for option in options:
+            parsed = re.fullmatch(r"([a-z][a-z0-9-]*)([+\-]?=)(.*)", option, re.IGNORECASE)
+            if not parsed:
+                if any(option.casefold().startswith(name) for name in APT_SECURITY_BOOLEAN_OPTIONS):
+                    raise SetupFailure("apt_source_configuration_invalid")
+                continue
+            name, operator, value = parsed.groups()
+            name = name.casefold()
+            if name not in APT_SECURITY_BOOLEAN_OPTIONS:
+                continue
+            if name in seen:
+                raise SetupFailure("apt_security_configuration_duplicate_option")
+            seen.add(name)
+            if operator != "=":
+                raise SetupFailure("apt_source_configuration_invalid")
+            _check_apt_security_boolean(name, value, APT_SECURITY_BOOLEAN_OPTIONS[name])
+
+
+def _validate_apt_security_configuration(text: str,
+                                         source_files: dict[str, str]) -> dict[str, Any]:
+    booleans, _ = _parse_apt_config_dump(text)
+    for name, source_text in source_files.items():
+        if len(source_text) > APT_SOURCE_FILE_BYTES or "\x00" in source_text:
+            raise SetupFailure("apt_source_configuration_invalid")
+        if name.endswith(".sources"):
+            records = _parse_deb822_records(
+                source_text, failure_code="apt_source_configuration_invalid",
+                max_bytes=APT_SOURCE_FILE_BYTES,
+            )
+            _validate_source_boolean_fields(records)
+        elif name == "sources.list" or name.endswith(".list"):
+            _parse_one_line_source_security(source_text)
+        else:
+            raise SetupFailure("apt_source_configuration_file_type_unrecognized")
+    return {
+        "signed_repository_checks_enabled": True,
+        "freshness_checks_enabled": True,
+        "security_boolean_options_checked": len(APT_SECURITY_CONFIG_KEYS),
+        "source_control_files_checked": len(source_files),
+        "source_configuration_paths": "default_etc_apt",
+        "unsafe_overrides": [],
+    }
+
+
+def _read_apt_source_files() -> dict[str, str]:
+    files: dict[str, str] = {}
+    total_bytes = 0
+    source_list = _read_root_owned_file(
+        APT_SOURCES_LIST_PATH, limit=APT_SOURCE_FILE_BYTES,
+        failure_code="apt_source_configuration_unreadable", missing_ok=True,
+    )
+    if source_list is not None:
+        total_bytes += len(source_list)
+        try:
+            files["sources.list"] = source_list.decode("utf-8", "strict")
+        except UnicodeError as exc:
+            raise SetupFailure("apt_source_configuration_invalid") from exc
+
+    try:
+        directory = APT_SOURCES_PARTS_PATH.lstat()
+    except FileNotFoundError:
+        directory = None
+    except OSError as exc:
+        raise SetupFailure("apt_source_configuration_unreadable") from exc
+    if directory is not None:
+        if (not stat.S_ISDIR(directory.st_mode) or stat.S_ISLNK(directory.st_mode)
+                or directory.st_uid != 0 or directory.st_gid != 0
+                or directory.st_mode & 0o022):
+            raise SetupFailure("apt_source_configuration_directory_unverified")
+        try:
+            names: list[str] = []
+            entries_seen = 0
+            with os.scandir(APT_SOURCES_PARTS_PATH) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > APT_SOURCE_DIRECTORY_ENTRY_LIMIT:
+                        raise SetupFailure("apt_source_configuration_directory_limit_exceeded")
+                    if entry.name.endswith((".list", ".sources")):
+                        names.append(entry.name)
+                        if len(names) > APT_SOURCE_FILE_LIMIT:
+                            raise SetupFailure("apt_source_configuration_file_limit_exceeded")
+        except SetupFailure:
+            raise
+        except OSError as exc:
+            raise SetupFailure("apt_source_configuration_unreadable") from exc
+        for name in sorted(names):
+            path = APT_SOURCES_PARTS_PATH / name
+            content = _read_root_owned_file(
+                path, limit=APT_SOURCE_FILE_BYTES,
+                failure_code="apt_source_configuration_unreadable",
+            )
+            assert content is not None
+            total_bytes += len(content)
+            if total_bytes > APT_SOURCE_TOTAL_BYTES:
+                raise SetupFailure("apt_source_configuration_byte_limit_exceeded")
+            try:
+                files[name] = content.decode("utf-8", "strict")
+            except UnicodeError as exc:
+                raise SetupFailure("apt_source_configuration_invalid") from exc
+    if total_bytes > APT_SOURCE_TOTAL_BYTES:
+        raise SetupFailure("apt_source_configuration_byte_limit_exceeded")
+    return files
+
+
 def _apt_signature_configuration() -> dict[str, Any]:
     if "APT_CONFIG" in os.environ:
         raise SetupFailure("external_apt_configuration_override_unverified")
-    output, _ = _command(["apt-config", "dump"], limit=256 * 1024)
-    text = output.decode("utf-8", errors="strict")
-    unsafe = re.findall(
-        r"(?im)^\s*(APT::Get::AllowUnauthenticated|Acquire::AllowInsecureRepositories|"
-        r"Acquire::AllowDowngradeToInsecureRepositories|Acquire::AllowWeakRepositories)"
-        r"\s+\"(?:true|yes|1)\"\s*;",
-        text,
-    )
-    if unsafe:
-        raise SetupFailure("apt_signature_validation_is_disabled")
-    source_files = [Path("/etc/apt/sources.list"), *Path("/etc/apt/sources.list.d").glob("*")]
-    for source_file in source_files:
-        if source_file.is_symlink():
-            raise SetupFailure("apt_source_configuration_symlink_unverified")
-        if not source_file.is_file():
-            continue
-        try:
-            source_text = source_file.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise SetupFailure("apt_source_configuration_unreadable") from exc
-        if (re.search(r"(?i)(?:trusted|allow-insecure|allow-weak)\s*=\s*yes", source_text)
-                or re.search(r"(?im)^\s*(?:trusted|allow-insecure|allow-weak)\s*:\s*yes\s*$", source_text)):
-            raise SetupFailure("apt_source_configuration_bypasses_signature_checks")
-    return {"signed_repository_checks_enabled": True, "unsafe_overrides": []}
+    output, _ = _command([APT_CONFIG_PATH, "dump"], limit=256 * 1024)
+    try:
+        text = output.decode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise SetupFailure("apt_security_configuration_invalid") from exc
+    # Reject an unsafe effective value before touching host source files; the
+    # source scan below then verifies every file APT can load from the fixed
+    # source-list locations.
+    _parse_apt_config_dump(text)
+    return _validate_apt_security_configuration(text, _read_apt_source_files())
 
 
 def _read_profiles() -> list[str]:
@@ -930,6 +1244,45 @@ def _package_version(name: str) -> str:
     return output.decode("ascii", errors="strict").strip()
 
 
+def _apt_toolchain_evidence() -> dict[str, str]:
+    for command, expected_path in (
+        ("apt-get", APT_GET_PATH), ("apt-cache", APT_CACHE_PATH),
+        ("apt-config", APT_CONFIG_PATH),
+    ):
+        resolved = shutil.which(command)
+        if not resolved or os.path.realpath(resolved) != expected_path:
+            raise SetupFailure("apt_system_tool_path_unverified")
+        owner = _owner_of(expected_path).split(":", 1)[0]
+        if owner != "apt":
+            raise SetupFailure("apt_system_tool_package_owner_mismatch")
+    _verify_package("apt")
+    package_version = _package_version("apt")
+    expected_cli_version = APT_SUPPORTED_PACKAGE_VERSIONS.get(package_version)
+    if expected_cli_version is None:
+        raise SetupFailure("apt_package_version_unsupported", details={
+            "apt_package_version": (
+                package_version if re.fullmatch(r"[0-9A-Za-z.+:~\-]{1,64}", package_version)
+                else "unrecognized"
+            ),
+            "supported_package_versions": sorted(APT_SUPPORTED_PACKAGE_VERSIONS),
+        })
+    cli_version = _version([APT_GET_PATH, "--version"], r"apt ([0-9.]+) \(amd64\)")
+    if cli_version != expected_cli_version:
+        raise SetupFailure("apt_cli_package_version_mismatch", details={
+            "apt_cli_version": cli_version,
+            "apt_package_version": package_version,
+        })
+    return {
+        "package": "apt",
+        "package_version": package_version,
+        "apt_get_version": cli_version,
+        "apt_get_sha256": _sha256(Path(APT_GET_PATH)),
+        "apt_cache_sha256": _sha256(Path(APT_CACHE_PATH)),
+        "apt_config_sha256": _sha256(Path(APT_CONFIG_PATH)),
+        "supported_interface": "ubuntu_apt_2_7_14build2_or_2_8_3",
+    }
+
+
 def _owner_of(path: str) -> str:
     output, _ = _command(["dpkg-query", "-S", path], limit=8192)
     line = output.decode("utf-8", errors="strict").splitlines()[0]
@@ -980,6 +1333,11 @@ def prepare(evidence_path: Path) -> int:
         if platform.machine() not in {"x86_64", "amd64"}:
             raise SetupFailure("ubuntu_amd64_runner_required")
 
+        report["stage"] = "apt_toolchain_version"
+        apt_toolchain = _apt_toolchain_evidence()
+        report["apt_toolchain"] = apt_toolchain
+        _write_json(evidence_path, report)
+
         report["stage"] = "global_state_before_setup"
         before = _state_snapshot()
         report["global_state_before"] = _public_state(before)
@@ -992,13 +1350,15 @@ def prepare(evidence_path: Path) -> int:
 
         report["stage"] = "trusted_ubuntu_source_configuration"
         apt_transport = _runner_mirror_configuration()
+        apt_transport["apt_package_version"] = apt_toolchain["package_version"]
         report["apt_source_transport"] = {
             key: value for key, value in apt_transport.items() if not key.startswith("_")
         }
         _write_json(evidence_path, report)
 
         report["stage"] = "signed_apt_index_refresh"
-        _quiet_command(["sudo", "-n", "apt-get", "-o", "APT::Update::Error-Mode=any",
+        _quiet_command(["/usr/bin/sudo", "-n", APT_GET_PATH,
+                        "-o", "APT::Update::Error-Mode=any",
                         "update", "-qq"], timeout=240)
 
         report["stage"] = "bubblewrap_package_record"
@@ -1013,7 +1373,8 @@ def prepare(evidence_path: Path) -> int:
         _write_json(evidence_path, report)
 
         report["stage"] = "bubblewrap_package_install"
-        _quiet_command(["sudo", "-n", "apt-get", "install", "--no-install-recommends", "--yes",
+        _quiet_command(["/usr/bin/sudo", "-n", APT_GET_PATH,
+                        "install", "--no-install-recommends", "--yes",
                         "bubblewrap=" + BWRAP_VERSION], timeout=180)
         bwrap_path = shutil.which("bwrap")
         if not bwrap_path or os.path.realpath(bwrap_path) != "/usr/bin/bwrap":
@@ -1051,7 +1412,7 @@ def prepare(evidence_path: Path) -> int:
         report["stage"] = "profile_package_authenticated_download"
         with tempfile.TemporaryDirectory(prefix="acv1-native-profile-hardening-") as temporary:
             work = Path(temporary)
-            _quiet_command(["apt-get", "download", PROFILE_PACKAGE + "=" + PROFILE_VERSION],
+            _quiet_command([APT_GET_PATH, "download", PROFILE_PACKAGE + "=" + PROFILE_VERSION],
                            timeout=120, cwd=work)
             packages = list(work.glob("*.deb"))
             if len(packages) != 1:

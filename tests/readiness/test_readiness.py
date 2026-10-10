@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import resource
+import re
 import shutil
 import subprocess
 import sys
@@ -39,13 +40,19 @@ def synthetic_apt_transport() -> dict:
                     for line in profile_setup.APT_MIRRORLIST_BYTES.splitlines())
     return {
         "transport": "github_ubuntu_runner_root_owned_mirrorlist",
+        "source_layout": "noble_archive_security_split",
+        "source_file_sha256": sha(SYNTHETIC_UBUNTU_SOURCES.encode("utf-8")),
         "_source_uri": profile_setup.APT_MIRROR_URI,
         "_mirror_uris": mirrors,
         "mirrorlist_sha256": sha(profile_setup.APT_MIRRORLIST_BYTES),
+        "signed_by": "ubuntu_archive_keyring_package",
+        "ubuntu_archive_keyring_sha256": "f" * 64,
+        "apt_package_version": "2.8.3",
     }
 
 
 def synthetic_apt_index_target(repo_uri: str | None = None, **changes: str) -> str:
+    repository = (repo_uri or profile_setup.APT_MIRROR_URI).rstrip("/")
     values = {
         "Identifier": "Packages",
         "MetaKey": "main/binary-amd64/Packages",
@@ -57,8 +64,8 @@ def synthetic_apt_index_target(repo_uri: str | None = None, **changes: str) -> s
         "Origin": "Ubuntu",
         "Label": "Ubuntu",
         "Trusted": "yes",
-        "Signed-By": str(profile_setup.UBUNTU_ARCHIVE_KEYRING),
         "Repo-URI": repo_uri or profile_setup.APT_MIRROR_URI,
+        "URI": repository + "/dists/noble-updates/main/binary-amd64/Packages",
     }
     values.update(changes)
     return "".join(f"{field}: {value}\n" for field, value in values.items()) + "\n"
@@ -1507,15 +1514,16 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                          "https://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages")
         self.assertEqual(parsed["_release_evidence"]["trusted"], "yes")
         self.assertEqual(command.call_args_list[0].args[0], [
-            "apt-cache", "-o", "APT::Cache::ShowFull=true",
+            profile_setup.APT_CACHE_PATH, "-o", "APT::Cache::ShowFull=true",
             "-o", "APT::Cache::Show::Version=1", "show",
             "apparmor-profiles=4.0.1really4.0.1-0ubuntu0.24.04.8"])
         self.assertEqual(command.call_args_list[1].args[0], [
-            "apt-cache", "-o", "APT::Cache::ShowFull=true",
+            profile_setup.APT_CACHE_PATH, "-o", "APT::Cache::ShowFull=true",
             "-o", "APT::Cache::Show::Version=2", "show",
             "apparmor-profiles=4.0.1really4.0.1-0ubuntu0.24.04.8"])
         self.assertEqual(command.call_args_list[2].args[0], [
-            "apt-get", "indextargets", "--format", profile_setup.APT_INDEXTARGETS_FORMAT])
+            profile_setup.APT_GET_PATH, "-o", "APT::Get::IndexTargets::ReleaseInfo=true",
+            "indextargets", "--format", profile_setup.APT_INDEXTARGETS_FORMAT])
         self.assertEqual(command.call_args_list[0].kwargs["apt_phase"], "metadata_v1")
         self.assertEqual(command.call_args_list[1].kwargs["apt_phase"], "source_v2")
         self.assertEqual(command.call_args_list[2].kwargs["apt_phase"], "index_targets")
@@ -1628,6 +1636,9 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 mock.patch.object(profile_setup.platform, "machine", return_value="x86_64"), \
                 mock.patch.object(Path, "read_text", autospec=True, side_effect=read_text), \
                 mock.patch.object(profile_setup, "_state_snapshot", return_value=state), \
+                mock.patch.object(profile_setup, "_apt_toolchain_evidence", return_value={
+                    "package": "apt", "package_version": "2.8.3", "apt_get_version": "2.8.3",
+                    "supported_interface": "ubuntu_apt_2_7_14build2_or_2_8_3"}), \
                 mock.patch.object(profile_setup, "_apt_signature_configuration", return_value={
                     "signed_repository_checks_enabled": True, "unsafe_overrides": []}), \
                 mock.patch.object(profile_setup, "_runner_mirror_configuration",
@@ -1771,10 +1782,280 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                                         "external_apt_configuration_override_unverified"):
                 profile_setup._apt_signature_configuration()
         with mock.patch.object(profile_setup, "_command", return_value=(
-                b'Acquire::AllowWeakRepositories "true";\n', b"")):
+                b'Acquire::AllowWeakRepositories "true";\n', b"")), \
+                mock.patch.object(profile_setup, "_read_apt_source_files", return_value={}):
             with self.assertRaisesRegex(profile_setup.SetupFailure,
-                                        "apt_signature_validation_is_disabled"):
+                                        "apt_source_configuration_bypasses_signature_checks"):
                 profile_setup._apt_signature_configuration()
+
+    def test_apt_boolean_parser_matches_noble_string_to_bool_aliases_and_numeric_forms(self) -> None:
+        for value in ("yes", "true", "with", "on", "enable", "YES", "TrUe", "ON",
+                      "1", "01", "0x1", "+1", "0X01"):
+            with self.subTest(value=value):
+                self.assertIs(profile_setup._apt_boolean_value(value), True)
+        for value in ("no", "false", "without", "off", "disable", "NO", "FaLsE",
+                      "0", "00", "0x0", "+0", "-0"):
+            with self.subTest(value=value):
+                self.assertIs(profile_setup._apt_boolean_value(value), False)
+        for value in ("", "enabled", "2", "-1", "0x2", "0b1", "perhaps"):
+            with self.subTest(value=value):
+                self.assertIsNone(profile_setup._apt_boolean_value(value))
+
+    def test_apt_security_audit_rejects_source_aliases_and_disabled_freshness(self) -> None:
+        true_spellings = ("true", "1", "on", "enable", "with", "YES", "0x1")
+        source_boolean_options = (
+            ("Trusted", "trusted"), ("Allow-Insecure", "allow-insecure"),
+            ("Allow-Weak", "allow-weak"),
+            ("Allow-Downgrade-To-Insecure", "allow-downgrade-to-insecure"),
+        )
+        for value in true_spellings:
+            for deb822_field, one_line_option in source_boolean_options:
+                source = SYNTHETIC_UBUNTU_SOURCES + f"{deb822_field}: {value}\n"
+                with self.subTest(source_field=deb822_field, source_value=value), self.assertRaisesRegex(
+                        profile_setup.SetupFailure,
+                        "apt_source_configuration_bypasses_signature_checks"):
+                    profile_setup._validate_apt_security_configuration(
+                        "", {"ubuntu.sources": source})
+                one_line = (
+                    f"deb [{one_line_option}=\"{value}\"] "
+                    "https://archive.ubuntu.com/ubuntu noble main\n")
+                with self.subTest(one_line_option=one_line_option, one_line_value=value), \
+                        self.assertRaisesRegex(profile_setup.SetupFailure,
+                                               "apt_source_configuration_bypasses_signature_checks"):
+                    profile_setup._validate_apt_security_configuration(
+                        "", {"archive.list": one_line})
+        for field in ("Check-Valid-Until", "Check-Date"):
+            for value in ("no", "false", "without", "off", "disable", "0", "00", "0x0"):
+                source = SYNTHETIC_UBUNTU_SOURCES + f"{field}: {value}\n"
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                        profile_setup.SetupFailure,
+                        "apt_source_configuration_disables_freshness_checks"):
+                    profile_setup._validate_apt_security_configuration(
+                        "", {"ubuntu.sources": source})
+                option = field.casefold()
+                one_line = (
+                    f"deb [{option}=\"{value}\"] https://archive.ubuntu.com/ubuntu noble main\n")
+                with self.subTest(one_line_option=option, one_line_value=value), \
+                        self.assertRaisesRegex(
+                            profile_setup.SetupFailure,
+                            "apt_source_configuration_disables_freshness_checks"):
+                    profile_setup._validate_apt_security_configuration(
+                        "", {"archive.list": one_line})
+
+    def test_apt_security_audit_checks_global_aliases_defaults_and_duplicate_values(self) -> None:
+        for key, policy in profile_setup.APT_SECURITY_CONFIG_KEYS.items():
+            if policy == "reject_true":
+                values = ("true", "1", "on", "enable", "with", "YES", "0x1")
+                expected = "apt_source_configuration_bypasses_signature_checks"
+            else:
+                values = ("false", "0", "off", "disable", "without", "NO", "0x0")
+                expected = "apt_source_configuration_disables_freshness_checks"
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                        profile_setup.SetupFailure, expected):
+                    profile_setup._validate_apt_security_configuration(
+                        f'{key} "{value}";\n', {})
+        for text in (
+            'Acquire::AllowWeakRepositories "maybe";\n',
+            'Acquire::Check-Date "2";\n',
+            'Acquire::Check-Date "true";\nAcquire::Check-Date "false";\n',
+            'Dir::Etc::sourceparts "/tmp/foreign-sources";\n',
+        ):
+            with self.subTest(config=text), self.assertRaises(profile_setup.SetupFailure):
+                profile_setup._validate_apt_security_configuration(text, {})
+        safe = (
+            'Acquire::AllowWeakRepositories "without";\n'
+            'Acquire::AllowInsecureRepositories "0";\n'
+            'Acquire::Check-Date "enable";\n'
+            'Acquire::Check-Valid-Until "1";\n'
+        )
+        evidence = profile_setup._validate_apt_security_configuration(safe, {})
+        self.assertTrue(evidence["signed_repository_checks_enabled"])
+        self.assertTrue(evidence["freshness_checks_enabled"])
+
+    def test_apt_security_audit_rejects_malformed_and_duplicate_source_options(self) -> None:
+        valid_line = (
+            "deb [trusted=no allow-insecure=0 allow-weak=off "
+            "allow-downgrade-to-insecure=disable check-valid-until=yes check-date=1] "
+            "https://archive.ubuntu.com/ubuntu noble main\n"
+        )
+        self.assertTrue(profile_setup._validate_apt_security_configuration(
+            "", {"sources.list": valid_line})["signed_repository_checks_enabled"])
+        invalid = (
+            "deb [trusted=perhaps] https://archive.ubuntu.com/ubuntu noble main\n",
+            "deb [trusted=no trusted=false] https://archive.ubuntu.com/ubuntu noble main\n",
+            "deb [trusted+=no] https://archive.ubuntu.com/ubuntu noble main\n",
+            "deb [trusted] https://archive.ubuntu.com/ubuntu noble main\n",
+            "deb [trusted=on https://archive.ubuntu.com/ubuntu noble main\n",
+        )
+        for text in invalid:
+            with self.subTest(text=text), self.assertRaises(profile_setup.SetupFailure):
+                profile_setup._validate_apt_security_configuration("", {"sources.list": text})
+        duplicate_deb822 = SYNTHETIC_UBUNTU_SOURCES + (
+            "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_source_configuration_invalid"):
+            profile_setup._validate_apt_security_configuration(
+                "", {"ubuntu.sources": duplicate_deb822})
+
+    def test_native_profile_setup_keeps_source_split_strict_and_rejects_ambiguous_targets(self) -> None:
+        valid = SYNTHETIC_UBUNTU_SOURCES.encode("utf-8")
+        self.assertEqual(profile_setup._validate_runner_mirror_configuration(
+            valid, profile_setup.APT_MIRRORLIST_BYTES)["mirror_source_stanza_count"], 2)
+        for changed in (
+            SYNTHETIC_UBUNTU_SOURCES + SYNTHETIC_UBUNTU_SOURCES.split("\n\n", 1)[0],
+            SYNTHETIC_UBUNTU_SOURCES.replace("noble-security", "noble-updates"),
+            SYNTHETIC_UBUNTU_SOURCES.replace(
+                "mirror+file:/etc/apt/apt-mirrors.txt",
+                "mirror+file:/etc/apt/apt-mirrors.txt https://extra.invalid/ubuntu"),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(profile_setup.SetupFailure):
+                profile_setup._validate_runner_mirror_configuration(
+                    changed.encode(), profile_setup.APT_MIRRORLIST_BYTES)
+        source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
+        ambiguous = synthetic_apt_index_target() + synthetic_apt_index_target()
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_target_missing_or_ambiguous"):
+            profile_setup._validate_signed_apt_index_target(
+                ambiguous, source, synthetic_apt_transport())
+
+    def test_native_profile_setup_supported_indextargets_format_omits_unavailable_signed_by(self) -> None:
+        variables = set(re.findall(r"\$\(([A-Z_]+)\)", profile_setup.APT_INDEXTARGETS_FORMAT))
+        self.assertEqual(variables, {
+            "IDENTIFIER", "METAKEY", "TARGET_OF", "ARCHITECTURE", "COMPONENT",
+            "SUITE", "CODENAME", "ORIGIN", "LABEL", "TRUSTED", "REPO_URI", "URI",
+        })
+        self.assertNotIn("SIGNED_BY", variables)
+        output = synthetic_apt_index_target()
+        self.assertNotIn("$(", output)
+        self.assertNotIn("Signed-By:", output)
+        source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
+        for package_version in profile_setup.APT_SUPPORTED_PACKAGE_VERSIONS:
+            transport = synthetic_apt_transport()
+            transport["apt_package_version"] = package_version
+            evidence = profile_setup._validate_signed_apt_index_target(
+                output, source, transport)
+            self.assertEqual(evidence["signer_binding"], "root_owned_source_stanza")
+            self.assertEqual(evidence["apt_package_version"], package_version)
+
+    def test_native_profile_setup_rejects_unexpanded_index_fields_and_missing_keyring_binding(self) -> None:
+        source = profile_setup.APT_MIRROR_URI + " noble-updates/main amd64 Packages"
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_target_unexpanded_format_variable"):
+            profile_setup._validate_signed_apt_index_target(
+                synthetic_apt_index_target() + "$(SIGNED_BY)\n", source,
+                synthetic_apt_transport())
+        missing = synthetic_apt_transport()
+        missing["ubuntu_archive_keyring_sha256"] = "unverified"
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "apt_signed_release_source_keyring_binding_missing"):
+            profile_setup._validate_signed_apt_index_target(
+                synthetic_apt_index_target(), source, missing)
+
+    def test_native_profile_setup_records_only_supported_apt_package_and_cli_versions(self) -> None:
+        for package_version, cli_version in profile_setup.APT_SUPPORTED_PACKAGE_VERSIONS.items():
+            with self.subTest(package_version=package_version), \
+                    mock.patch.object(profile_setup.shutil, "which", side_effect=lambda name: {
+                        "apt-get": profile_setup.APT_GET_PATH,
+                        "apt-cache": profile_setup.APT_CACHE_PATH,
+                        "apt-config": profile_setup.APT_CONFIG_PATH,
+                    }[name]), \
+                    mock.patch.object(profile_setup, "_owner_of", return_value="apt"), \
+                    mock.patch.object(profile_setup, "_package_version", return_value=package_version), \
+                    mock.patch.object(profile_setup, "_verify_package"), \
+                    mock.patch.object(profile_setup, "_sha256", return_value="a" * 64), \
+                    mock.patch.object(profile_setup, "_version", return_value=cli_version):
+                evidence = profile_setup._apt_toolchain_evidence()
+            self.assertEqual(evidence["package_version"], package_version)
+            self.assertEqual(evidence["apt_get_version"], cli_version)
+        with mock.patch.object(profile_setup.shutil, "which", side_effect=lambda name: {
+                    "apt-get": profile_setup.APT_GET_PATH,
+                    "apt-cache": profile_setup.APT_CACHE_PATH,
+                    "apt-config": profile_setup.APT_CONFIG_PATH,
+                }[name]), \
+                mock.patch.object(profile_setup, "_owner_of", return_value="apt"), \
+                mock.patch.object(profile_setup, "_package_version", return_value="3.0.0"), \
+                mock.patch.object(profile_setup, "_verify_package"):
+            with self.assertRaisesRegex(profile_setup.SetupFailure, "apt_package_version_unsupported"):
+                profile_setup._apt_toolchain_evidence()
+
+        with mock.patch.object(profile_setup.shutil, "which", side_effect=lambda name: {
+                    "apt-get": profile_setup.APT_GET_PATH,
+                    "apt-cache": profile_setup.APT_CACHE_PATH,
+                    "apt-config": profile_setup.APT_CONFIG_PATH,
+                }[name]), \
+                mock.patch.object(profile_setup, "_owner_of", return_value="apt"), \
+                mock.patch.object(profile_setup, "_package_version", return_value="2.8.3"), \
+                mock.patch.object(profile_setup, "_verify_package"), \
+                mock.patch.object(profile_setup, "_sha256", return_value="a" * 64), \
+                mock.patch.object(profile_setup, "_version", return_value="2.8.4"):
+            with self.assertRaisesRegex(profile_setup.SetupFailure, "apt_cli_package_version_mismatch"):
+                profile_setup._apt_toolchain_evidence()
+
+    def test_apt_cache_records_accept_descriptive_multiline_fields_and_reject_identity_duplicates(self) -> None:
+        version = profile_setup.PROFILE_VERSION
+        metadata = (
+            "Package: apparmor-profiles\n"
+            f"Version: {version}\n"
+            "Architecture: all\n"
+            f"Filename: pool/main/a/apparmor/apparmor-profiles_{version}_all.deb\n"
+            f"SHA256: {profile_setup.PROFILE_DEB_SHA256}\n"
+            "Depends: bubblewrap,\n apparmor\n"
+            "Description: profile bundle summary\n continuation detail\n .\n final detail\n"
+        )
+        source_record = (
+            "Package: apparmor-profiles:all\n"
+            f"Version: {version}\n"
+            f"Filename: pool/main/a/apparmor/apparmor-profiles_{version}_all.deb\n"
+            f"SHA256: {profile_setup.PROFILE_DEB_SHA256}\n"
+            "APT-Sources: mirror+file:/etc/apt/apt-mirrors.txt noble-updates/main amd64 Packages\n"
+            "Description: source metadata may contain continuation lines\n extra detail\n"
+        )
+        parsed = profile_setup.validate_apt_record(
+            metadata, profile_setup.PROFILE_PACKAGE, version,
+            profile_setup.PROFILE_DEB_SHA256, source_text=source_record)
+        self.assertEqual(parsed["Architecture"], "all")
+        self.assertEqual(parsed["SHA256"], profile_setup.PROFILE_DEB_SHA256)
+
+        identity_lines = {
+            "Package": "apparmor-profiles", "Version": version,
+            "Architecture": "all",
+            "Filename": f"pool/main/a/apparmor/apparmor-profiles_{version}_all.deb",
+            "SHA256": profile_setup.PROFILE_DEB_SHA256,
+            "APT-Sources": "mirror+file:/etc/apt/apt-mirrors.txt noble-updates/main amd64 Packages",
+        }
+        for field, value in identity_lines.items():
+            metadata_fields = 1 if field.lower() in {"package", "version", "architecture", "filename", "sha256"} else 0
+            bad_metadata = metadata + (f"{field}: {value}\n" * (2 if metadata_fields == 0 else 1))
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "apt_package_record_invalid"):
+                profile_setup.validate_apt_record(
+                    bad_metadata, profile_setup.PROFILE_PACKAGE, version,
+                    profile_setup.PROFILE_DEB_SHA256, source_text=source_record)
+            folded_metadata = metadata + f"{field}: {value}\n folded\n"
+            with self.subTest(folded_field=field), self.assertRaisesRegex(
+                    profile_setup.SetupFailure, "apt_package_record_invalid"):
+                profile_setup.validate_apt_record(
+                    folded_metadata, profile_setup.PROFILE_PACKAGE, version,
+                    profile_setup.PROFILE_DEB_SHA256, source_text=source_record)
+            source_fields = 1 if field.lower() in {
+                "package", "version", "filename", "sha256", "apt-sources"} else 0
+            bad_source = source_record + (f"{field}: {value}\n" * (2 if source_fields == 0 else 1))
+            with self.subTest(source_field=field), self.assertRaises(profile_setup.SetupFailure):
+                profile_setup.validate_apt_record(
+                    metadata, profile_setup.PROFILE_PACKAGE, version,
+                    profile_setup.PROFILE_DEB_SHA256, source_text=bad_source)
+
+        with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                    "exact_signed_apt_package_record_missing_or_ambiguous"):
+            profile_setup.validate_apt_record(
+                metadata + "\n" + metadata, profile_setup.PROFILE_PACKAGE, version,
+                profile_setup.PROFILE_DEB_SHA256, source_text=source_record)
+        oversized = "Description: " + ("x" * (128 * 1024)) + "\n" + metadata
+        with self.assertRaisesRegex(profile_setup.SetupFailure, "apt_package_record_invalid"):
+            profile_setup.validate_apt_record(
+                oversized, profile_setup.PROFILE_PACKAGE, version,
+                profile_setup.PROFILE_DEB_SHA256, source_text=source_record)
 
     def test_native_profile_setup_rejects_any_unreviewed_local_include(self) -> None:
         with tempfile.TemporaryDirectory(prefix="acv1-local-profile-override-") as temp:
