@@ -136,6 +136,20 @@ class CICheckerClassificationTests(unittest.TestCase):
         self.assertEqual(safe["nested_userns_process_exit_code"], 1)
         self.assertNotIn("raw_stderr", safe)
 
+    def test_structured_observations_accept_combined_namespace_stage_and_reject_unknown_stage(self):
+        safe = ci._safe_sandbox_observations({
+            "nested_bwrap_setup_stage": "combined_namespace_creation_failed",
+            "nested_bwrap_stderr_class": "other",
+        })
+        self.assertEqual(safe["nested_bwrap_setup_stage"], "combined_namespace_creation_failed")
+        self.assertEqual(safe["nested_bwrap_stderr_class"], "other")
+        unsafe = ci._safe_sandbox_observations({
+            "nested_bwrap_setup_stage": "user-supplied-stage",
+            "nested_bwrap_stderr_class": "user-supplied-class",
+        })
+        self.assertNotIn("nested_bwrap_setup_stage", unsafe)
+        self.assertNotIn("nested_bwrap_stderr_class", unsafe)
+
     def test_sandbox_probe_reads_synthetic_host_canary_after_canary_failure(self):
         with tempfile.TemporaryDirectory(prefix="acv1-host-canary-observation-") as temp:
             root = Path(temp)

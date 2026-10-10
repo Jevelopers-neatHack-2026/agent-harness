@@ -1515,11 +1515,12 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         child_stderr_class = report.get("child_stderr_class")
         allowed_stderr_classes = {"empty", "operation_not_permitted", "permission_denied", "missing_file",
                                   "python_dependency_import_failure", "python_traceback", "other"}
+        allowed_nested_stderr_classes = allowed_stderr_classes | {"mapping_setup_failure"}
         flags["child_stderr_class"] = child_stderr_class if child_stderr_class in allowed_stderr_classes else "unavailable"
         nested_exit = report.get("nested_userns_process_exit_code")
         flags["nested_userns_exit_code"] = nested_exit if type(nested_exit) is int else "unavailable"
         nested_stderr = report.get("nested_userns_stderr_class")
-        flags["nested_userns_stderr_class"] = nested_stderr if nested_stderr in allowed_stderr_classes else "unavailable"
+        flags["nested_userns_stderr_class"] = nested_stderr if nested_stderr in allowed_nested_stderr_classes else "unavailable"
         mapping_stage = report.get("nested_userns_mapping_stage")
         flags["nested_userns_mapping_stage"] = mapping_stage if mapping_stage in {
             "not_observed", "completed", "uid_mapping_failed", "gid_mapping_failed",
@@ -1540,6 +1541,12 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         nested_cap_eff = report.get("nested_cap_eff")
         flags["nested_cap_eff"] = nested_cap_eff if isinstance(nested_cap_eff, str) and len(nested_cap_eff) <= 32 \
             and all(char in "0123456789abcdefABCDEF" for char in nested_cap_eff) else "unavailable"
+        bwrap_stage = report.get("nested_bwrap_setup_stage")
+        flags["nested_bwrap_setup_stage"] = bwrap_stage if bwrap_stage in {
+            "not_run", "payload_reached", "loopback_setup_denied", "loopback_link_setup_failed",
+            "combined_namespace_creation_failed", "user_namespace_creation_failed", "uid_mapping_failed",
+            "gid_mapping_failed", "setgroups_mapping_failed", "mount_setup_failed", "setup_or_exec_failed",
+            "timeout_or_output_limit", "not_observed"} else "unavailable"
     detail = {
         "process_code": code,
         "exit_code": exit_code,
@@ -1547,8 +1554,24 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         "stderr": (stderr_excerpt or "<empty>")[:120],
         "canary": flags,
     }
-    return ("bubblewrap internal canary failed: "
-            + json.dumps(detail, sort_keys=True, separators=(",", ":")))[:640]
+    prefix = "bubblewrap internal canary failed: "
+    serialized = json.dumps(detail, sort_keys=True, separators=(",", ":"))
+    if len(prefix) + len(serialized) > 640:
+        # Keep the compact diagnostic valid JSON and retain the finite stage
+        # evidence even when the full set of boolean observations is present.
+        compact_keys = (
+            "nested_userns_stderr_class", "nested_userns_mapping_stage", "nested_userns_errno_category",
+            "nested_bwrap_setup_stage", "nested_bwrap_errno_category", "nested_mount_attempted",
+            "nested_mount_errno_category", "nested_capability_denied", "nested_mount_namespace_created",
+            "nested_bwrap_denied",
+        )
+        detail["canary"] = {key: flags[key] for key in compact_keys if key in flags}
+        for excerpt_limit in (72, 48, 24, 0):
+            detail["stderr"] = (stderr_excerpt or "<empty>")[:excerpt_limit]
+            serialized = json.dumps(detail, sort_keys=True, separators=(",", ":"))
+            if len(prefix) + len(serialized) <= 640:
+                break
+    return prefix + serialized
 
 
 def _classify_namespace_setup_stderr(stderr: bytes, utility: str, utility_version: str | None = None) -> str:
@@ -1573,9 +1596,14 @@ def _classify_namespace_setup_stderr(stderr: bytes, utility: str, utility_versio
     if utility == "bubblewrap":
         if utility_version not in (None, "0.9.0"):
             return "setup_or_exec_failed"
-        if ("unshare user ns" in text or "no permissions to creating new namespace" in text
-                or "creating new namespace failed" in text):
+        if "unshare user ns" in text:
             return "user_namespace_creation_failed"
+        # Bubblewrap 0.9.0's raw_clone request combines multiple namespace
+        # types, so these diagnostics identify the combined creation stage,
+        # not a particular namespace or the kernel policy cause.
+        if ("no permissions to creating new namespace" in text
+                or "creating new namespace failed" in text):
+            return "combined_namespace_creation_failed"
         if "setting up uid map" in text:
             return "uid_mapping_failed"
         if "setting up gid map" in text:

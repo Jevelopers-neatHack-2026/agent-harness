@@ -1558,6 +1558,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(classify(b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted", "bubblewrap"),
                          "loopback_setup_denied")
         self.assertEqual(classify(b"bwrap: No permissions to creating new namespace, likely because user namespaces are disabled",
+                                  "bubblewrap", "0.9.0"), "combined_namespace_creation_failed")
+        self.assertEqual(classify(b"bwrap: Creating new namespace failed: Operation not permitted",
+                                  "bubblewrap", "0.9.0"), "combined_namespace_creation_failed")
+        self.assertEqual(classify(b"bwrap: unshare user ns failed: Operation not permitted",
                                   "bubblewrap", "0.9.0"), "user_namespace_creation_failed")
         self.assertEqual(classify(b"bwrap: setting up gid map: Operation not permitted", "bubblewrap", "0.9.0"),
                          "gid_mapping_failed")
@@ -1568,6 +1572,49 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(errno_class(b"unshare: Operation not permitted"), "operation_not_permitted")
         self.assertEqual(errno_class(b"unshare: Permission denied"), "permission_denied")
         self.assertEqual(errno_class(b""), "empty")
+
+    def test_compact_sandbox_failure_preserves_known_stages_and_sanitizes_unknown_values(self) -> None:
+        report = {key: True for key in (
+            "outside_read_blocked", "private_shadow_visible", "sandbox_shadow_write_succeeded",
+            "network_blocked", "network_namespace_isolated", "apparmor_stack_verified",
+            "payload_no_new_privs", "payload_capability_sets_zero", "python_reexec_stack_verified",
+            "other_exec_stack_verified", "nested_userns_created", "nested_capability_sets_observed",
+            "nested_mount_attempted", "nested_mount_namespace_denied", "nested_mount_namespace_created",
+            "nested_bwrap_denied", "child_isolated", "child_stderr_present",
+        )}
+        report.update({
+            "child_exit_code": 1,
+            "child_stderr_class": "other",
+            "nested_userns_process_exit_code": 1,
+            "nested_userns_stderr_class": "mapping_setup_failure",
+            "nested_userns_mapping_stage": "uid_mapping_failed",
+            "nested_userns_errno_category": "operation_not_permitted",
+            "nested_bwrap_errno_category": "operation_not_permitted",
+            "nested_mount_errno_category": "permission_denied",
+            "nested_bwrap_setup_stage": "combined_namespace_creation_failed",
+            "nested_userns_source_identity": "util-linux-v2.39.3-sys-utils-unshare.c",
+            "nested_bwrap_source_identity": "bubblewrap-v0.9.0-bubblewrap.c+network.c",
+            "nested_cap_eff": "0000000000000000",
+        })
+        reason = contracts._sandbox_process_failure({
+            "code": "adapter_nonzero_exit", "returncode": 1,
+            "stderr": b"mapping setup failed at /private/runner/path",
+        }, report)
+        prefix = "bubblewrap internal canary failed: "
+        self.assertTrue(reason.startswith(prefix))
+        self.assertLessEqual(len(reason), 640)
+        compact = json.loads(reason[len(prefix):])
+        self.assertEqual(compact["canary"]["nested_userns_stderr_class"], "mapping_setup_failure")
+        self.assertEqual(compact["canary"]["nested_bwrap_setup_stage"], "combined_namespace_creation_failed")
+        self.assertNotIn("/private/runner", reason)
+
+        report["nested_userns_stderr_class"] = "untrusted/raw-value"
+        report["nested_bwrap_setup_stage"] = "untrusted/raw-stage"
+        unknown_reason = contracts._sandbox_process_failure({
+            "code": "adapter_nonzero_exit", "returncode": 1, "stderr": b""}, report)
+        unknown_compact = json.loads(unknown_reason[len(prefix):])
+        self.assertEqual(unknown_compact["canary"]["nested_userns_stderr_class"], "unavailable")
+        self.assertEqual(unknown_compact["canary"]["nested_bwrap_setup_stage"], "unavailable")
 
     def test_native_profile_setup_accepts_only_exact_signed_ubuntu_apt_record(self) -> None:
         record = (
