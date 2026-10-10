@@ -1,0 +1,35 @@
+name: Runtime foundation
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  internal-foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .node-version
+      - name: Verify pinned toolchain and locked package
+        run: |
+          node --version
+          npm --version
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build and import internal entrypoint
+        run: make check
+      - name: Run offline runtime tests
+        run: |
+          mkdir -p .runtime-artifacts
+          npm test > .runtime-artifacts/runtime-foundation.tap
+      - name: Upload sanitized test trace
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: runtime-foundation-node22
+          path: .runtime-artifacts/runtime-foundation.tap
+          if-no-files-found: warn

@@ -1,0 +1,26 @@
+{
+  "name": "@jevelopers/agent-harness-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Experimental internal durability primitives for agent-harness",
+  "engines": {
+    "node": ">=22.23.3 <23"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/internal/index.d.ts",
+      "import": "./src/internal/index.js"
+    }
+  },
+  "scripts": {
+    "build": "node --check src/internal/errors.js && node --check src/internal/config.js && node --check src/internal/durable-store.js && node --check src/internal/index.js && node --input-type=module -e \"import('@jevelopers/agent-harness-runtime')\" && npm run typecheck",
+    "typecheck": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext tests/runtime/public-api.typecheck.ts",
+    "check": "npm run build",
+    "test": "node --test --test-concurrency=1 tests/runtime/*.test.js",
+    "test:internal": "node --test --test-concurrency=1 tests/runtime/*.test.js"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
