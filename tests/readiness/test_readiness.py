@@ -1509,8 +1509,17 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("nested_userns_setup_stage", parent_code)
         self.assertIn("nested_userns_creation_attempted", parent_code)
         self.assertIn("nested_userns_mapping_observation", parent_code)
+        self.assertIn("'--map-user=0'", parent_code)
+        self.assertNotIn("--map-root-user", parent_code)
         self.assertIn("user_namespace_creation_failed", parent_code)
         self.assertIn("uid_mapping_failed", parent_code)
+        self.assertIn("nested_userns_mapping_stage", parent_code)
+        self.assertIn("nested_userns_errno_category", parent_code)
+        self.assertIn("nested_bwrap_errno_category", parent_code)
+        self.assertIn("nested_userns_source_identity", parent_code)
+        self.assertIn("nested_bwrap_source_identity", parent_code)
+        self.assertIn("'--unshare-user'", parent_code)
+        self.assertIn("'--unshare-net'", parent_code)
         self.assertIn("_classify_namespace_setup_stderr", parent_code)
         self.assertIn("nested_userns_utility_version", parent_code)
         self.assertIn("nested_mount_attempted", parent_code)
@@ -1541,10 +1550,24 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                          "user_namespace_creation_failed")
         self.assertEqual(classify(b"unshare: write failed /proc/17/uid_map: Operation not permitted", "unshare"),
                          "uid_mapping_failed")
+        self.assertEqual(classify(b"unshare: write failed /proc/17/gid_map: Operation not permitted", "unshare"),
+                         "gid_mapping_failed")
+        self.assertEqual(classify(b"unshare: write failed /proc/17/setgroups: Operation not permitted", "unshare"),
+                         "setgroups_mapping_failed")
         self.assertEqual(classify(b"unshare: Operation not permitted", "unshare"), "setup_before_payload")
         self.assertEqual(classify(b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted", "bubblewrap"),
                          "loopback_setup_denied")
+        self.assertEqual(classify(b"bwrap: No permissions to creating new namespace, likely because user namespaces are disabled",
+                                  "bubblewrap", "0.9.0"), "user_namespace_creation_failed")
+        self.assertEqual(classify(b"bwrap: setting up gid map: Operation not permitted", "bubblewrap", "0.9.0"),
+                         "gid_mapping_failed")
+        self.assertEqual(classify(b"bwrap: No permissions to creating new namespace", "bubblewrap", "1.0.0"),
+                         "setup_or_exec_failed")
         self.assertEqual(classify(b"bwrap: Operation not permitted", "bubblewrap"), "setup_or_exec_failed")
+        errno_class = contracts._namespace_setup_errno_category
+        self.assertEqual(errno_class(b"unshare: Operation not permitted"), "operation_not_permitted")
+        self.assertEqual(errno_class(b"unshare: Permission denied"), "permission_denied")
+        self.assertEqual(errno_class(b""), "empty")
 
     def test_native_profile_setup_accepts_only_exact_signed_ubuntu_apt_record(self) -> None:
         record = (

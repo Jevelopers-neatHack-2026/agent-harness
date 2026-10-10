@@ -1520,6 +1520,20 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         flags["nested_userns_exit_code"] = nested_exit if type(nested_exit) is int else "unavailable"
         nested_stderr = report.get("nested_userns_stderr_class")
         flags["nested_userns_stderr_class"] = nested_stderr if nested_stderr in allowed_stderr_classes else "unavailable"
+        mapping_stage = report.get("nested_userns_mapping_stage")
+        flags["nested_userns_mapping_stage"] = mapping_stage if mapping_stage in {
+            "not_observed", "completed", "uid_mapping_failed", "gid_mapping_failed",
+            "setgroups_mapping_failed", "user_namespace_creation_failed", "setup_before_payload"} else "unavailable"
+        for key in ("nested_userns_errno_category", "nested_bwrap_errno_category"):
+            value = report.get(key)
+            flags[key] = value if value in {"operation_not_permitted", "permission_denied", "invalid_argument",
+                                            "resource_limit", "missing_resource", "address_conflict",
+                                            "other", "empty"} else "unavailable"
+        for key in ("nested_userns_source_identity", "nested_bwrap_source_identity"):
+            value = report.get(key)
+            allowed_sources = {"util-linux-v2.39.3-sys-utils-unshare.c",
+                               "bubblewrap-v0.9.0-bubblewrap.c+network.c", "unsupported"}
+            flags[key] = value if value in allowed_sources else "unsupported"
         nested_errno = report.get("nested_mount_errno_category")
         flags["nested_mount_errno_category"] = nested_errno if nested_errno in {
             "operation_not_permitted", "permission_denied", "other", "unavailable"} else "unavailable"
@@ -1537,35 +1551,66 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
             + json.dumps(detail, sort_keys=True, separators=(",", ":")))[:640]
 
 
-def _classify_namespace_setup_stderr(stderr: bytes, utility: str) -> str:
+def _classify_namespace_setup_stderr(stderr: bytes, utility: str, utility_version: str | None = None) -> str:
     """Classify only explicit, versioned utility-stage diagnostics.
 
     Generic EPERM/EACCES remains a generic setup failure. The embedded Linux
     canary mirrors these finite markers and never publishes raw stderr.
     """
-    text = stderr.decode("utf-8", "replace").casefold().replace("_", " ")
+    text = stderr[:2048].decode("utf-8", "replace").casefold().replace("_", " ")
     if utility == "unshare":
+        if utility_version not in (None, "2.39.3"):
+            return "setup_before_payload"
         if "unshare failed" in text:
             return "user_namespace_creation_failed"
         if "uid map" in text:
             return "uid_mapping_failed"
-        if "gid map" in text or "setgroups" in text:
+        if "gid map" in text:
             return "gid_mapping_failed"
+        if "setgroups" in text:
+            return "setgroups_mapping_failed"
         return "setup_before_payload"
     if utility == "bubblewrap":
-        if "unshare user ns" in text:
+        if utility_version not in (None, "0.9.0"):
+            return "setup_or_exec_failed"
+        if ("unshare user ns" in text or "no permissions to creating new namespace" in text
+                or "creating new namespace failed" in text):
             return "user_namespace_creation_failed"
         if "setting up uid map" in text:
             return "uid_mapping_failed"
-        if "setting up gid map" in text or "error writing to setgroups" in text:
+        if "setting up gid map" in text:
             return "gid_mapping_failed"
+        if "error writing to setgroups" in text:
+            return "setgroups_mapping_failed"
         if ("loopback: failed rtm newaddr" in text
                 and "operation not permitted" in text):
             return "loopback_setup_denied"
         if "loopback: failed rtm newlink" in text:
             return "loopback_link_setup_failed"
+        for marker in ("failed to make / slave", "failed to mount tmpfs", "setting up newroot bind",
+                       "pivot_root", "mount /proc failed", "mount /dev failed"):
+            if marker in text:
+                return "mount_setup_failed"
         return "setup_or_exec_failed"
     return "unclassified"
+
+
+def _namespace_setup_errno_category(stderr: bytes) -> str:
+    """Return only a finite errno category; never retain a utility message."""
+    text = stderr[:2048].decode("utf-8", "replace").casefold()
+    if "operation not permitted" in text:
+        return "operation_not_permitted"
+    if "permission denied" in text:
+        return "permission_denied"
+    if "invalid argument" in text:
+        return "invalid_argument"
+    if "no space left" in text or "enospc" in text:
+        return "resource_limit"
+    if "no such file or directory" in text:
+        return "missing_resource"
+    if "address already in use" in text:
+        return "address_conflict"
+    return "other" if text.strip() else "empty"
 
 
 def _run_sandbox_canary(package_root: Path, outside: Path,
@@ -1694,6 +1739,8 @@ r={'outside_read_blocked':False,'private_shadow_visible':False,
    'nested_userns_creation_attempted':False,'nested_userns_mapping_requested':False,
    'nested_userns_mapping_completed':False,
    'nested_userns_creation_observation':'not_observed','nested_userns_mapping_observation':'not_observed',
+   'nested_userns_mapping_stage':'not_observed','nested_userns_errno_category':'unavailable',
+   'nested_userns_source_identity':'unsupported',
    'nested_userns_utility_version':'unavailable','nested_userns_utility_version_exit_code':None,
    'nested_userns_stderr_bytes':0,
    'nested_userns_process_bounded':False,
@@ -1704,7 +1751,8 @@ r={'outside_read_blocked':False,'private_shadow_visible':False,
    'nested_bwrap_payload_reached':False,'nested_bwrap_exit_code':None,
    'nested_bwrap_utility_version':'unavailable','nested_bwrap_utility_version_exit_code':None,
    'nested_bwrap_stderr_bytes':0,
-   'nested_bwrap_stderr_class':'not_run',
+   'nested_bwrap_stderr_class':'not_run','nested_bwrap_errno_category':'unavailable',
+   'nested_bwrap_source_identity':'unsupported',
    'child_isolated':False,'child_capabilities_dropped':False,'child_exit_code':None,
    'child_stderr_present':False,'child_stderr_class':'not_run'}
 try:
@@ -1800,9 +1848,11 @@ if unshare:
  r['nested_userns_utility_version_exit_code']=version_run['code']
  if version_run['bounded'] and version_run['code']==0 and version_match and not version_run['stderr']:
   r['nested_userns_utility_version']=version_match.group(1)
+ if r['nested_userns_utility_version']=='2.39.3':
+  r['nested_userns_source_identity']='util-linux-v2.39.3-sys-utils-unshare.c'
  r['nested_userns_creation_attempted']=True
  r['nested_userns_mapping_requested']=True
- nested=run_child([unshare,'--user','--map-root-user',sys.executable,'-I','-B','-S','-c',nested_code],timeout=4)
+ nested=run_child([unshare,'--map-user=0',sys.executable,'-I','-B','-S','-c',nested_code],timeout=4)
  nested_report=parse_object(nested['stdout'])
  payload_reached=(nested_report.get('payload_reached') is True or nested_report.get('created') is True)
  r['nested_userns_process_bounded']=nested['bounded'] is True
@@ -1811,6 +1861,7 @@ if unshare:
  r['nested_userns_creation_observation']=('confirmed' if nested_report.get('created') is True else 'not_observed')
  r['nested_userns_mapping_observation']=('completed' if nested_report.get('mapping_completed') is True else 'not_observed')
  r['nested_userns_stderr_bytes']=len(nested.get('stderr',b''))
+ r['nested_userns_errno_category']=_namespace_setup_errno_category(nested.get('stderr',b''))
  if nested_report.get('created') is True and nested_report.get('mount_attempted') is True:
   r['nested_userns_setup_stage']='mount_attempted'
  elif payload_reached:
@@ -1818,8 +1869,9 @@ if unshare:
  elif not nested['bounded']:
   r['nested_userns_setup_stage']='timeout_or_output_limit'
  else:
-  r['nested_userns_setup_stage']=_classify_namespace_setup_stderr(nested.get('stderr',b''),'unshare')
-  if r['nested_userns_setup_stage'] in ('uid_mapping_failed','gid_mapping_failed'):
+  r['nested_userns_setup_stage']=_classify_namespace_setup_stderr(
+   nested.get('stderr',b''),'unshare',r['nested_userns_utility_version'])
+  if r['nested_userns_setup_stage'] in ('uid_mapping_failed','gid_mapping_failed','setgroups_mapping_failed'):
    r['nested_userns_setup_stage']='mapping_setup_failed'
  r['nested_userns_created']=nested_report.get('created') is True and nested['bounded']
  r['nested_userns_setup_complete']=(nested_report.get('created') is True
@@ -1854,6 +1906,10 @@ if unshare:
  elif r['nested_userns_setup_stage']=='user_namespace_creation_failed':
   r['nested_userns_creation_observation']=('denied' if r['nested_userns_stderr_class'] in
    ('operation_not_permitted','permission_denied') else 'failed')
+ r['nested_userns_mapping_stage']=(_classify_namespace_setup_stderr(
+  nested.get('stderr',b''),'unshare',r['nested_userns_utility_version'])
+  if r['nested_userns_mapping_observation']=='failed' else
+  'completed' if r['nested_userns_mapping_observation']=='completed' else 'not_observed')
 else:
  r['nested_userns_setup_stage']='tool_unavailable'
 
@@ -1863,14 +1919,18 @@ version_match=re.fullmatch(r'bubblewrap ([0-9A-Za-z.+~-]{1,48})',version_text)
 r['nested_bwrap_utility_version_exit_code']=version_run['code']
 if version_run['bounded'] and version_run['code']==0 and version_match and not version_run['stderr']:
  r['nested_bwrap_utility_version']=version_match.group(1)
+if r['nested_bwrap_utility_version']=='0.9.0':
+ r['nested_bwrap_source_identity']='bubblewrap-v0.9.0-bubblewrap.c+network.c'
 payload_code="import os;os.write(1,b'ACV1_NESTED_PAYLOAD_REACHED\\n')"
-inner=run_child([bwrap,'--die-with-parent','--new-session','--unshare-all','--cap-drop','ALL',
+inner=run_child([bwrap,'--die-with-parent','--new-session','--unshare-user','--unshare-ipc',
+                 '--unshare-pid','--unshare-uts','--unshare-net','--cap-drop','ALL',
                  sys.executable,'-I','-B','-S','-c',payload_code],timeout=4)
 inner_error=inner['stderr'].decode('utf-8','replace').lower()
 inner_output=inner['stdout']
 r['nested_bwrap_payload_reached']=b'ACV1_NESTED_PAYLOAD_REACHED' in inner_output
 r['nested_bwrap_exit_code']=inner['code'] if type(inner.get('code')) is int else None
 r['nested_bwrap_stderr_bytes']=len(inner.get('stderr',b''))
+r['nested_bwrap_errno_category']=_namespace_setup_errno_category(inner.get('stderr',b''))
 r['nested_bwrap_stderr_class']=('network_namespace_loopback_setup_denied'
  if 'bwrap: loopback: failed rtm_newaddr: operation not permitted' in inner_error else
  'operation_not_permitted' if 'operation not permitted' in inner_error else
@@ -1881,7 +1941,8 @@ if r['nested_bwrap_payload_reached']:
 elif not inner['bounded']:
  r['nested_bwrap_setup_stage']='timeout_or_output_limit'
 else:
- r['nested_bwrap_setup_stage']=_classify_namespace_setup_stderr(inner.get('stderr',b''),'bubblewrap')
+ r['nested_bwrap_setup_stage']=_classify_namespace_setup_stderr(
+  inner.get('stderr',b''),'bubblewrap',r['nested_bwrap_utility_version'])
  if inner['code'] is None or inner['code']==0:
   r['nested_bwrap_setup_stage']='not_observed'
 r['nested_bwrap_denied']=(inner['bounded'] and inner['code'] is not None and inner['code']!=0
@@ -1907,7 +1968,8 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
         return "The host network namespace identity cannot be inspected; no owner adapter is executed."
     command = prefix + [python_exe, "-I", "-B", "-S", "-c", parent_code,
                         str(outside), child_code, str(host_network_namespace), bwrap]
-    classifier_source = inspect.getsource(_classify_namespace_setup_stderr)
+    classifier_source = (inspect.getsource(_classify_namespace_setup_stderr) + "\n"
+                         + inspect.getsource(_namespace_setup_errno_category))
     parent_code = classifier_source + "\n" + parent_code
     command[command.index("-c") + 1] = parent_code
     run = run_bounded(command, cwd=package_root,

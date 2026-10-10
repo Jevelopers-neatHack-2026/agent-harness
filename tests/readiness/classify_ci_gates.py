@@ -352,9 +352,19 @@ def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
                                       "timeout_or_output_limit"},
         "nested_userns_creation_observation": {"confirmed", "denied", "failed", "not_observed"},
         "nested_userns_mapping_observation": {"completed", "failed", "not_observed"},
+        "nested_userns_mapping_stage": {"not_observed", "completed", "uid_mapping_failed",
+                                        "gid_mapping_failed", "setgroups_mapping_failed",
+                                        "user_namespace_creation_failed", "setup_before_payload"},
+        "nested_userns_errno_category": {"operation_not_permitted", "permission_denied", "invalid_argument",
+                                         "resource_limit", "missing_resource", "address_conflict", "other", "empty"},
+        "nested_bwrap_errno_category": {"operation_not_permitted", "permission_denied", "invalid_argument",
+                                        "resource_limit", "missing_resource", "address_conflict", "other", "empty"},
+        "nested_userns_source_identity": {"util-linux-v2.39.3-sys-utils-unshare.c", "unsupported"},
+        "nested_bwrap_source_identity": {"bubblewrap-v0.9.0-bubblewrap.c+network.c", "unsupported"},
         "nested_bwrap_setup_stage": {"not_run", "payload_reached", "loopback_setup_denied",
                                      "loopback_link_setup_failed", "user_namespace_creation_failed",
-                                     "uid_mapping_failed", "gid_mapping_failed",
+                                     "uid_mapping_failed", "gid_mapping_failed", "setgroups_mapping_failed",
+                                     "mount_setup_failed",
                                      "setup_or_exec_failed", "timeout_or_output_limit",
                                      "not_observed"},
         "nested_bwrap_stderr_class": {"empty", "operation_not_permitted", "permission_denied",
@@ -364,6 +374,9 @@ def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
         value = observed.get(key)
         if isinstance(value, str) and value in allowed:
             result[key] = value
+    namespace_errno = observed.get("nested_mount_errno_category")
+    if namespace_errno in {"operation_not_permitted", "permission_denied", "other", "unavailable"}:
+        result["nested_mount_errno_category"] = namespace_errno
     for key in ("nested_userns_utility_version", "nested_bwrap_utility_version"):
         version = observed.get(key)
         if isinstance(version, str) and re.fullmatch(r"[0-9A-Za-z.+~-]{1,48}", version):
