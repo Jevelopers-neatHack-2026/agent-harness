@@ -960,6 +960,78 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                 with self.assertRaises(profile_setup.SetupFailure):
                     profile_setup._check_local_overrides()
 
+    def test_native_profile_status_uses_only_bounded_fixed_privileged_read_on_permission_denial(self) -> None:
+        original_open = Path.open
+
+        def deny_status_open(path: Path, *args, **kwargs):
+            if path == profile_setup.APPARMOR_PROFILES:
+                raise PermissionError("synthetic securityfs permission denial")
+            return original_open(path, *args, **kwargs)
+
+        expected_status = b"kernel-profile-a (enforce)\nkernel-profile-b (enforce)\n"
+        with mock.patch.object(Path, "open", autospec=True, side_effect=deny_status_open), \
+                mock.patch.object(profile_setup, "_command", return_value=(expected_status, b"")) as command:
+            self.assertEqual(profile_setup._read_profiles(), [
+                "kernel-profile-a (enforce)", "kernel-profile-b (enforce)"])
+        command.assert_called_once_with(
+            ["/usr/bin/sudo", "-n", "--", "/usr/bin/head", "-c",
+             str(profile_setup.PROFILE_TABLE_MAX_BYTES + 1), "--", "/sys/kernel/security/apparmor/profiles"],
+            timeout=5, limit=profile_setup.PROFILE_TABLE_MAX_BYTES, cwd=Path("/"))
+
+    def test_native_profile_status_avoids_privilege_when_unprivileged_read_works(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="acv1-profile-status-readable-") as temp:
+            status_path = Path(temp) / "profiles"
+            status_path.write_text("profile-one (enforce)\n", encoding="utf-8")
+            with mock.patch.object(profile_setup, "APPARMOR_PROFILES", status_path), \
+                    mock.patch.object(profile_setup, "_command") as command:
+                self.assertEqual(profile_setup._read_profiles(), ["profile-one (enforce)"])
+            command.assert_not_called()
+
+    def test_native_profile_status_does_not_escalate_for_nonpermission_io_errors(self) -> None:
+        original_open = Path.open
+
+        def missing_status_open(path: Path, *args, **kwargs):
+            if path == profile_setup.APPARMOR_PROFILES:
+                raise FileNotFoundError("synthetic missing securityfs entry")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=missing_status_open), \
+                mock.patch.object(profile_setup, "_command") as command:
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "apparmor_kernel_profile_status_unavailable"):
+                profile_setup._read_profiles()
+            command.assert_not_called()
+
+    def test_native_profile_status_overflow_fails_closed(self) -> None:
+        original_open = Path.open
+
+        def deny_status_open(path: Path, *args, **kwargs):
+            if path == profile_setup.APPARMOR_PROFILES:
+                raise PermissionError("synthetic securityfs permission denial")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=deny_status_open), \
+                mock.patch.object(profile_setup, "_command",
+                                  side_effect=profile_setup.SetupFailure("command_output_exceeded_bound")):
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "apparmor_kernel_profile_status_exceeded_bound"):
+                profile_setup._read_profiles()
+
+    def test_native_profile_status_still_fails_closed_if_fixed_privileged_read_fails(self) -> None:
+        original_open = Path.open
+
+        def deny_status_open(path: Path, *args, **kwargs):
+            if path == profile_setup.APPARMOR_PROFILES:
+                raise PermissionError("synthetic securityfs permission denial")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=deny_status_open), \
+                mock.patch.object(profile_setup, "_command", side_effect=profile_setup.SetupFailure("command_failed")) as command:
+            with self.assertRaisesRegex(profile_setup.SetupFailure,
+                                        "apparmor_kernel_profile_status_privileged_read_failed"):
+                profile_setup._read_profiles()
+        command.assert_called_once()
+
     def test_sandbox_command_imports_only_declared_sealed_dependency_root(self) -> None:
         with tempfile.TemporaryDirectory(prefix="acv1-dependency-import-root-") as temp, \
                 mock.patch.object(contracts.platform, "system", return_value="Linux"), \

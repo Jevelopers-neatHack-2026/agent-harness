@@ -26,6 +26,7 @@ PROFILE_SHA256 = "11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264
 BWRAP_VERSION = "0.9.0-1ubuntu0.3"
 INSTALLED_PROFILE = Path("/run/acv1-native-profile/bwrap-userns-restrict")
 APPARMOR_PROFILES = Path("/sys/kernel/security/apparmor/profiles")
+PROFILE_TABLE_MAX_BYTES = 128 * 1024
 LOCAL_OVERRIDES = (
     Path("/etc/apparmor.d/local/bwrap-userns-restrict"),
     Path("/etc/apparmor.d/local/unpriv_bwrap"),
@@ -159,9 +160,30 @@ def _apt_signature_configuration() -> dict[str, Any]:
 
 def _read_profiles() -> list[str]:
     try:
-        rows = APPARMOR_PROFILES.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
+        with APPARMOR_PROFILES.open("rb") as source:
+            profile_bytes = source.read(PROFILE_TABLE_MAX_BYTES + 1)
+    except PermissionError as exc:
+        # Some Ubuntu runner images expose securityfs profile state to root only.
+        # Elevate only a fixed, bounded head read of this constant kernel path.
+        # The profile contents never become a command, shell fragment, or policy input.
+        try:
+            profile_bytes, _ = _command(
+                ["/usr/bin/sudo", "-n", "--", "/usr/bin/head", "-c",
+                 str(PROFILE_TABLE_MAX_BYTES + 1), "--", str(APPARMOR_PROFILES)],
+                timeout=5, limit=PROFILE_TABLE_MAX_BYTES, cwd=Path("/"))
+        except SetupFailure as privileged_error:
+            code = ("apparmor_kernel_profile_status_exceeded_bound"
+                    if privileged_error.code == "command_output_exceeded_bound"
+                    else "apparmor_kernel_profile_status_privileged_read_failed")
+            raise SetupFailure(code) from privileged_error
+    except OSError as exc:
         raise SetupFailure("apparmor_kernel_profile_status_unavailable") from exc
+    if len(profile_bytes) > PROFILE_TABLE_MAX_BYTES:
+        raise SetupFailure("apparmor_kernel_profile_status_exceeded_bound")
+    try:
+        rows = profile_bytes.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise SetupFailure("apparmor_kernel_profile_status_encoding_invalid") from exc
     return sorted(line.strip() for line in rows if line.strip())
 
 
