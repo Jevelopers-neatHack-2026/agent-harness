@@ -1326,6 +1326,10 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "ubuntu_runner_sources_configuration_untrusted")
         self.assertEqual(raised.exception.details["source_record_count"], 3)
         self.assertEqual(raised.exception.details["mirror_source_stanza_count"], 2)
+        self.assertEqual(raised.exception.details["exact_mirror_uri_stanza_count"], 2)
+        self.assertEqual(raised.exception.details["archive_suite_stanza_count"], 1)
+        self.assertEqual(raised.exception.details["security_suite_stanza_count"], 0)
+        self.assertEqual(raised.exception.details["unknown_suite_group_stanza_count"], 2)
         self.assertEqual(raised.exception.details["recognized_layout"], "unrecognized")
         for private_value in ("private-suite-name", "private.invalid", "secret", "/private/keyring"):
             self.assertNotIn(private_value, diagnostic)

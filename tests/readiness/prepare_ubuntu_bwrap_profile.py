@@ -370,25 +370,45 @@ def _parse_runner_mirrorlist(mirrorlist: bytes) -> tuple[str, ...]:
 def _runner_source_layout_diagnostics(records: list[dict[str, str]], source_file: bytes) -> dict[str, Any]:
     archive_count = 0
     security_count = 0
+    unknown_suite_count = 0
+    exact_field_set_count = 0
+    exact_types_count = 0
+    exact_mirror_uri_count = 0
+    exact_components_count = 0
+    exact_signed_by_count = 0
     invalid_count = 0
     mirror_count = sum(
         APT_MIRROR_URI in row.get("uris", "").split() for row in records)
     for row in records:
         uris = row.get("uris", "").split()
         suites = tuple(row.get("suites", "").split())
-        exact_common_fields = (
-            set(row) == APT_RUNNER_SOURCE_FIELDS
-            and row.get("types", "").split() == ["deb"]
-            and uris == [APT_MIRROR_URI]
-            and row.get("components", "").split() == list(APT_RUNNER_COMPONENTS)
-            and row.get("signed-by") == str(UBUNTU_ARCHIVE_KEYRING)
-        )
-        if exact_common_fields and suites == APT_RUNNER_ARCHIVE_SUITES:
+        exact_field_set = set(row) == APT_RUNNER_SOURCE_FIELDS
+        exact_types = row.get("types", "").split() == ["deb"]
+        exact_mirror_uri = uris == [APT_MIRROR_URI]
+        exact_components = row.get("components", "").split() == list(APT_RUNNER_COMPONENTS)
+        exact_signed_by = row.get("signed-by") == str(UBUNTU_ARCHIVE_KEYRING)
+        exact_field_set_count += int(exact_field_set)
+        exact_types_count += int(exact_types)
+        exact_mirror_uri_count += int(exact_mirror_uri)
+        exact_components_count += int(exact_components)
+        exact_signed_by_count += int(exact_signed_by)
+        if suites == APT_RUNNER_ARCHIVE_SUITES:
             archive_count += 1
-        elif exact_common_fields and suites == APT_RUNNER_SECURITY_SUITES:
+        elif suites == APT_RUNNER_SECURITY_SUITES:
             security_count += 1
         else:
+            unknown_suite_count += 1
+        if not (exact_field_set and exact_types and exact_mirror_uri and exact_components
+                and exact_signed_by
+                and suites in (APT_RUNNER_ARCHIVE_SUITES, APT_RUNNER_SECURITY_SUITES)):
             invalid_count += 1
+    expected_layout = (
+        len(records) == 2 and archive_count == 1 and security_count == 1
+        and unknown_suite_count == 0 and exact_field_set_count == 2
+        and exact_types_count == 2 and exact_mirror_uri_count == 2
+        and exact_components_count == 2 and exact_signed_by_count == 2
+        and invalid_count == 0
+    )
     return {
         "expected_format": APT_RUNNER_SOURCE_FORMAT,
         "source_file_sha256": hashlib.sha256(source_file).hexdigest(),
@@ -396,17 +416,19 @@ def _runner_source_layout_diagnostics(records: list[dict[str, str]], source_file
         "source_record_count_capped": len(records) > 99,
         "mirror_source_stanza_count": min(mirror_count, 99),
         "mirror_source_stanza_count_capped": mirror_count > 99,
+        "exact_allowed_field_set_stanza_count": exact_field_set_count,
+        "exact_types_deb_stanza_count": exact_types_count,
+        "exact_mirror_uri_stanza_count": exact_mirror_uri_count,
+        "exact_component_set_stanza_count": exact_components_count,
+        "exact_archive_keyring_stanza_count": exact_signed_by_count,
         "archive_suite_stanza_count": archive_count,
         "security_suite_stanza_count": security_count,
+        "unknown_suite_group_stanza_count": unknown_suite_count,
         "invalid_stanza_count": min(invalid_count, 99),
         "invalid_stanza_count_capped": invalid_count > 99,
         "missing_expected_stanza_count": min(max(0, 2 - len(records)), 2),
         "unexpected_stanza_count": min(max(0, len(records) - 2), 99),
-        "recognized_layout": (
-            "noble_archive_security_split"
-            if len(records) == 2 and archive_count == 1 and security_count == 1
-            and invalid_count == 0 else "unrecognized"
-        ),
+        "recognized_layout": "noble_archive_security_split" if expected_layout else "unrecognized",
     }
 
 
