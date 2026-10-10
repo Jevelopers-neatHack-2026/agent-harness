@@ -1507,6 +1507,7 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("--cap-drop", command)
         self.assertIn("nested_userns_setup_complete", parent_code)
         self.assertIn("nested_userns_setup_stage", parent_code)
+        self.assertIn("nested_userns_creation_attempted", parent_code)
         self.assertIn("nested_userns_mapping_observation", parent_code)
         self.assertIn("nested_userns_utility_version", parent_code)
         self.assertIn("nested_mount_attempted", parent_code)

@@ -1658,7 +1658,8 @@ r={'outside_read_blocked':False,'private_shadow_visible':False,
    'nested_userns_stack_verified':False,'nested_userns_label':'unverified','nested_userns_no_new_privs':False,
    'nested_userns_process_exit_code':None,'nested_userns_stderr_class':'not_run',
    'nested_userns_setup_stage':'not_run','nested_userns_payload_reached':False,
-   'nested_userns_mapping_requested':False,'nested_userns_mapping_completed':False,
+   'nested_userns_creation_attempted':False,'nested_userns_mapping_requested':False,
+   'nested_userns_mapping_completed':False,
    'nested_userns_creation_observation':'not_observed','nested_userns_mapping_observation':'not_observed',
    'nested_userns_utility_version':'unavailable','nested_userns_utility_version_exit_code':None,
    'nested_userns_stderr_bytes':0,
@@ -1766,6 +1767,7 @@ if unshare:
  r['nested_userns_utility_version_exit_code']=version_run['code']
  if version_run['bounded'] and version_run['code']==0 and version_match and not version_run['stderr']:
   r['nested_userns_utility_version']=version_match.group(1)
+ r['nested_userns_creation_attempted']=True
  r['nested_userns_mapping_requested']=True
  nested=run_child([unshare,'--user','--map-root-user',sys.executable,'-I','-B','-S','-c',nested_code],timeout=4)
  nested_report=parse_object(nested['stdout'])
@@ -1854,7 +1856,8 @@ required=('outside_read_blocked','sandbox_shadow_write_succeeded','network_block
  'python_reexec_stack_verified','python_reexec_capabilities_zero','python_reexec_no_new_privs',
  'other_exec_stack_verified','other_exec_capabilities_zero','other_exec_no_new_privs','nested_userns_created',
  'nested_userns_setup_complete','nested_userns_stack_verified','nested_userns_no_new_privs',
- 'nested_userns_mapping_requested','nested_userns_mapping_completed','nested_userns_payload_reached',
+ 'nested_userns_creation_attempted','nested_userns_mapping_requested',
+ 'nested_userns_mapping_completed','nested_userns_payload_reached',
  'nested_capability_sets_observed','nested_mount_attempted','nested_mount_namespace_denied',
  'nested_bwrap_denied','child_isolated','child_capabilities_dropped')
 sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_errno_category'] in ('operation_not_permitted','permission_denied')
@@ -1891,7 +1894,8 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
                 "nested_userns_no_new_privs", "nested_userns_setup_complete", "nested_cap_eff",
                 "nested_userns_process_exit_code", "nested_userns_stderr_class",
                 "nested_userns_setup_stage", "nested_userns_payload_reached",
-                "nested_userns_mapping_requested", "nested_userns_mapping_completed",
+                "nested_userns_creation_attempted", "nested_userns_mapping_requested",
+                "nested_userns_mapping_completed",
                 "nested_userns_creation_observation", "nested_userns_mapping_observation",
                 "nested_userns_utility_version", "nested_userns_utility_version_exit_code",
                 "nested_userns_stderr_bytes", "nested_userns_process_bounded",
@@ -1928,6 +1932,7 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
             or report.get("nested_userns_setup_complete") is not True
             or report.get("nested_userns_stack_verified") is not True
             or report.get("nested_userns_no_new_privs") is not True
+            or report.get("nested_userns_creation_attempted") is not True
             or report.get("nested_userns_mapping_requested") is not True
             or report.get("nested_userns_mapping_completed") is not True
             or report.get("nested_userns_payload_reached") is not True
