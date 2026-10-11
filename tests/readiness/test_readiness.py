@@ -1526,7 +1526,11 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertIn("nested_mount_namespace_denied", parent_code)
         self.assertNotIn("nested_cap_sys_admin_available", parent_code)
         self.assertNotIn("'--mount'", parent_code)
-        self.assertIn("libc.unshare(0x00020000)", parent_code)
+        self.assertIn("libc.unshare(0x00020000)", nested_code)
+        self.assertIn("libc.mount(", nested_code)
+        self.assertIn("mount_result<0 and mount_error in (errno.EPERM,errno.EACCES)", nested_code)
+        self.assertIn("mount_syscall_denied", nested_code)
+        self.assertIn("libc.umount2(", nested_code)
         self.assertIn("private_shadow_visible", child_code)
         self.assertIn("loopback: failed rtm_newaddr: operation not permitted", parent_code)
         self.assertIn("nested_bwrap_setup_stage", parent_code)
@@ -1559,6 +1563,8 @@ class ContractReleaseReadinessTests(unittest.TestCase):
                          "loopback_setup_denied")
         self.assertEqual(classify(b"bwrap: No permissions to creating new namespace, likely because user namespaces are disabled",
                                   "bubblewrap", "0.9.0"), "combined_namespace_creation_failed")
+        self.assertEqual(classify(b"bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces",
+                                  "bubblewrap", "0.9.0"), "combined_namespace_creation_failed")
         self.assertEqual(classify(b"bwrap: Creating new namespace failed: Operation not permitted",
                                   "bubblewrap", "0.9.0"), "combined_namespace_creation_failed")
         self.assertEqual(classify(b"bwrap: unshare user ns failed: Operation not permitted",
@@ -1566,6 +1572,8 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(classify(b"bwrap: setting up gid map: Operation not permitted", "bubblewrap", "0.9.0"),
                          "gid_mapping_failed")
         self.assertEqual(classify(b"bwrap: No permissions to creating new namespace", "bubblewrap", "1.0.0"),
+                         "setup_or_exec_failed")
+        self.assertEqual(classify(b"bwrap: No permissions to create new namespace", "bubblewrap", "1.0.0"),
                          "setup_or_exec_failed")
         self.assertEqual(classify(b"bwrap: Operation not permitted", "bubblewrap"), "setup_or_exec_failed")
         errno_class = contracts._namespace_setup_errno_category

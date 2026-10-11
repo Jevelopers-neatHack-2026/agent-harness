@@ -1602,7 +1602,12 @@ def _classify_namespace_setup_stderr(stderr: bytes, utility: str, utility_versio
         # types, so these diagnostics identify the combined creation stage,
         # not a particular namespace or the kernel policy cause.
         if ("no permissions to creating new namespace" in text
+                or "no permissions to create new namespace" in text
                 or "creating new namespace failed" in text):
+            # Ubuntu's pinned 0.9.0-1ubuntu0.3 package carries the Debian
+            # wording patch: "to create" replaces upstream's "to creating".
+            # Both remain a combined raw_clone stage; neither names the
+            # particular namespace or the policy cause.
             return "combined_namespace_creation_failed"
         if "setting up uid map" in text:
             return "uid_mapping_failed"
@@ -1852,18 +1857,37 @@ try:
  stacked=label.endswith('(enforce)') and 'bwrap' in label and 'unpriv_bwrap' in label
  capabilities={name:s.get(name,'') for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')}
  libc=ctypes.CDLL(None,use_errno=True);libc.unshare.argtypes=[ctypes.c_int]
- ctypes.set_errno(0);result=libc.unshare(0x00020000);error=ctypes.get_errno()
- denied=result<0 and error in (errno.EPERM,errno.EACCES)
- errno_category=('operation_not_permitted' if error==errno.EPERM else
-                 'permission_denied' if error==errno.EACCES else 'other' if result<0 else 'unavailable')
+ libc.unshare.restype=ctypes.c_int
+ ctypes.set_errno(0);namespace_result=libc.unshare(0x00020000);namespace_error=ctypes.get_errno()
+ namespace_denied=namespace_result<0 and namespace_error in (errno.EPERM,errno.EACCES)
+ mount_attempted=False;mount_denied=False;mount_errno_category='unavailable'
+ mount_target='/tmp/acv1-nested-mount-'+str(os.getpid())
+ os.mkdir(mount_target,0o700)
+ libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]
+ libc.mount.restype=ctypes.c_int
+ ctypes.set_errno(0)
+ # MS_NOSUID | MS_NODEV: this is a real, isolated tmpfs mount request. A
+ # successful result is always detached before the private /tmp is discarded.
+ mount_result=libc.mount(b'tmpfs',os.fsencode(mount_target),b'tmpfs',2|4,None)
+ mount_error=ctypes.get_errno();mount_attempted=True
+ mount_syscall_denied=mount_result<0 and mount_error in (errno.EPERM,errno.EACCES)
+ mount_errno_category=('operation_not_permitted' if mount_error==errno.EPERM else
+                       'permission_denied' if mount_error==errno.EACCES else
+                       'other' if mount_result<0 else 'other')
+ if mount_result==0:
+  libc.umount2.argtypes=[ctypes.c_char_p,ctypes.c_int];libc.umount2.restype=ctypes.c_int
+  ctypes.set_errno(0)
+  if libc.umount2(os.fsencode(mount_target),2)<0:
+   raise OSError(ctypes.get_errno(),'private canary unmount failed')
+ os.rmdir(mount_target)
  report={'created':True,'mapping_completed':True,'payload_reached':True,
          'label':label if stacked else 'unverified','stack':stacked,
          'no_new_privs':s.get('NoNewPrivs')=='1','capabilities':capabilities,
-         'cap_eff':capabilities['CapEff'],'mount_attempted':True,
-         'mount_namespace_created':result==0,'mount_denied':denied,
-         'mount_errno_category':errno_category}
+         'cap_eff':capabilities['CapEff'],'mount_attempted':mount_attempted,
+         'mount_namespace_created':namespace_result==0,'mount_denied':namespace_denied,
+         'mount_errno_category':mount_errno_category}
  print(json.dumps(report,sort_keys=True,separators=(',',':')))
- sys.exit(0 if stacked and report['no_new_privs'] and denied else 9)
+ sys.exit(0 if stacked and report['no_new_privs'] and namespace_denied and mount_attempted and mount_syscall_denied else 9)
 except (OSError,ValueError,KeyError):
  print('{"created":true,"mapping_completed":true,"payload_reached":true,'
        '"diagnostic_stage":"payload_setup_incomplete"}');sys.exit(10)
