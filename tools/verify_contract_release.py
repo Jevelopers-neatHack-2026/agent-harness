@@ -1480,11 +1480,12 @@ def _sandbox_stderr_summary(stderr: bytes) -> tuple[str, str]:
 
 def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
     code = run.get("code")
-    if code not in {"execution_timeout", "execution_output_limit_exceeded", "execution_start_failed",
-                    "adapter_nonzero_exit", "ok"}:
+    if not isinstance(code, str) or code not in {
+            "execution_timeout", "execution_output_limit_exceeded", "execution_start_failed",
+            "adapter_nonzero_exit", "ok"}:
         code = "unclassified_process_result"
     exit_code = run.get("returncode")
-    if type(exit_code) is not int:
+    if type(exit_code) is not int or not -255 <= exit_code <= 255:
         exit_code = "unavailable"
     stderr_category, stderr_excerpt = _sandbox_stderr_summary(
         run.get("stderr") if isinstance(run.get("stderr"), bytes) else b"")
@@ -1516,33 +1517,35 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
         allowed_stderr_classes = {"empty", "operation_not_permitted", "permission_denied", "missing_file",
                                   "python_dependency_import_failure", "python_traceback", "other"}
         allowed_nested_stderr_classes = allowed_stderr_classes | {"mapping_setup_failure"}
-        flags["child_stderr_class"] = child_stderr_class if child_stderr_class in allowed_stderr_classes else "unavailable"
+        flags["child_stderr_class"] = child_stderr_class if isinstance(child_stderr_class, str) \
+            and child_stderr_class in allowed_stderr_classes else "unavailable"
         nested_exit = report.get("nested_userns_process_exit_code")
         flags["nested_userns_exit_code"] = nested_exit if type(nested_exit) is int else "unavailable"
         nested_stderr = report.get("nested_userns_stderr_class")
-        flags["nested_userns_stderr_class"] = nested_stderr if nested_stderr in allowed_nested_stderr_classes else "unavailable"
+        flags["nested_userns_stderr_class"] = nested_stderr if isinstance(nested_stderr, str) \
+            and nested_stderr in allowed_nested_stderr_classes else "unavailable"
         mapping_stage = report.get("nested_userns_mapping_stage")
-        flags["nested_userns_mapping_stage"] = mapping_stage if mapping_stage in {
+        flags["nested_userns_mapping_stage"] = mapping_stage if isinstance(mapping_stage, str) and mapping_stage in {
             "not_observed", "completed", "uid_mapping_failed", "gid_mapping_failed",
             "setgroups_mapping_failed", "user_namespace_creation_failed", "setup_before_payload"} else "unavailable"
         for key in ("nested_userns_errno_category", "nested_bwrap_errno_category"):
             value = report.get(key)
-            flags[key] = value if value in {"operation_not_permitted", "permission_denied", "invalid_argument",
-                                            "resource_limit", "missing_resource", "address_conflict",
-                                            "other", "empty"} else "unavailable"
+            flags[key] = value if isinstance(value, str) and value in {
+                "operation_not_permitted", "permission_denied", "invalid_argument",
+                "resource_limit", "missing_resource", "address_conflict", "other", "empty"} else "unavailable"
         for key in ("nested_userns_source_identity", "nested_bwrap_source_identity"):
             value = report.get(key)
             allowed_sources = {"util-linux-v2.39.3-sys-utils-unshare.c",
                                "bubblewrap-v0.9.0-bubblewrap.c+network.c", "unsupported"}
-            flags[key] = value if value in allowed_sources else "unsupported"
+            flags[key] = value if isinstance(value, str) and value in allowed_sources else "unsupported"
         nested_errno = report.get("nested_mount_errno_category")
-        flags["nested_mount_errno_category"] = nested_errno if nested_errno in {
+        flags["nested_mount_errno_category"] = nested_errno if isinstance(nested_errno, str) and nested_errno in {
             "operation_not_permitted", "permission_denied", "other", "unavailable"} else "unavailable"
         nested_cap_eff = report.get("nested_cap_eff")
         flags["nested_cap_eff"] = nested_cap_eff if isinstance(nested_cap_eff, str) and len(nested_cap_eff) <= 32 \
             and all(char in "0123456789abcdefABCDEF" for char in nested_cap_eff) else "unavailable"
         bwrap_stage = report.get("nested_bwrap_setup_stage")
-        flags["nested_bwrap_setup_stage"] = bwrap_stage if bwrap_stage in {
+        flags["nested_bwrap_setup_stage"] = bwrap_stage if isinstance(bwrap_stage, str) and bwrap_stage in {
             "not_run", "payload_reached", "loopback_setup_denied", "loopback_link_setup_failed",
             "combined_namespace_creation_failed", "user_namespace_creation_failed", "uid_mapping_failed",
             "gid_mapping_failed", "setgroups_mapping_failed", "mount_setup_failed", "setup_or_exec_failed",
@@ -1571,6 +1574,14 @@ def _sandbox_process_failure(run: dict[str, Any], report: Any = None) -> str:
             serialized = json.dumps(detail, sort_keys=True, separators=(",", ":"))
             if len(prefix) + len(serialized) <= 640:
                 break
+        # Long supported stage names can exceed the publication bound even
+        # without an excerpt. Omit optional stderr descriptions before any
+        # finite canary stage/errno/denial observation; never slice JSON bytes.
+        for key in ("stderr", "stderr_class"):
+            if len(prefix) + len(serialized) <= 640:
+                break
+            detail.pop(key, None)
+            serialized = json.dumps(detail, sort_keys=True, separators=(",", ":"))
     return prefix + serialized
 
 
@@ -2096,6 +2107,7 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
             or report.get("nested_mount_attempted") is not True
             or report.get("nested_mount_namespace_denied") is not True
             or report.get("nested_mount_namespace_created") is not False
+            or not isinstance(report.get("nested_mount_errno_category"), str)
             or report.get("nested_mount_errno_category") not in {"operation_not_permitted", "permission_denied"}
             or report.get("nested_userns_process_exit_code") != 0
             or report.get("nested_userns_stderr_class") != "empty"

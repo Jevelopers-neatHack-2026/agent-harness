@@ -320,12 +320,10 @@ def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
     if type(nested_exit) is int and -255 <= nested_exit <= 255:
         result["nested_userns_process_exit_code"] = nested_exit
     nested_stderr = observed.get("nested_userns_stderr_class")
-    if nested_stderr in ("empty", "operation_not_permitted", "permission_denied", "missing_file", "other",
-                         "mapping_setup_failure"):
+    if isinstance(nested_stderr, str) and nested_stderr in (
+            "empty", "operation_not_permitted", "permission_denied", "missing_file", "other",
+            "mapping_setup_failure"):
         result["nested_userns_stderr_class"] = nested_stderr
-    nested_errno = observed.get("nested_mount_errno_category")
-    if nested_errno in ("operation_not_permitted", "permission_denied", "other", "unavailable"):
-        result["nested_mount_errno_category"] = nested_errno
     capability_names = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
     capability_sets = observed.get("nested_capability_sets")
     if (isinstance(capability_sets, dict) and set(capability_sets) == set(capability_names)
@@ -344,6 +342,7 @@ def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
     if type(observed.get("host_canary_unchanged")) is bool:
         result["host_canary_unchanged"] = observed["host_canary_unchanged"]
     enum_fields = {
+        "nested_mount_errno_category": {"operation_not_permitted", "permission_denied", "other", "unavailable"},
         "host_canary_observation": {"unchanged", "changed", "unavailable", "unstable",
                                     "not_regular", "outside_size_bound"},
         "nested_userns_setup_stage": {"not_run", "tool_unavailable", "setup_before_payload",
@@ -375,9 +374,6 @@ def _safe_sandbox_observations(observed: Dict[str, Any]) -> Dict[str, Any]:
         value = observed.get(key)
         if isinstance(value, str) and value in allowed:
             result[key] = value
-    namespace_errno = observed.get("nested_mount_errno_category")
-    if namespace_errno in {"operation_not_permitted", "permission_denied", "other", "unavailable"}:
-        result["nested_mount_errno_category"] = namespace_errno
     for key in ("nested_userns_utility_version", "nested_bwrap_utility_version"):
         version = observed.get(key)
         if isinstance(version, str) and re.fullmatch(r"[0-9A-Za-z.+~-]{1,48}", version):

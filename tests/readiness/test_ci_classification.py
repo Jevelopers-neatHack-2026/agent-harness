@@ -1,5 +1,6 @@
 """Direct tests for CI's expected-pending classifier behavior."""
 
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -10,6 +11,36 @@ from tools import verify_contract_release as contracts
 
 
 class CICheckerClassificationTests(unittest.TestCase):
+    def test_sandbox_observations_omit_non_string_categories(self):
+        fields = (
+            "nested_mount_errno_category", "nested_userns_stderr_class", "nested_userns_mapping_stage",
+            "nested_userns_errno_category", "nested_bwrap_errno_category", "nested_bwrap_setup_stage",
+            "nested_userns_source_identity", "nested_bwrap_source_identity", "nested_bwrap_stderr_class",
+        )
+        for field in fields:
+            for value in ([], {}, ["operation_not_permitted"], {"unexpected": "value"}, None, True, 1):
+                with self.subTest(field=field, value=value):
+                    self.assertNotIn(field, ci._safe_sandbox_observations({field: value}))
+
+    def test_sandbox_failure_detail_round_trips_at_publication_bound(self):
+        report = {
+            "nested_userns_stderr_class": "operation_not_permitted",
+            "nested_userns_mapping_stage": "user_namespace_creation_failed",
+            "nested_userns_errno_category": "operation_not_permitted",
+            "nested_bwrap_setup_stage": "combined_namespace_creation_failed",
+            "nested_bwrap_errno_category": "operation_not_permitted",
+            "nested_mount_errno_category": "operation_not_permitted",
+        }
+        reason = contracts._sandbox_process_failure({
+            "code": "execution_output_limit_exceeded", "returncode": 255,
+            "stderr": b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+        }, report)
+        published = ci._bounded_string(reason, 640)
+        self.assertEqual(published, reason)
+        detail = json.loads(published.removeprefix("bubblewrap internal canary failed: "))
+        for key, value in report.items():
+            self.assertEqual(detail["canary"][key], value)
+
     def test_sandbox_artifact_preserves_only_bounded_sanitized_failure_detail(self):
         reason = contracts._sandbox_process_failure({
             "ok": False,
