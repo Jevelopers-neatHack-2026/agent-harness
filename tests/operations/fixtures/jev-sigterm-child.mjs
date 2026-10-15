@@ -13,6 +13,7 @@ import { sendJevOnce } from '../../../src/adapters/jev/http-transport.js';
 import { runPrivateJevTestAttempt } from '../../decisions/jev-adapter.contract/private-orchestrator.js';
 import { recordSyntheticMetric } from '../../decisions/jev-adapter.contract/synthetic-metrics.js';
 import { createOperationsWorker } from '../../../src/worker/private/worker.js';
+import { pauseAtWriterBoundary } from '../pause-writer-boundary.js';
 import {
   createOps04FailureDetails, ops04ReadErrorKind, parseOps04FailureDetails,
   throwAfterOps04FailureCapture
@@ -346,9 +347,15 @@ t:
   const pgrep = spawnSync('pgrep', ['-P', String(process.pid)], { encoding: 'utf8' });
   if (pgrep.status !== 0) throw new Error('The owned operations runner PID was unavailable.');
   runnerPid = Number(pgrep.stdout.trim().split(/\s+/u).at(-1));
-  if (!Number.isSafeInteger(runnerPid) || runnerPid < 2 || !process.kill(runnerPid, 'SIGSTOP')) {
+  if (!Number.isSafeInteger(runnerPid) || runnerPid < 2) {
     throw new Error('The JEV composition fixture could not pause its actual owned runner.');
   }
+  pauseAtWriterBoundary(databasePath, () => process.kill(runnerPid, 'SIGSTOP'), () => {
+    const observed = spawnSync('ps', ['-o', 'state=', '-p', String(runnerPid)], {
+      encoding: 'utf8', timeout: 100, killSignal: 'SIGKILL'
+    });
+    return observed.status === 0 && /^T/u.test(observed.stdout.trim());
+  });
   capturePhase('runner_claimed');
   if (phase === 'failure-runner-marker-partial') {
     await writeFile(`${metricsPath}.runner`, '{"runnerPid":');

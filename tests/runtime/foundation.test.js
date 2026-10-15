@@ -63,6 +63,37 @@ test('live mode fails closed without canonical authorities', () => {
   );
 });
 
+test('configuration rejects executable settings without invoking or disclosing them', () => {
+  const marker = 'SYNTHETIC_CONFIG_SECRET';
+  let calls = 0;
+  const unsafe = () => { calls += 1; throw new Error(marker); };
+  const safeFailure = input => assert.throws(() => parseRuntimeConfig(input), error => {
+    assert.ok(error instanceof RuntimeError);
+    assert.equal(error.code, 'CONFIG_INVALID');
+    assert.equal(error.message.includes(marker), false);
+    assert.equal(JSON.stringify(error).includes(marker), false);
+    return true;
+  });
+  for (const key of Object.keys(validSettings)) {
+    safeFailure(Object.defineProperty({ ...validSettings }, key, { get: unsafe }));
+  }
+  safeFailure(new Proxy({ ...validSettings }, {
+    get: unsafe, getOwnPropertyDescriptor: unsafe, getPrototypeOf: unsafe
+  }));
+  const revocable = Proxy.revocable({}, {});
+  revocable.revoke();
+  safeFailure(revocable.proxy);
+  assert.equal(calls, 0);
+
+  const inherited = Object.create(validSettings);
+  assert.throws(() => parseRuntimeConfig(inherited), error =>
+    error instanceof RuntimeError && error.code === 'CONFIG_MISSING');
+  const ordinary = Object.assign(Object.create(null), validSettings);
+  Object.defineProperty(ordinary, 'UNRELATED', { get: unsafe });
+  assert.equal(parseRuntimeConfig(ordinary).mode, 'mock');
+  assert.equal(calls, 0);
+});
+
 test('injected boundary errors are safe and malformed results fail closed', async () => {
   const privateMarker = 'private-fixture-value-do-not-disclose';
   await assert.rejects(

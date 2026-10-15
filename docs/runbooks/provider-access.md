@@ -23,7 +23,7 @@ Exit codes:
 | `2` | Profile is well-formed but access, eligibility, configuration, or downstream live evidence remains pending or denied. |
 | `3` | Requested metadata or live mode is unsupported; no provider request was made. |
 
-CI expects exit `2` from the pending fixture and separately requires the offline adversarial suite to pass. After both checks pass, it uploads the sanitized JSON report as a seven-day `provider-readiness-report` artifact. Passing those tests establishes only that the local validator handles its inputs as specified.
+CI expects exit `2` from the pending fixture and separately requires the offline adversarial suite to pass. Before upload, `python3 -B tools/verify_provider_report_identity.py "$RUNNER_TEMP/provider-readiness.json"` requires the report's component revision to equal the clean checkout containing the checker, independently of caller cwd or Git environment variables. An older commit is refused even when its tree is identical. The checker leaves report bytes unchanged and logs their SHA256, checkout revision/tree, verifier hash and checked-in sample-profile hash. The PR checkout may be a merge candidate; retain that actual identity rather than relabeling it as the head commit. After these checks pass, CI uploads the sanitized JSON report as a seven-day `provider-readiness-report` artifact. Passing these tests establishes only local validation and CI source identity, not provider access or readiness.
 
 ## Credential handling
 
