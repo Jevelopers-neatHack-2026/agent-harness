@@ -1624,6 +1624,103 @@ class ContractReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(unknown_compact["canary"]["nested_userns_stderr_class"], "unavailable")
         self.assertEqual(unknown_compact["canary"]["nested_bwrap_setup_stage"], "unavailable")
 
+    def test_sandbox_failure_sanitizes_non_string_enum_fields(self) -> None:
+        fields = (
+            "child_stderr_class", "nested_userns_stderr_class", "nested_userns_mapping_stage",
+            "nested_userns_errno_category", "nested_bwrap_errno_category",
+            "nested_userns_source_identity", "nested_bwrap_source_identity",
+            "nested_mount_errno_category", "nested_bwrap_setup_stage",
+        )
+        run = {"code": "adapter_nonzero_exit", "returncode": 8, "stderr": b""}
+        prefix = "bubblewrap internal canary failed: "
+        for field in fields:
+            for value in ([], {}, ["operation_not_permitted"], {"unexpected": "value"}, None, True, 1):
+                with self.subTest(field=field, value=value):
+                    reason = contracts._sandbox_process_failure(run, {field: value})
+                    self.assertLessEqual(len(reason), 640)
+                    detail = json.loads(reason[len(prefix):])
+                    if field in detail["canary"]:
+                        self.assertEqual(detail["canary"][field],
+                                         "unsupported" if field.endswith("source_identity") else "unavailable")
+        for value in ([], {}, True, 1):
+            with self.subTest(process_code=value):
+                reason = contracts._sandbox_process_failure({**run, "code": value})
+                self.assertEqual(json.loads(reason[len(prefix):])["process_code"],
+                                 "unclassified_process_result")
+
+    def test_compact_sandbox_failure_fits_with_longest_supported_categories(self) -> None:
+        report = {
+            "nested_userns_stderr_class": "operation_not_permitted",
+            "nested_userns_mapping_stage": "user_namespace_creation_failed",
+            "nested_userns_errno_category": "operation_not_permitted",
+            "nested_bwrap_setup_stage": "combined_namespace_creation_failed",
+            "nested_bwrap_errno_category": "operation_not_permitted",
+            "nested_mount_errno_category": "operation_not_permitted",
+        }
+        reason = contracts._sandbox_process_failure({
+            "code": "execution_output_limit_exceeded", "returncode": 255,
+            "stderr": b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+        }, report)
+        self.assertLessEqual(len(reason), 640)
+        detail = json.loads(reason.removeprefix("bubblewrap internal canary failed: "))
+        self.assertEqual(detail["process_code"], "execution_output_limit_exceeded")
+        self.assertEqual(detail["exit_code"], 255)
+        for key, value in report.items():
+            self.assertEqual(detail["canary"][key], value)
+        for key in ("nested_mount_attempted", "nested_capability_denied",
+                    "nested_mount_namespace_created", "nested_bwrap_denied"):
+            self.assertIs(detail["canary"][key], False)
+
+    def test_synthetic_canary_result_rejects_non_string_mount_errno_without_execution(self) -> None:
+        report = {key: True for key in (
+            "outside_read_blocked", "private_shadow_visible", "sandbox_shadow_write_succeeded",
+            "network_blocked", "network_namespace_isolated", "sandbox_exec_capabilities_dropped",
+            "apparmor_stack_verified", "payload_no_new_privs", "payload_capability_sets_zero",
+            "python_reexec_stack_verified", "python_reexec_capabilities_zero", "python_reexec_no_new_privs",
+            "other_exec_stack_verified", "other_exec_capabilities_zero", "other_exec_no_new_privs",
+            "nested_userns_created", "nested_userns_setup_complete", "nested_userns_stack_verified",
+            "nested_userns_no_new_privs", "nested_userns_creation_attempted", "nested_userns_mapping_requested",
+            "nested_userns_mapping_completed", "nested_userns_payload_reached", "nested_capability_sets_observed",
+            "nested_mount_attempted", "nested_mount_namespace_denied", "nested_bwrap_denied",
+            "child_isolated", "child_capabilities_dropped",
+        )}
+        report.update({
+            "nested_userns_setup_stage": "mount_attempted", "nested_userns_utility_version": "2.39.3",
+            "nested_mount_namespace_created": False, "nested_mount_errno_category": "operation_not_permitted",
+            "nested_userns_process_exit_code": 0, "nested_userns_stderr_class": "empty",
+            "nested_bwrap_setup_stage": "loopback_setup_denied", "nested_bwrap_utility_version": "0.9.0",
+            "nested_bwrap_exit_code": 1, "nested_bwrap_stderr_class": "network_namespace_loopback_setup_denied",
+            "child_exit_code": 0, "child_stderr_present": False, "child_stderr_class": "empty",
+        })
+        for value in ("operation_not_permitted", "permission_denied", [], {}, None, True, 1):
+            with self.subTest(errno=value), tempfile.TemporaryDirectory(prefix="acv1-synthetic-errno-") as temp, \
+                    mock.patch.object(contracts.shutil, "which", return_value="/usr/bin/bwrap"), \
+                    mock.patch.object(contracts.sys, "executable", "/usr/bin/python3"), \
+                    mock.patch.object(contracts.os, "stat", return_value=mock.Mock(st_ino=42)), \
+                    mock.patch.object(contracts, "run_bounded", return_value={
+                        "ok": True, "code": "ok", "returncode": 0, "stderr": b"",
+                        "stdout": json.dumps({**report, "nested_mount_errno_category": value}).encode(),
+                    }) as runner:
+                reason = contracts._run_sandbox_canary(Path(temp), Path(temp) / "host-canary.txt")
+                runner.assert_called_once()
+                if isinstance(value, str):
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIsNotNone(reason)
+                    self.assertLessEqual(len(reason), 640)
+                    detail = json.loads(reason.removeprefix("bubblewrap internal canary failed: "))
+                    self.assertEqual(detail["canary"]["nested_mount_errno_category"], "unavailable")
+
+    def test_sandbox_failure_bounds_untrusted_process_exit_code(self) -> None:
+        for value in (10 ** 1000, -(10 ** 1000), True, None, "255"):
+            with self.subTest(returncode=value):
+                reason = contracts._sandbox_process_failure({
+                    "code": "adapter_nonzero_exit", "returncode": value, "stderr": b"",
+                })
+                self.assertLessEqual(len(reason), 640)
+                detail = json.loads(reason.removeprefix("bubblewrap internal canary failed: "))
+                self.assertEqual(detail["exit_code"], "unavailable")
+
     def test_native_profile_setup_accepts_only_exact_signed_ubuntu_apt_record(self) -> None:
         record = (
             "Package: apparmor-profiles\n"

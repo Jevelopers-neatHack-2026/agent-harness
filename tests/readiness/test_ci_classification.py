@@ -1,5 +1,6 @@
 """Direct tests for CI's expected-pending classifier behavior."""
 
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -10,6 +11,116 @@ from tools import verify_contract_release as contracts
 
 
 class CICheckerClassificationTests(unittest.TestCase):
+    def _classify_mocked_failed_sandbox(self, diagnostic_fields):
+        report = {
+            "nested_userns_created": False,
+            "nested_userns_mapping_completed": False,
+            "nested_userns_payload_reached": False,
+            "nested_mount_attempted": False,
+            "nested_mount_namespace_denied": False,
+            "nested_bwrap_denied": False,
+            **diagnostic_fields,
+        }
+
+        def bounded(command, **_kwargs):
+            if command == ["/usr/bin/bwrap", "--version"]:
+                return {"ok": True, "stdout": b"bubblewrap 0.9.0", "stderr": b""}
+            self.assertEqual(command[0], "/usr/bin/bwrap")
+            self.assertIn("-c", command)
+            return {
+                "ok": False, "code": "adapter_nonzero_exit", "returncode": 8,
+                "stdout": json.dumps(report).encode(), "stderr": b"",
+            }
+
+        real_stat = contracts.os.stat
+
+        def stat_with_synthetic_namespace(path, *args, **kwargs):
+            if str(path) == "/proc/self/ns/net":
+                return mock.Mock(st_ino=42)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(ci.platform, "system", return_value="Linux"), \
+                mock.patch.object(ci.shutil, "which", return_value="/usr/bin/bwrap"), \
+                mock.patch.object(ci.os, "access", return_value=True), \
+                mock.patch.object(contracts.sys, "executable", "/usr/bin/python3"), \
+                mock.patch.object(contracts.os, "stat", side_effect=stat_with_synthetic_namespace), \
+                mock.patch.object(contracts, "_sandbox_prerequisite_error", return_value=None), \
+                mock.patch.object(ci, "_kernel_apparmor_audit", return_value={"status": "not_observed"}), \
+                mock.patch.object(contracts, "run_bounded", side_effect=bounded) as runner, \
+                mock.patch.object(contracts.subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")):
+            evidence, problems = ci.classify_sandbox()
+
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(problems, ["bubblewrap_canary_failed"])
+        self.assertEqual(evidence["implementation_check"], "unexpected_result")
+        self.assertEqual(evidence["canary"]["status"], "failed")
+        for key in ("nested_userns_created", "nested_userns_mapping_completed",
+                    "nested_userns_payload_reached", "nested_mount_attempted",
+                    "nested_mount_namespace_denied", "nested_bwrap_denied"):
+            self.assertIs(evidence["canary"]["observations"][key], False)
+        detail = evidence["canary"]["details"]
+        self.assertLessEqual(len(detail), 640)
+        json.loads(detail.removeprefix("bubblewrap internal canary failed: "))
+        return evidence["canary"]["observations"]
+
+    def test_sandbox_classifier_preserves_finite_diagnostic_fields_through_verifier(self):
+        fields = {
+            "nested_userns_mapping_stage": "uid_mapping_failed",
+            "nested_userns_errno_category": "operation_not_permitted",
+            "nested_bwrap_errno_category": "operation_not_permitted",
+            "nested_userns_source_identity": "util-linux-v2.39.3-sys-utils-unshare.c",
+            "nested_bwrap_source_identity": "bubblewrap-v0.9.0-bubblewrap.c+network.c",
+        }
+        published = self._classify_mocked_failed_sandbox({
+            **fields, "raw_stderr": "/synthetic/private/path",
+        })
+        for key, value in fields.items():
+            self.assertEqual(published.get(key), value, key)
+        self.assertNotIn("raw_stderr", published)
+
+    def test_sandbox_classifier_rejects_invalid_transported_diagnostics(self):
+        fields = (
+            "nested_userns_mapping_stage", "nested_userns_errno_category",
+            "nested_bwrap_errno_category", "nested_userns_source_identity",
+            "nested_bwrap_source_identity",
+        )
+        for field in fields:
+            for value in ([], {}, ["operation_not_permitted"], {"unexpected": "value"},
+                          None, True, 1, "unknown-diagnostic-value"):
+                with self.subTest(field=field, value=value):
+                    published = self._classify_mocked_failed_sandbox({field: value})
+                    self.assertNotIn(field, published)
+
+    def test_sandbox_observations_omit_non_string_categories(self):
+        fields = (
+            "nested_mount_errno_category", "nested_userns_stderr_class", "nested_userns_mapping_stage",
+            "nested_userns_errno_category", "nested_bwrap_errno_category", "nested_bwrap_setup_stage",
+            "nested_userns_source_identity", "nested_bwrap_source_identity", "nested_bwrap_stderr_class",
+        )
+        for field in fields:
+            for value in ([], {}, ["operation_not_permitted"], {"unexpected": "value"}, None, True, 1):
+                with self.subTest(field=field, value=value):
+                    self.assertNotIn(field, ci._safe_sandbox_observations({field: value}))
+
+    def test_sandbox_failure_detail_round_trips_at_publication_bound(self):
+        report = {
+            "nested_userns_stderr_class": "operation_not_permitted",
+            "nested_userns_mapping_stage": "user_namespace_creation_failed",
+            "nested_userns_errno_category": "operation_not_permitted",
+            "nested_bwrap_setup_stage": "combined_namespace_creation_failed",
+            "nested_bwrap_errno_category": "operation_not_permitted",
+            "nested_mount_errno_category": "operation_not_permitted",
+        }
+        reason = contracts._sandbox_process_failure({
+            "code": "execution_output_limit_exceeded", "returncode": 255,
+            "stderr": b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+        }, report)
+        published = ci._bounded_string(reason, 640)
+        self.assertEqual(published, reason)
+        detail = json.loads(published.removeprefix("bubblewrap internal canary failed: "))
+        for key, value in report.items():
+            self.assertEqual(detail["canary"][key], value)
+
     def test_sandbox_artifact_preserves_only_bounded_sanitized_failure_detail(self):
         reason = contracts._sandbox_process_failure({
             "ok": False,
