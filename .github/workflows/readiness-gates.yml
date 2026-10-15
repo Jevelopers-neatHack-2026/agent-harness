@@ -1,0 +1,143 @@
+name: Readiness gates
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/readiness-gates.yml'
+      - 'tools/verify_contract_release.py'
+      - 'tools/validate_jev_targets.py'
+      - 'tests/readiness/**'
+      - 'fixtures/contracts/**'
+      - 'evals/jev/**'
+      - 'docs/decisions/contract-readiness.md'
+      - 'docs/decisions/evaluation-plan.md'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/readiness-gates.yml'
+      - 'tools/verify_contract_release.py'
+      - 'tools/validate_jev_targets.py'
+      - 'tests/readiness/**'
+      - 'fixtures/contracts/**'
+      - 'evals/jev/**'
+      - 'docs/decisions/contract-readiness.md'
+      - 'docs/decisions/evaluation-plan.md'
+
+permissions:
+  contents: read
+
+jobs:
+  checker-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report readiness Python runtime
+        run: python3 --version
+      - name: Provision only the authenticated, pinned Ubuntu bubblewrap profile
+        run: >-
+          python3 tests/readiness/prepare_ubuntu_bwrap_profile.py
+          --evidence "$RUNNER_TEMP/native-profile-hardening-profile-provenance.json"
+      - name: Run standalone readiness checker tests without skips
+        env:
+          ACV1_REQUIRE_BWRAP: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests/readiness -v 2>&1 | tee "$RUNNER_TEMP/native-profile-hardening-readiness-tests.log"
+          if grep -Eq 'skipped=[1-9]' "$RUNNER_TEMP/native-profile-hardening-readiness-tests.log"; then
+            echo "::error::Required readiness coverage must not be skipped on the Linux CI runner."
+            exit 1
+          fi
+      - name: Publish readiness tests and profile provenance
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: native-profile-hardening-checker-tests
+          path: |
+            ${{ runner.temp }}/native-profile-hardening-readiness-tests.log
+            ${{ runner.temp }}/native-profile-hardening-profile-provenance.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  contract-readiness-classification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report runner Python version
+        run: python3 --version
+      - name: Confirm canonical release remains blocked on its exact owner actions
+        run: |
+          python3 tests/readiness/classify_ci_gates.py --gate contracts --output "$RUNNER_TEMP/contract-readiness-blocked.json"
+          cat "$RUNNER_TEMP/contract-readiness-blocked.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish classified canonical release evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: canonical-release-readiness-classification
+          path: ${{ runner.temp }}/contract-readiness-blocked.json
+          if-no-files-found: error
+          retention-days: 30
+
+  jev-readiness-classification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report runner Python version
+        run: python3 --version
+      - name: Confirm JEV targets remain blocked on owner definitions and evidence
+        run: |
+          python3 tests/readiness/classify_ci_gates.py --gate jev --output "$RUNNER_TEMP/jev-readiness-blocked.json"
+          cat "$RUNNER_TEMP/jev-readiness-blocked.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish classified JEV readiness evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: jev-readiness-classification
+          path: ${{ runner.temp }}/jev-readiness-blocked.json
+          if-no-files-found: error
+          retention-days: 30
+
+  sandbox-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+      - name: Report readiness Python runtime
+        run: python3 --version
+      - name: Provision only the authenticated, pinned Ubuntu bubblewrap profile
+        run: >-
+          python3 tests/readiness/prepare_ubuntu_bwrap_profile.py
+          --evidence "$RUNNER_TEMP/native-profile-hardening-profile-provenance.json"
+      - name: Run native readiness tests with zero skips
+        env:
+          ACV1_REQUIRE_BWRAP: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests/readiness -v 2>&1 | tee "$RUNNER_TEMP/native-profile-hardening-sandbox-tests.log"
+          if grep -Eq 'skipped=[1-9]' "$RUNNER_TEMP/native-profile-hardening-sandbox-tests.log"; then
+            echo "::error::Required readiness coverage must not be skipped on the Linux sandbox runner."
+            exit 1
+          fi
+      - name: Require Linux bubblewrap filesystem, network, and descendant canaries
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        run: >-
+          python3 tests/readiness/classify_ci_gates.py --gate sandbox
+          --output "$RUNNER_TEMP/native-profile-hardening-sandbox-canaries.json"
+      - name: Publish native profile and synthetic sandbox evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: native-profile-hardening-sandbox-evidence
+          path: |
+            ${{ runner.temp }}/native-profile-hardening-sandbox-tests.log
+            ${{ runner.temp }}/native-profile-hardening-sandbox-canaries.json
+            ${{ runner.temp }}/native-profile-hardening-profile-provenance.json
+          if-no-files-found: warn
+          retention-days: 30

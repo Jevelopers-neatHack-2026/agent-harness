@@ -1,0 +1,46 @@
+{
+  "format": "agent-creative.jev-promotion-targets/v2",
+  "status": "pending_owner_decisions",
+  "owner_reviews": [],
+  "metering_stage_inventory": null,
+  "dataset_split_sha256": {
+    "train": null,
+    "validation": null,
+    "held_out": null
+  },
+  "question_inventory": [
+    {"family": "source_classification", "owner_repository": "event-intelligence", "owner_role": "Agent and research", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"},
+    {"family": "relevance_ranking", "owner_repository": "event-intelligence", "owner_role": "Agent and research", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"},
+    {"family": "entity_matching", "owner_repository": "event-intelligence", "owner_role": "Agent and research", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"},
+    {"family": "factual_conflict_triage", "owner_repository": "event-intelligence", "owner_role": "Agent and research", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"},
+    {"family": "injection_signal", "owner_repository": "event-intelligence", "owner_role": "Agent and research", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"},
+    {"family": "brand_asset_classification", "owner_repository": "creative-engine", "owner_role": "Creative and fulfillment", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"},
+    {"family": "creative_intent_routing", "owner_repository": "creative-engine", "owner_role": "Creative and fulfillment", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"},
+    {"family": "quality_repair_triage", "owner_repository": "creative-engine", "owner_role": "Creative and fulfillment", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"},
+    {"family": "harness_eligible_action_ranking", "owner_repository": "agent-harness", "owner_role": "Agent and research", "required_question_ids": [], "definition_revision": null, "status": "definition_pending"}
+  ],
+  "questions": [],
+  "negative_results_policy": {
+    "on_target_miss": null,
+    "preserve_original_required_target": true,
+    "retroactive_lowering_after_results": false,
+    "target_change_policy": null
+  },
+  "shadow_only_counts_as_active": false,
+  "active_routing_claim": false,
+  "evaluation_follow_on": {
+    "issue_ref": "https://github.com/Jevelopers-neatHack-2026/agent-harness/issues/22",
+    "owner_role": "Agent and research",
+    "status": "pending"
+  },
+  "evaluation_budget": {
+    "budget_scope_ref": null,
+    "currency": null,
+    "maximum_amount": null,
+    "owner_approval": null,
+    "paid_execution_allowed": false
+  },
+  "rollback_owner_role": null,
+  "rollback_rule": null,
+  "note": "No question IDs, metric values, sample counts, cost limits, policy thresholds, approvals, or baseline conclusions are supplied here. Engine owners define their questions. This file stays blocked until they publish decisions and frozen data references. V2 requires externally pinned owner evidence, candidate/baseline byte identity, and a complete independently maintained metering-stage inventory."
+}
