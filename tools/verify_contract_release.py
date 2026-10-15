@@ -2062,6 +2062,8 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
                 "nested_userns_creation_attempted", "nested_userns_mapping_requested",
                 "nested_userns_mapping_completed",
                 "nested_userns_creation_observation", "nested_userns_mapping_observation",
+                "nested_userns_mapping_stage", "nested_userns_errno_category",
+                "nested_userns_source_identity",
                 "nested_userns_utility_version", "nested_userns_utility_version_exit_code",
                 "nested_userns_stderr_bytes", "nested_userns_process_bounded",
                 "nested_capability_sets_observed", "nested_capability_sets",
@@ -2070,7 +2072,8 @@ sys.exit(0 if all(r.get(key) is True for key in required) and r['nested_mount_er
                 "nested_bwrap_denied", "nested_bwrap_setup_stage", "nested_bwrap_payload_reached",
                 "nested_bwrap_exit_code", "nested_bwrap_utility_version",
                 "nested_bwrap_utility_version_exit_code", "nested_bwrap_stderr_bytes",
-                "nested_bwrap_stderr_class", "child_isolated",
+                "nested_bwrap_stderr_class", "nested_bwrap_errno_category", "nested_bwrap_source_identity",
+                "child_isolated",
                 "child_capabilities_dropped", "child_exit_code", "child_stderr_present", "child_stderr_class",
             }
             observed.update({key: report[key] for key in allowed if key in report})
