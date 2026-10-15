@@ -1,6 +1,6 @@
 import {
   closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, opendirSync, openSync,
-  readFileSync, readSync, renameSync, statSync, unlinkSync, writeSync
+  readSync, renameSync, unlinkSync, writeSync
 } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -110,10 +110,34 @@ function writeDurably(path, text) {
   }
 }
 
+function readBatchBytes(path) {
+  let fd;
+  try {
+    // Bind validation and reads to one regular file. A size sample alone
+    // cannot cap a concurrent append, and a pathname read can follow a swap.
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size < 1 || stats.size > MAX_BATCH_FILE_BYTES) {
+      throw new NeatlogsOutboxError('BATCH_INVALID');
+    }
+    const bytes = Buffer.alloc(MAX_BATCH_FILE_BYTES + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = readSync(fd, bytes, length, bytes.length - length, length);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length < 1 || length > MAX_BATCH_FILE_BYTES) throw new NeatlogsOutboxError('BATCH_INVALID');
+    return bytes.subarray(0, length).toString('utf8');
+  } catch {
+    throw new NeatlogsOutboxError('BATCH_INVALID');
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 function readBatch(path) {
-  const stats = statSync(path);
-  if (!stats.isFile() || stats.size > MAX_BATCH_FILE_BYTES) throw new NeatlogsOutboxError('BATCH_INVALID');
-  const batch = parseNeatlogsJson(readFileSync(path, 'utf8'));
+  const batch = parseNeatlogsJson(readBatchBytes(path));
   if (![NEATLOGS_OUTBOX_SCHEMA, LEGACY_OUTBOX_SCHEMA].includes(batch?.schema) || !BATCH_STATES.has(batch.state)) {
     throw new NeatlogsOutboxError('BATCH_INVALID');
   }
