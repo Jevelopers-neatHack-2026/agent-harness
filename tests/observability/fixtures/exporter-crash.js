@@ -1,7 +1,18 @@
-import { writeFileSync } from 'node:fs';
+import { renameSync, rmSync, writeFileSync } from 'node:fs';
 import { DurableWorkflowStore, createHmacTokenizer, createTelemetryExporter } from '@jevelopers/agent-harness-runtime';
 
 const [databasePath, stage, readyPath, acceptedPath] = process.argv.slice(2);
+function publishReady(value) {
+  const temporary = `${readyPath}.${process.pid}.tmp`;
+  try {
+    writeFileSync(temporary, value, { flag: 'wx', mode: 0o600 });
+    renameSync(temporary, readyPath);
+  } catch (error) {
+    try { rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
+}
+
 const store = DurableWorkflowStore.open({ databasePath, clock: () => 20_000 });
 const tokenizer = createHmacTokenizer(Buffer.alloc(32, 91));
 const exporter = createTelemetryExporter({
@@ -10,7 +21,7 @@ const exporter = createTelemetryExporter({
   sink: async records => {
     writeFileSync(acceptedPath, JSON.stringify(records.map(record => record.eventId)));
     if (stage === 'accepted-before-cursor') {
-      writeFileSync(readyPath, 'ready');
+      publishReady('ready');
       return holdForParentKill();
     }
     return { accepted: true, acceptedCount: records.length };
@@ -25,13 +36,13 @@ function holdForParentKill() {
 }
 
 if (stage === 'before-export') {
-  writeFileSync(readyPath, 'ready');
+  publishReady('ready');
   await holdForParentKill();
 }
 
 if (stage === 'after-cursor') {
   await exporter.flush();
-  writeFileSync(readyPath, String(store.getTelemetryCursor()));
+  publishReady(String(store.getTelemetryCursor()));
   await holdForParentKill();
 }
 
