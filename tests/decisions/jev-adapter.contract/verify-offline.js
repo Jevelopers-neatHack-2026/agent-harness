@@ -143,7 +143,15 @@ const manifest = {
     candidateRef: provenance.candidateRef,
     candidateCommit: provenance.candidateCommit,
     candidateTree: provenance.candidateTree,
-    baseSelectionPolicy: provenance.baseSelectionPolicy
+    baseSelectionPolicy: provenance.baseSelectionPolicy,
+    ...(provenance.eventName === 'pull_request' ? {
+      webhookBaseRef: provenance.webhookBaseRef,
+      webhookBaseCommit: provenance.webhookBaseCommit,
+      fetchedBaseRef: provenance.fetchedBaseRef,
+      fetchedBaseCommit: provenance.fetchedBaseCommit,
+      candidateParentCommits: provenance.candidateParentCommits,
+      baseAncestryPolicy: provenance.baseAncestryPolicy
+    } : {})
   },
   workingTreeClean: workingTree.length === 0,
   dirtyPathCount: workingTree === '' ? 0 : workingTree.split('\n').length,

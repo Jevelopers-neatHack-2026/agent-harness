@@ -4,12 +4,22 @@ import { types as utilTypes } from 'node:util';
 import {
   DurableWorkflowStore,
   measureCheckpointPayload,
-  checkpointPayloadForIntegrity
+  checkpointPayloadForIntegrity,
+  consumeLocalCompletionBusyAfterConfirmedInactive,
+  consumeLocalCompletionClockStaleAfterConfirmedInactive,
+  registerLocalControllerCompletionClockSample,
+  consumeLocalAdmissionBusyAfterConfirmedInactive
 } from '../../internal/durable-store.js';
+import { RuntimeError } from '../../internal/errors.js';
 import {
   MAX_CHECKPOINT_SERIALIZED_BYTES
 } from '../../internal/checkpoint-bounds.js';
 import { LOCAL_CONTROLLER_STORAGE_CAPABILITY } from '../../internal/private-local-store-capability.js';
+import {
+  recordOperationsDiagnosticError,
+  recordOperationsDiagnosticProgress,
+  setOperationsDiagnosticPhase
+} from '../../internal/private-ops-diagnostics.js';
 import {
   advanceBudget,
   checkClockBudget,
@@ -43,7 +53,10 @@ const CONTROLLER_KEYS = new Set([
   'runIdentity', 'limitsJson', 'limitsHash', 'budget', 'completedResultsJson',
   'pendingStepId', 'lastAdmissionKind', 'lastAdmissionStepId', 'baseCheckpointData'
 ]);
-const INPUT_KEYS = new Set(['store', 'workflowId', 'ownerId', 'fence', 'planJson', 'limitsJson']);
+const INPUT_KEYS = new Set([
+  'store', 'workflowId', 'ownerId', 'fence', 'planJson', 'limitsJson',
+  'busyTimeoutMs', 'runtimeDeadlineNs'
+]);
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
 
 export class LocalControllerError extends Error {
@@ -441,6 +454,235 @@ function elapsedNow(baseElapsed, processStart) {
   return baseElapsed + delta;
 }
 
+function isCompletionBusy(error) {
+  const confirmedInactive = consumeLocalCompletionBusyAfterConfirmedInactive(error);
+  return confirmedInactive
+    && error instanceof RuntimeError
+    && error.module === 'state'
+    && error?.operation === '_localControllerComplete'
+    && error?.code === 'STORE_BUSY'
+    && error?.retryable === true;
+}
+
+function isCompletionClockStale(error) {
+  const confirmedInactive = consumeLocalCompletionClockStaleAfterConfirmedInactive(error);
+  return confirmedInactive
+    && error instanceof RuntimeError
+    && error.module === 'state'
+    && error.operation === '_localControllerComplete'
+    && error.code === 'CONCURRENT_MODIFICATION'
+    && error.retryable === true;
+}
+
+function completionRetryWindowAvailable(fields, snapshot, now, elapsedMs, limitSet) {
+  if (!Number.isSafeInteger(fields.busyTimeoutMs) || typeof fields.runtimeDeadlineNs !== 'bigint') return false;
+  const busyWaitNs = BigInt(fields.busyTimeoutMs) * 1_000_000n;
+  if (fields.runtimeDeadlineNs - process.hrtime.bigint() <= busyWaitNs) return false;
+  const limits = getLimitValues(limitSet);
+  const remainingWallMs = Math.min(
+    snapshot.workflow.leaseExpiresAtMs - now,
+    snapshot.checkpoint.data.budget.deadlineWallMs - now,
+    limits.maxElapsedMs - elapsedMs
+  );
+  return remainingWallMs > fields.busyTimeoutMs;
+}
+
+function isLocalAdmissionBusy(error) {
+  const confirmedInactive = consumeLocalAdmissionBusyAfterConfirmedInactive(error);
+  return confirmedInactive
+    && error instanceof RuntimeError
+    && error.module === 'state'
+    && error.operation === '_localControllerAdmit'
+    && error.code === 'STORE_BUSY'
+    && error.retryable === true;
+}
+
+function admissionRetryWindowAvailable(fields, snapshot, now, elapsedMs, limitSet, controllerState) {
+  if (!Number.isSafeInteger(fields.busyTimeoutMs) || typeof fields.runtimeDeadlineNs !== 'bigint') return false;
+  const busyWaitNs = BigInt(fields.busyTimeoutMs) * 1_000_000n;
+  if (fields.runtimeDeadlineNs - process.hrtime.bigint() <= busyWaitNs) return false;
+  const limits = getLimitValues(limitSet);
+  const remainingWallMs = Math.min(
+    snapshot.workflow.leaseExpiresAtMs - now,
+    controllerState.budget.deadlineWallMs - now,
+    limits.maxElapsedMs - elapsedMs
+  );
+  return remainingWallMs > fields.busyTimeoutMs;
+}
+
+function admissionResolutionStopReason(resolution) {
+  if (resolution.reason === 'lease_expired') return 'LEASE_FENCED';
+  if (resolution.reason === 'external_outcome_unresolved') return 'EXTERNAL_OUTCOME_UNRESOLVED';
+  if ([
+    'pending_state_changed', 'pending_checkpoint_changed', 'pending_base_checkpoint_changed'
+  ].includes(resolution.reason)) return 'WORKFLOW_SNAPSHOT_CHANGED';
+  return 'LOCAL_ADMISSION_OUTCOME_UNKNOWN';
+}
+
+async function admitWithBusyRecovery({
+  store,
+  fields,
+  snapshot,
+  previousState,
+  controllerState,
+  plan,
+  limitSet,
+  workflowId,
+  ownerId,
+  fence,
+  stepId,
+  admissionKind,
+  admissionEventId,
+  phase,
+  elapsedAtStart,
+  initialMono,
+  hasBusyTimeout
+}) {
+  let candidate = controllerState;
+  const maximumCalls = 3;
+  for (let admissionCall = 1; admissionCall <= maximumCalls; admissionCall += 1) {
+    try {
+      setOperationsDiagnosticPhase(phase, snapshot.checkpoint.sequence);
+      const admission = store._localControllerAdmit(LOCAL_CONTROLLER_STORAGE_CAPABILITY, {
+        workflowId,
+        ownerId,
+        fence,
+        expectedRevision: snapshot.workflow.revision,
+        expectedCheckpointSequence: snapshot.checkpoint.sequence,
+        stepId,
+        admissionKind,
+        eventId: admissionEventId,
+        controllerState: candidate
+      });
+      return { kind: 'committed', admission, controllerState: candidate };
+    } catch (error) {
+      if (!isLocalAdmissionBusy(error) || !hasBusyTimeout) throw error;
+
+      let resolution;
+      try {
+        setOperationsDiagnosticPhase('admission_resolution', snapshot.checkpoint.sequence);
+        resolution = store._localControllerResolveAdmission(LOCAL_CONTROLLER_STORAGE_CAPABILITY, {
+          workflowId,
+          ownerId,
+          fence,
+          expectedRevision: snapshot.workflow.revision,
+          expectedCheckpointSequence: snapshot.checkpoint.sequence,
+          stepId,
+          admissionKind,
+          eventId: admissionEventId,
+          previousCheckpointSha256: snapshot.checkpoint.sha256,
+          controllerState: candidate
+        });
+      } catch (resolutionError) {
+        recordOperationsDiagnosticError('controller_error', resolutionError, {
+          phase: 'admission_resolution', checkpointSequence: snapshot.checkpoint.sequence
+        });
+        return {
+          kind: 'stopped',
+          reason: 'LOCAL_ADMISSION_OUTCOME_UNKNOWN',
+          checkpointSequence: snapshot.checkpoint.sequence
+        };
+      }
+
+      if (resolution.kind === 'committed') {
+        const currentStop = unavailableSnapshot(resolution.snapshot);
+        if (currentStop) {
+          return {
+            kind: 'stopped', reason: currentStop,
+            checkpointSequence: resolution.snapshot.checkpoint.sequence
+          };
+        }
+        if (
+          resolution.snapshot.workflow.revision !== resolution.revision
+          || resolution.snapshot.checkpoint.sequence !== resolution.checkpointSequence
+          || resolution.snapshot.workflow.leaseOwner !== ownerId
+          || resolution.snapshot.workflow.fence !== fence
+          || resolution.snapshot.workflow.leaseExpiresAtMs === null
+          || resolution.snapshot.workflow.leaseExpiresAtMs <= resolution.now
+        ) {
+          return {
+            kind: 'stopped', reason: 'WORKFLOW_SNAPSHOT_CHANGED',
+            checkpointSequence: resolution.snapshot.checkpoint.sequence
+          };
+        }
+        return { kind: 'committed', admission: resolution, controllerState: candidate };
+      }
+      if (resolution.kind !== 'pending') {
+        return {
+          kind: 'stopped',
+          reason: admissionResolutionStopReason(resolution),
+          checkpointSequence: resolution.snapshot?.checkpoint.sequence ?? snapshot.checkpoint.sequence
+        };
+      }
+      if (admissionCall === maximumCalls) {
+        return {
+          kind: 'stopped', reason: 'LOCAL_ADMISSION_BUSY',
+          checkpointSequence: resolution.snapshot.checkpoint.sequence
+        };
+      }
+
+      await yieldAtControllerBoundary();
+      const retrySnapshot = store._localControllerSnapshot(LOCAL_CONTROLLER_STORAGE_CAPABILITY, workflowId);
+      const retryStop = unavailableSnapshot(retrySnapshot);
+      if (retryStop) {
+        return { kind: 'stopped', reason: retryStop, checkpointSequence: retrySnapshot.checkpoint.sequence };
+      }
+      if (
+        retrySnapshot.workflow.revision !== snapshot.workflow.revision
+        || retrySnapshot.checkpoint.sequence !== snapshot.checkpoint.sequence
+        || retrySnapshot.checkpoint.sha256 !== snapshot.checkpoint.sha256
+      ) {
+        return {
+          kind: 'stopped', reason: 'WORKFLOW_SNAPSHOT_CHANGED',
+          checkpointSequence: retrySnapshot.checkpoint.sequence
+        };
+      }
+      const retryNow = store._localControllerNow(LOCAL_CONTROLLER_STORAGE_CAPABILITY);
+      if (
+        retrySnapshot.workflow.leaseOwner !== ownerId
+        || retrySnapshot.workflow.fence !== fence
+        || retrySnapshot.workflow.leaseExpiresAtMs === null
+        || retrySnapshot.workflow.leaseExpiresAtMs <= retryNow
+      ) {
+        return { kind: 'stopped', reason: 'LEASE_FENCED', checkpointSequence: retrySnapshot.checkpoint.sequence };
+      }
+      const retryElapsed = elapsedNow(elapsedAtStart, initialMono);
+      const clockReason = checkClockBudget(candidate.budget, retryNow, retryElapsed, limitSet);
+      if (clockReason) {
+        return { kind: 'stopped', reason: clockReason, checkpointSequence: retrySnapshot.checkpoint.sequence };
+      }
+      if (!admissionRetryWindowAvailable(fields, retrySnapshot, retryNow, retryElapsed, limitSet, candidate)) {
+        return {
+          kind: 'stopped', reason: 'LOCAL_ADMISSION_BUSY',
+          checkpointSequence: retrySnapshot.checkpoint.sequence
+        };
+      }
+      const retryBudget = Object.freeze({
+        ...candidate.budget,
+        lastWallMs: retryNow,
+        elapsedMs: retryElapsed
+      });
+      candidate = previousState === null
+        ? buildInitialPrivateCheckpoint({
+          workflowId,
+          planJson: candidate.planJson,
+          plan,
+          limitSet,
+          baseCheckpointData: candidate.baseCheckpointData,
+          budget: retryBudget,
+          stepId
+        })
+        : buildAdmissionCheckpoint(previousState, admissionKind, stepId, retryBudget);
+      assertPrivateCheckpointRoundTrip(retrySnapshot, candidate, plan, limitSet, retryNow);
+      snapshot = retrySnapshot;
+    }
+  }
+  return {
+    kind: 'stopped', reason: 'LOCAL_ADMISSION_BUSY',
+    checkpointSequence: snapshot.checkpoint.sequence
+  };
+}
+
 /**
  * Execute one pinned private plan over the durable store. The only executable
  * handlers come from the static reviewed registry; each allowance and result
@@ -449,6 +691,9 @@ function elapsedNow(baseElapsed, processStart) {
 export async function runBoundedLocalPlan(input) {
   let workflowId = null;
   let checkpointSequence = null;
+  let diagnosticPhase = 'initial_snapshot';
+  let admissionOrdinal = 0;
+  let completionOrdinal = 0;
   try {
     const fields = ownDataRecord(input, INPUT_KEYS, ['store', 'workflowId', 'ownerId', 'fence']);
     workflowId = fields.workflowId;
@@ -466,8 +711,18 @@ export async function runBoundedLocalPlan(input) {
       || (fields.planJson !== undefined && typeof fields.planJson !== 'string')
       || (fields.limitsJson !== undefined && typeof fields.limitsJson !== 'string')
     ) fail('CONTROLLER_INPUT_INVALID');
+    const hasBusyTimeout = Object.hasOwn(fields, 'busyTimeoutMs');
+    const hasRuntimeDeadline = Object.hasOwn(fields, 'runtimeDeadlineNs');
+    if (hasBusyTimeout !== hasRuntimeDeadline || (hasBusyTimeout && (
+      !Number.isSafeInteger(fields.busyTimeoutMs)
+      || fields.busyTimeoutMs < 1
+      || fields.busyTimeoutMs > 250
+      || typeof fields.runtimeDeadlineNs !== 'bigint'
+      || fields.runtimeDeadlineNs < 1n
+    ))) fail('CONTROLLER_INPUT_INVALID');
 
     const store = fields.store;
+    setOperationsDiagnosticPhase(diagnosticPhase, checkpointSequence);
     const now = store._localControllerNow(LOCAL_CONTROLLER_STORAGE_CAPABILITY);
     let snapshot = store._localControllerSnapshot(LOCAL_CONTROLLER_STORAGE_CAPABILITY, workflowId);
     checkpointSequence = snapshot.checkpoint.sequence;
@@ -488,12 +743,14 @@ export async function runBoundedLocalPlan(input) {
     let admissionKind;
     let elapsedAtStart;
     let initialMono;
+    let previousState = null;
 
     if (privateCheckpoint(snapshot.checkpoint.data)) {
       if (snapshot.checkpoint.data.version !== CHECKPOINT_VERSION) {
         return controllerStop('CHECKPOINT_UNSUPPORTED', workflowId, checkpointSequence);
       }
       state = controllerState(snapshot.checkpoint.data, workflowId);
+      previousState = state;
       ({ plan, limitSet } = compilePinnedPlan(state, workflowId));
       assertOptionalPins(fields, plan, limitSet, workflowId);
       const recovery = readRecovery(snapshot, now);
@@ -548,20 +805,40 @@ export async function runBoundedLocalPlan(input) {
     }
 
     assertPrivateCheckpointRoundTrip(snapshot, state, plan, limitSet, now);
-    let currentAdmission = store._localControllerAdmit(LOCAL_CONTROLLER_STORAGE_CAPABILITY, {
+    diagnosticPhase = 'initial_admission';
+    setOperationsDiagnosticPhase(diagnosticPhase, checkpointSequence);
+    const initialAdmissionEventId = eventId(admissionKind);
+    const initialAdmissionResult = await admitWithBusyRecovery({
+      store,
+      fields,
+      snapshot,
+      previousState,
+      controllerState: state,
+      plan,
+      limitSet,
       workflowId,
       ownerId: fields.ownerId,
       fence: fields.fence,
-      expectedRevision: snapshot.workflow.revision,
-      expectedCheckpointSequence: snapshot.checkpoint.sequence,
       stepId: pendingStepId,
       admissionKind,
-      eventId: eventId(admissionKind),
-      controllerState: state
+      admissionEventId: initialAdmissionEventId,
+      phase: diagnosticPhase,
+      elapsedAtStart,
+      initialMono,
+      hasBusyTimeout
     });
+    if (initialAdmissionResult.kind === 'stopped') {
+      return controllerStop(initialAdmissionResult.reason, workflowId, initialAdmissionResult.checkpointSequence);
+    }
+    state = initialAdmissionResult.controllerState;
+    let currentAdmission = initialAdmissionResult.admission;
+    admissionOrdinal += 1;
+    recordOperationsDiagnosticProgress('admission_committed', admissionOrdinal, currentAdmission.checkpointSequence);
 
     while (true) {
       await yieldAtControllerBoundary();
+      diagnosticPhase = 'loop_snapshot';
+      setOperationsDiagnosticPhase(diagnosticPhase, checkpointSequence);
       snapshot = store._localControllerSnapshot(LOCAL_CONTROLLER_STORAGE_CAPABILITY, workflowId);
       checkpointSequence = snapshot.checkpoint.sequence;
       const stopped = unavailableSnapshot(snapshot);
@@ -613,37 +890,181 @@ export async function runBoundedLocalPlan(input) {
         || beforeCommit.checkpoint.sequence !== snapshot.checkpoint.sequence
       ) return controllerStop('WORKFLOW_SNAPSHOT_CHANGED', workflowId, checkpointSequence);
 
-      const wallNow = store._localControllerNow(LOCAL_CONTROLLER_STORAGE_CAPABILITY);
-      const elapsed = elapsedNow(elapsedAtStart, initialMono);
-      const clockReason = checkClockBudget(byteRecord.state, wallNow, elapsed, limitSet);
-      if (clockReason) return controllerStop(clockReason, workflowId, checkpointSequence);
-      const completedBudget = Object.freeze({
-        ...byteRecord.state,
-        lastWallMs: wallNow,
-        elapsedMs: elapsed
-      });
-      const completedState = buildCompletedCheckpoint(state, plan, resultRecord, completedBudget);
-      assertPrivateCheckpointRoundTrip(beforeCommit, completedState, plan, limitSet, wallNow);
-      const commitWallNow = store._localControllerNow(LOCAL_CONTROLLER_STORAGE_CAPABILITY);
-      const commitElapsed = elapsedNow(elapsedAtStart, initialMono);
-      const commitClockReason = checkClockBudget(
-        completedState.budget,
-        commitWallNow,
-        commitElapsed,
+      const completionWallNow = store._localControllerNow(LOCAL_CONTROLLER_STORAGE_CAPABILITY);
+      const completionMonotonicNowNs = process.hrtime.bigint();
+      const completionElapsed = elapsedNow(elapsedAtStart, initialMono);
+      const completionClockReason = checkClockBudget(
+        byteRecord.state,
+        completionWallNow,
+        completionElapsed,
         limitSet
       );
-      if (commitClockReason) return controllerStop(commitClockReason, workflowId, checkpointSequence);
-      const completion = store._localControllerComplete(LOCAL_CONTROLLER_STORAGE_CAPABILITY, {
-        workflowId,
-        ownerId: fields.ownerId,
-        fence: fields.fence,
-        expectedRevision: beforeCommit.workflow.revision,
-        expectedCheckpointSequence: beforeCommit.checkpoint.sequence,
-        stepId: pendingStepId,
-        eventId: eventId('complete'),
-        controllerState: completedState
+      if (completionClockReason) return controllerStop(completionClockReason, workflowId, checkpointSequence);
+      const completedBudget = Object.freeze({
+        ...byteRecord.state,
+        lastWallMs: completionWallNow,
+        elapsedMs: completionElapsed
       });
-      state = completedState;
+      const completedState = buildCompletedCheckpoint(state, plan, resultRecord, completedBudget);
+      assertPrivateCheckpointRoundTrip(beforeCommit, completedState, plan, limitSet, completionWallNow);
+      diagnosticPhase = 'completion';
+      setOperationsDiagnosticPhase(diagnosticPhase, checkpointSequence);
+      const completionEventId = eventId('complete');
+      let completionState = completedState;
+      let completionStateMonotonicNowNs = completionMonotonicNowNs;
+      let completionClockRefreshUsed = false;
+      let completion;
+      let completionResolution = null;
+      for (let completionCall = 1; completionCall <= 3; completionCall += 1) {
+        try {
+          const callElapsed = elapsedNow(elapsedAtStart, initialMono);
+          const callClockReason = checkClockBudget(
+            completionState.budget,
+            completionState.budget.lastWallMs,
+            callElapsed,
+            limitSet
+          );
+          if (callClockReason) return controllerStop(callClockReason, workflowId, checkpointSequence);
+          registerLocalControllerCompletionClockSample(
+            LOCAL_CONTROLLER_STORAGE_CAPABILITY,
+            completionState,
+            completionState.budget.lastWallMs,
+            completionStateMonotonicNowNs
+          );
+          completion = store._localControllerComplete(LOCAL_CONTROLLER_STORAGE_CAPABILITY, {
+            workflowId,
+            ownerId: fields.ownerId,
+            fence: fields.fence,
+            expectedRevision: beforeCommit.workflow.revision,
+            expectedCheckpointSequence: beforeCommit.checkpoint.sequence,
+            stepId: pendingStepId,
+            eventId: completionEventId,
+            controllerState: completionState
+          });
+          break;
+        } catch (error) {
+          if (isCompletionClockStale(error)) {
+            if (completionClockRefreshUsed || completionCall === 3) {
+              return controllerStop('LOCAL_COMPLETION_BUSY', workflowId, checkpointSequence);
+            }
+            completionClockRefreshUsed = true;
+            await yieldAtControllerBoundary();
+            const retrySnapshot = store._localControllerSnapshot(LOCAL_CONTROLLER_STORAGE_CAPABILITY, workflowId);
+            checkpointSequence = retrySnapshot.checkpoint.sequence;
+            const retryStop = unavailableSnapshot(retrySnapshot);
+            if (retryStop) return controllerStop(retryStop, workflowId, checkpointSequence);
+            const retryWallNow = store._localControllerNow(LOCAL_CONTROLLER_STORAGE_CAPABILITY);
+            const retryMonotonicNowNs = process.hrtime.bigint();
+            if (
+              retrySnapshot.workflow.revision !== beforeCommit.workflow.revision
+              || retrySnapshot.checkpoint.sequence !== beforeCommit.checkpoint.sequence
+              || retrySnapshot.checkpoint.sha256 !== beforeCommit.checkpoint.sha256
+              || retrySnapshot.workflow.leaseOwner !== fields.ownerId
+              || retrySnapshot.workflow.fence !== fields.fence
+              || retrySnapshot.workflow.leaseExpiresAtMs === null
+              || retrySnapshot.workflow.leaseExpiresAtMs <= retryWallNow
+            ) return controllerStop('WORKFLOW_SNAPSHOT_CHANGED', workflowId, checkpointSequence);
+            const retryElapsed = elapsedNow(elapsedAtStart, initialMono);
+            const retryClockReason = checkClockBudget(byteRecord.state, retryWallNow, retryElapsed, limitSet);
+            if (retryClockReason) return controllerStop(retryClockReason, workflowId, checkpointSequence);
+            if (hasBusyTimeout && !completionRetryWindowAvailable(fields, retrySnapshot, retryWallNow, retryElapsed, limitSet)) {
+              return controllerStop('LOCAL_COMPLETION_BUSY', workflowId, checkpointSequence);
+            }
+            const retryBudget = Object.freeze({
+              ...byteRecord.state,
+              lastWallMs: retryWallNow,
+              elapsedMs: retryElapsed
+            });
+            completionState = buildCompletedCheckpoint(state, plan, resultRecord, retryBudget);
+            assertPrivateCheckpointRoundTrip(beforeCommit, completionState, plan, limitSet, retryWallNow);
+            completionStateMonotonicNowNs = retryMonotonicNowNs;
+            continue;
+          }
+          if (!isCompletionBusy(error) || !hasBusyTimeout) throw error;
+          let resolution;
+          try {
+            resolution = store._localControllerResolveCompletion(LOCAL_CONTROLLER_STORAGE_CAPABILITY, {
+              workflowId,
+              ownerId: fields.ownerId,
+              fence: fields.fence,
+              expectedRevision: beforeCommit.workflow.revision,
+              expectedCheckpointSequence: beforeCommit.checkpoint.sequence,
+              stepId: pendingStepId,
+              eventId: completionEventId,
+              previousCheckpointSha256: beforeCommit.checkpoint.sha256,
+              controllerState: completionState
+            });
+          } catch (resolutionError) {
+            recordOperationsDiagnosticError('controller_error', resolutionError, {
+              phase: 'completion_resolution', checkpointSequence
+            });
+            return controllerStop('LOCAL_COMPLETION_OUTCOME_UNKNOWN', workflowId, checkpointSequence);
+          }
+          if (resolution.kind === 'committed') {
+            completion = resolution;
+            completionResolution = resolution;
+            break;
+          }
+          if (resolution.kind !== 'pending' || completionCall === 3) {
+            return controllerStop(
+              resolution.kind === 'pending' ? 'LOCAL_COMPLETION_BUSY' : 'LOCAL_COMPLETION_OUTCOME_UNKNOWN',
+              workflowId,
+              checkpointSequence
+            );
+          }
+
+          // The exact attempted checkpoint is classified before yielding or
+          // refreshing mutable clocks. Recheck the same pending barrier after
+          // yielding so cancellation, fencing, or an unresolved outcome wins.
+          await yieldAtControllerBoundary();
+          const retrySnapshot = store._localControllerSnapshot(LOCAL_CONTROLLER_STORAGE_CAPABILITY, workflowId);
+          checkpointSequence = retrySnapshot.checkpoint.sequence;
+          const retryStop = unavailableSnapshot(retrySnapshot);
+          if (retryStop) return controllerStop(retryStop, workflowId, checkpointSequence);
+          const retryWallNow = store._localControllerNow(LOCAL_CONTROLLER_STORAGE_CAPABILITY);
+          const retryMonotonicNowNs = process.hrtime.bigint();
+          if (
+            retrySnapshot.workflow.revision !== beforeCommit.workflow.revision
+            || retrySnapshot.checkpoint.sequence !== beforeCommit.checkpoint.sequence
+            || retrySnapshot.checkpoint.sha256 !== beforeCommit.checkpoint.sha256
+            || retrySnapshot.workflow.leaseOwner !== fields.ownerId
+            || retrySnapshot.workflow.fence !== fields.fence
+            || retrySnapshot.workflow.leaseExpiresAtMs === null
+            || retrySnapshot.workflow.leaseExpiresAtMs <= retryWallNow
+          ) return controllerStop('WORKFLOW_SNAPSHOT_CHANGED', workflowId, checkpointSequence);
+          const retryElapsed = elapsedNow(elapsedAtStart, initialMono);
+          const retryClockReason = checkClockBudget(byteRecord.state, retryWallNow, retryElapsed, limitSet);
+          if (retryClockReason) return controllerStop(retryClockReason, workflowId, checkpointSequence);
+          if (!completionRetryWindowAvailable(fields, retrySnapshot, retryWallNow, retryElapsed, limitSet)) {
+            return controllerStop('LOCAL_COMPLETION_BUSY', workflowId, checkpointSequence);
+          }
+          const retryBudget = Object.freeze({
+            ...byteRecord.state,
+            lastWallMs: retryWallNow,
+            elapsedMs: retryElapsed
+          });
+          completionState = buildCompletedCheckpoint(state, plan, resultRecord, retryBudget);
+          assertPrivateCheckpointRoundTrip(beforeCommit, completionState, plan, limitSet, retryWallNow);
+          completionStateMonotonicNowNs = retryMonotonicNowNs;
+        }
+      }
+      if (!completion) return controllerStop('LOCAL_COMPLETION_OUTCOME_UNKNOWN', workflowId, checkpointSequence);
+      if (completionResolution) {
+        const current = completionResolution.snapshot;
+        const currentStop = unavailableSnapshot(current);
+        if (currentStop) return controllerStop(currentStop, workflowId, current.checkpoint.sequence);
+        if (
+          current.workflow.revision !== completion.revision
+          || current.checkpoint.sequence !== completion.checkpointSequence
+          || current.workflow.leaseOwner !== fields.ownerId
+          || current.workflow.fence !== fields.fence
+          || current.workflow.leaseExpiresAtMs === null
+          || current.workflow.leaseExpiresAtMs <= completionResolution.now
+        ) return controllerStop('WORKFLOW_SNAPSHOT_CHANGED', workflowId, current.checkpoint.sequence);
+      }
+      completionOrdinal += 1;
+      recordOperationsDiagnosticProgress('completion_committed', completionOrdinal, completion.checkpointSequence);
+      state = completionState;
       checkpointSequence = completion.checkpointSequence;
       const allResults = validatePrivateCheckpointResults(plan, state.completedResultsJson);
       if (allResults.resultCount === getPlanStepIds(plan).length) {
@@ -667,23 +1088,44 @@ export async function runBoundedLocalPlan(input) {
       if (!nextBudget.allowed) return controllerStop(nextBudget.reason, workflowId, checkpointSequence);
       const nextState = buildAdmissionCheckpoint(state, 'step', stepId, nextBudget.state);
       assertPrivateCheckpointRoundTrip(snapshot, nextState, plan, limitSet, nextWall);
-      const nextAdmission = store._localControllerAdmit(LOCAL_CONTROLLER_STORAGE_CAPABILITY, {
+      diagnosticPhase = 'next_admission';
+      setOperationsDiagnosticPhase(diagnosticPhase, checkpointSequence);
+      const nextAdmissionEventId = eventId('step');
+      const nextAdmissionResult = await admitWithBusyRecovery({
+        store,
+        fields,
+        snapshot,
+        previousState: state,
+        controllerState: nextState,
+        plan,
+        limitSet,
         workflowId,
         ownerId: fields.ownerId,
         fence: fields.fence,
-        expectedRevision: snapshot.workflow.revision,
-        expectedCheckpointSequence: snapshot.checkpoint.sequence,
         stepId,
         admissionKind: 'step',
-        eventId: eventId('step'),
-        controllerState: nextState
+        admissionEventId: nextAdmissionEventId,
+        phase: diagnosticPhase,
+        elapsedAtStart,
+        initialMono,
+        hasBusyTimeout
       });
-      state = nextState;
+      if (nextAdmissionResult.kind === 'stopped') {
+        return controllerStop(nextAdmissionResult.reason, workflowId, nextAdmissionResult.checkpointSequence);
+      }
+      const nextAdmission = nextAdmissionResult.admission;
+      admissionOrdinal += 1;
+      recordOperationsDiagnosticProgress('admission_committed', admissionOrdinal, nextAdmission.checkpointSequence);
+      state = nextAdmissionResult.controllerState;
       pendingStepId = stepId;
       // The next loop iteration uses this committed admission's revision/fence.
       currentAdmission = nextAdmission;
     }
   } catch (error) {
+    recordOperationsDiagnosticError('controller_error', error, {
+      phase: diagnosticPhase,
+      checkpointSequence
+    });
     return safeFailure(error, workflowId, checkpointSequence);
   }
 }

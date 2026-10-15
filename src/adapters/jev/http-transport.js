@@ -26,6 +26,7 @@ const SAFE_MESSAGES = Object.freeze({
   TRANSPORT_FAILED_BEFORE_DISPATCH: 'The fixed JEV transport failed before an HTTP write.',
   TRANSPORT_OUTCOME_UNKNOWN: 'The fixed JEV transport failed after a possible HTTP write.',
   RESPONSE_LIMIT_EXCEEDED: 'The JEV response exceeded a transport safety limit.',
+  DISPATCH_AUTHORIZATION_REJECTED: 'The JEV owner did not authorize the HTTP write.',
   INVALID_TRANSPORT_INPUT: 'The private JEV transport input is invalid.'
 });
 
@@ -66,8 +67,8 @@ function readInput(input) {
   } catch {
     return null;
   }
-  const allowed = new Set(['request', 'apiKey', 'signal']);
-  if (keys.length < 2 || keys.length > 3
+  const allowed = new Set(['request', 'apiKey', 'signal', 'beforeWrite']);
+  if (keys.length < 2 || keys.length > 4
       || keys.some(key => typeof key !== 'string' || !allowed.has(key))) return null;
   const fields = Object.create(null);
   for (const key of keys) {
@@ -82,6 +83,7 @@ function readInput(input) {
   }
   if (!Object.hasOwn(fields, 'request') || !Object.hasOwn(fields, 'apiKey')) return null;
   if (Object.hasOwn(fields, 'signal') && !isAbortSignal(fields.signal)) return null;
+  if (Object.hasOwn(fields, 'beforeWrite') && typeof fields.beforeWrite !== 'function') return null;
   if (typeof fields.apiKey !== 'string'
       || fields.apiKey.length < 8
       || fields.apiKey.length > 512
@@ -374,7 +376,7 @@ export function sendJevOnce(input) {
       requestObject.once('error', () => finishError('TRANSPORT_OUTCOME_UNKNOWN'));
       requestObject.once('socket', socket => {
         activeSocket = socket;
-        const send = () => {
+        const send = async () => {
           if (settled || !checkDeadline()) return;
           if (signalAborted(signal)) {
             finishError('ABORTED');
@@ -384,6 +386,24 @@ export function sendJevOnce(input) {
             finishError('TRANSPORT_FAILED_BEFORE_DISPATCH');
             return;
           }
+          // The host's durable Finance/job fences run after DNS and TLS, at
+          // the final write boundary. A stalled/rejected hook never writes.
+          let assertCurrent;
+          if (fields.beforeWrite) {
+            try { assertCurrent = await fields.beforeWrite(); }
+            catch { finishError('DISPATCH_AUTHORIZATION_REJECTED'); return; }
+          }
+          if (settled || !checkDeadline()) return;
+          if (signalAborted(signal)) { finishError('ABORTED'); return; }
+          // The async owner work may return its final synchronous fence. There
+          // is no await between that uncached owner read and the HTTP write.
+          if (assertCurrent !== undefined) {
+            if (typeof assertCurrent !== 'function') { finishError('DISPATCH_AUTHORIZATION_REJECTED'); return; }
+            try { assertCurrent(); }
+            catch { finishError('DISPATCH_AUTHORIZATION_REJECTED'); return; }
+          }
+          if (!checkDeadline()) return;
+          if (signalAborted(signal)) { finishError('ABORTED'); return; }
           possibleWrite = true;
           try {
             requestObject.end(body);

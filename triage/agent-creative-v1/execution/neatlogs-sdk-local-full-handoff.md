@@ -4,13 +4,15 @@
 
 **Repository:** `agent-harness`
 **Branch:** `launch/acv1-neatlogs-sdk-local`
-**Worktree:** `/Users/completetech/agent-harness-worktrees/acv1-neatlogs-sdk-local`
+**Worktree:** task-relative checkout name `acv1-neatlogs-sdk-local` (absolute location is environment-specific)
 **Inspected base:** `bb280f2bfcf390b5d228148fb961ed0b2af326c9` (tree `50d9c05c0311f443961f40a0e39d9a56c6b0e52e`)
 **Source fix commit:** `f92623511ecfc934c0d25ffd7b897867c7876821` (parent `e15d0cf94e2f8359e9a75597348dd187b15405be`, tree `655a82bfeb2e630d65a4428417d71031c8880a07`)
 **Dependency:** `neatlogs@1.1.28`; unchanged lock SHA-256 `9c136cb70e980c19daf05978ce98a372cf2825fcbbd37f098d583aa7083fff7d`
 **Current after-fix local source verification:** Node `v22.23.3`, npm `10.9.9`; all listed commands used the pinned Node toolchain path.
 
-The requested launcher profile was gpt-6-luna/max, strict, Fast, non-UI. The supported launcher control was accepted; the resolved backend tier is not exposed here. No nested delegation was used. The final documentation commit for this handoff is recorded in the external root handoff at `/Users/completetech/agent-harness/triage/agent-creative-v1/execution/neatlogs-pr31-r1-all-findings-full-handoff.md`.
+The requested launcher profile was gpt-6-luna/max, strict, Fast, non-UI. The supported launcher control was accepted; the resolved backend tier is not exposed here. No nested delegation was used. The final documentation commit for this handoff is recorded in the external root execution archive as `neatlogs-pr31-r1-all-findings-full-handoff.md`.
+
+**Portability and historical-scope correction (2026-10-10):** This handoff originally included author-environment absolute checkout, toolchain, and archive paths. They are now represented by a checkout-relative name, the task-specific Node toolchain variable, and an archive-relative filename. This documentation correction leaves the listed source pairs, commands and arguments, results, artifact hashes, nine acceptance groups, and scope limits intact; it adds no runtime, service, Finance, sponsor, or global AH-10 acceptance. References to “current” local verification above are bound to the commits and evidence listed in this historical handoff.
 
 ## Scope, ownership, and boundaries
 
@@ -79,7 +81,7 @@ The SDK package’s optional AI/framework branch remains present in the lock gra
 
 ## Commands and evidence artifacts
 
-All runtime commands below used `PATH=/Users/completetech/.cache/acv1-toolchains/node-v22.23.3-darwin-arm64/bin:$PATH`.
+All runtime commands below used the pinned Node `v22.23.3` toolchain. To recreate them, set the task-specific `ACV1_NODE22_BIN` variable to that toolchain’s `bin` directory; its absolute location is environment-specific.
 
 | Command | Exit | Result |
 | --- | ---: | --- |

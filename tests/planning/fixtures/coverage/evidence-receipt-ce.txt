@@ -1,0 +1,1 @@
+synthetic receipt fixture; not an authenticated owner assertion

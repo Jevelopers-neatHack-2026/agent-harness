@@ -246,6 +246,17 @@ function sqliteSnapshot(databasePath) {
 
 function removeV5Tables(database) {
   database.exec(`
+    PRAGMA foreign_keys = OFF;
+    DROP TRIGGER operations_event_reservation;
+    DROP TRIGGER operations_work_payload_immutable;
+    DROP INDEX operations_attempts_workflow_state_idx;
+    DROP INDEX operations_attempts_state_workflow_idx;
+    DROP INDEX operations_work_scope_page_idx;
+    DROP INDEX operations_work_lease_idx;
+    DROP TABLE operations_work;
+    DROP TABLE operations_projects;
+    DROP TABLE operations_tenants;
+    DROP TABLE operations_meta;
     DROP TABLE jev_local_observation_outbox;
     DROP TABLE jev_provider_observations;
     DROP TABLE jev_dispatch_markers;
@@ -404,7 +415,7 @@ test('durable_evidence: valid synthetic transport persists intent, marker, usage
     return 'tok1_' + '0'.repeat(64);
   }), error => error.code === 'TELEMETRY_INVALID_INPUT');
   assert.equal(tokenizeCalls, 0);
-  assert.equal(INTERNAL_SCHEMA_VERSION, 5);
+  assert.equal(INTERNAL_SCHEMA_VERSION, 6);
 });
 
 test('durable_evidence: malformed decisions keep independently valid usage and missing usage remains unknown', async t => {
@@ -1077,7 +1088,7 @@ test('migration: v1 through v4 upgrades commit as one transaction and v5 failure
     const migrated = openStore(success.databasePath, () => 1000);
     try {
       const migratedSnapshot = sqliteSnapshot(success.databasePath);
-      assert.equal(migratedSnapshot.userVersion, 5);
+      assert.equal(migratedSnapshot.userVersion, 6);
       assert.ok(Object.hasOwn(migratedSnapshot.tables, 'jev_dispatch_markers'));
       assert.ok(Object.hasOwn(migratedSnapshot.tables, 'jev_provider_observations'));
       assert.ok(Object.hasOwn(migratedSnapshot.tables, 'jev_local_observation_outbox'));
@@ -1160,7 +1171,7 @@ test('migration: v4 to v5 preserves workflows, receipts, events, outbox, and tel
   raw.close();
   store = openStore(temporary.databasePath);
   t.after(() => store.close());
-  assert.equal(INTERNAL_SCHEMA_VERSION, 5);
+  assert.equal(INTERNAL_SCHEMA_VERSION, 6);
   assert.deepEqual({
     workflow: store.getWorkflow(lease.workflowId),
     checkpoint: store.getCheckpoint(lease.workflowId),

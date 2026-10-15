@@ -4,7 +4,7 @@
 
 ## Private adapter boundary
 
-`src/adapters/jev/` contains private TypeSafe request/response validation, one fixed-target HTTP send, retry recommendation data, and a pure in-memory observation helper. The Phase B extension in `src/internal/durable-store.js` records the private observation in the existing SQLite store. Nothing in the JEV directory is exported by the package entrypoint or installed in an engine/default execution path. The runtime continues to reject `mode: "live"`.
+`src/adapters/jev/` contains private TypeSafe request/response validation, one fixed-target HTTP send, retry recommendation data, and a pure in-memory observation helper. The Phase B extension in `src/internal/durable-store.js` records the private observation in the existing SQLite store. These private modules remain unexported. The separately composed [public DecisionPort](typesafe-host-integration.md) reuses this transport under the application's existing canonical validators, authorization and Finance controls. It does not enable the private local runtime, which continues to reject `mode: "live"`.
 
 Every fixture and controlled HTTP/DNS response under `tests/fixtures/jev/` is synthetic. Tests replace DNS resolution and `https.request`; they do not contact TypeSafe or another external service. The API key supplied to the private send helper is an explicit internal argument. There is no `.env` reader or credential loader in this phase, and no real credential or spend authority was used.
 
@@ -80,10 +80,36 @@ One monotonic 8-second budget covers DNS, connect, TLS, request write, headers, 
 The owned synthetic suite is part of the normal runtime test command and CI workflow. The named evidence target runs that suite with controlled DNS/HTTPS and emits a sanitized, revision-bound report. Local evidence accepts an attached branch or a detached checkout: detached evidence labels both source and candidate as `refs/detached/HEAD` and binds them to the verified `HEAD` commit and tree, with the base selected from the merge-base against local `main`. It does not synthesize GitHub event metadata. The target requires Node v22.23.3 and accepts only the offline `mock` fixture:
 
 ```sh
-PATH=/Users/completetech/.cache/acv1-toolchains/node-v22.23.3-darwin-arm64/bin:$PATH \
+PATH="${ACV1_NODE22_BIN:?Set to the Node 22.23.3 bin directory}:$PATH" \
   make verify CASE=ACV1-AH05 MODE=mock FIXTURE=jev-phase-b-offline
 ```
 
 The suite names the nine acceptance groups: `wire_positive`, `wire_adversarial`, `batch_semantics`, `fixed_surface_ssrf`, `deadline_cancel`, `retry_faults`, `durable_evidence`, `privacy_identity`, and `gates`. Its evidence report distinguishes dynamically executed test cases and controlled DNS/HTTPS/crash activity from static assertion call-site counts. The cumulative runtime suite separately covers v1/v2/v3 migrations, legacy runtime behavior, build, and strict types.
 
 No AH-05/JEV, Finance, contract, provider-account, tenant-authorization, engine-injection, evaluation, live, or release gate is closed by these private modules or fixtures. Required downstream artifacts include canonical shared-contract request/result/error/version fixtures and consumer acknowledgment; Finance-approved reservation/attempt-binding and known/unknown usage reconciliation contracts; server-derived tenant authorization; provider account/model/client eligibility evidence plus separately authorized spend; and evaluation-owned thresholds/held-out results. Full AH-05 and downstream handoffs remain open.
+
+
+## Immutable pull-request candidate provenance
+
+Runtime CI checks out the exact `github.sha`, rather than following a PR merge
+ref that can move after the event. The evidence resolver requires that exact
+candidate to be HEAD, verifies its two parents and the event's exact PR source
+head, and records its actual first parent as the evaluated base. The webhook's
+base commit remains separate metadata; it is never substituted for the evaluated
+base or used to transfer a passing source-push receipt to a different merge tree.
+
+An advanced first parent is accepted only when the webhook base is its ancestor
+and it is an ancestor of the checked fetched base-branch commit. Missing refs,
+unsafe branch names, unrelated or invented bases, wrong source parents, and a
+checkout SHA/tree differing from the immutable event candidate fail closed.
+The manifest retains webhook/fetched base references and commits, actual parent
+commits, and the verified ancestry policy beside the exact candidate SHA/tree.
+The descriptive PR merge ref is not used as a floating source of authority.
+
+The regression fixture constructs a real merge after an independent base change.
+A separate local reconstruction of failed candidate
+`90b26c917a62b056db9d0c8d87ba19d60d79c815` uses its actual Git objects and the
+independently observed metadata: evaluated base `0c28ece...`, webhook base
+`19cdefe...`, and source `98e24f1...`. The original resolver rejects that case;
+the correction verifies it. This reconstruction does not claim possession of
+the original runner event JSON or replace a fresh passing PR-candidate CI run.

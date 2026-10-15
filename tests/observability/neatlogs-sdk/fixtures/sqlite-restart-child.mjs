@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { DurableWorkflowStore } from '@jevelopers/agent-harness-runtime';
 import { createNeatlogsSdkCapture } from '../../../../src/observability/private/neatlogs-sdk-capture.js';
-import { projectStoreEvents, writeJson } from '../helpers.js';
+import { projectStoreEvents, writeJsonAtomically } from '../helpers.js';
 
-const [databasePathInput, phase, readyPathInput, outputPathInput] = process.argv.slice(2);
+const [databasePathInput, phase, readyPathInput, outputPathInput, stagePathInput, gatePathInput] = process.argv.slice(2);
 const databasePath = resolve(databasePathInput);
 const readyPath = resolve(readyPathInput);
 const outputPath = resolve(outputPathInput);
@@ -14,7 +14,7 @@ const { records, rawEventCount } = projectStoreEvents(store);
 const keepAlive = () => setInterval(() => {}, 60_000);
 
 if (phase === 'before') {
-  writeJson(readyPath, { phase, rawEventCount, projectedRecordCount: records.length });
+  await writeJsonAtomically(readyPath, { phase, rawEventCount, projectedRecordCount: records.length });
   keepAlive();
 } else if (phase === 'during') {
   const capture = createNeatlogsSdkCapture({ timeoutMs: 500, exporterDelayMs: 150 });
@@ -24,13 +24,33 @@ if (phase === 'before') {
     if (Date.now() >= deadline) throw new Error('The local SDK export callback did not reach its kill barrier.');
     await new Promise(resolveWait => setTimeout(resolveWait, 1));
   }
-  writeJson(readyPath, {
+  await writeJsonAtomically(readyPath, {
     phase,
     rawEventCount,
     projectedRecordCount: records.length,
     callbackPending: capture.diagnostics().exporter.pendingCallbacks
   });
   void pending;
+  keepAlive();
+} else if (phase === 'partial-publication-control') {
+  const stagePath = resolve(stagePathInput);
+  const gatePath = resolve(gatePathInput);
+  const readyValue = { phase, rawEventCount, projectedRecordCount: records.length };
+  await writeJsonAtomically(readyPath, readyValue, {
+    afterPartialWrite: async ({ temporaryPath, partialBytes, totalBytes }) => {
+      await writeJsonAtomically(stagePath, {
+        finalReadyPathVisible: existsSync(readyPath),
+        temporaryPath,
+        partialBytes,
+        totalBytes
+      });
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(gatePath)) {
+        if (Date.now() >= deadline) throw new Error('The bounded readiness publication gate expired.');
+        await new Promise(resolveWait => setTimeout(resolveWait, 2));
+      }
+    }
+  });
   keepAlive();
 } else if (phase === 'after' || phase === 'replay') {
   const capture = createNeatlogsSdkCapture();
@@ -62,7 +82,7 @@ if (phase === 'before') {
     writeFileSync(outputPath, bytes, { mode: 0o600 });
     const artifactSha256 = createHash('sha256').update(bytes).digest('hex');
     if (phase === 'after') {
-      writeJson(readyPath, { phase, sourceRecordCount: records.length, artifactSha256 });
+      await writeJsonAtomically(readyPath, { phase, sourceRecordCount: records.length, artifactSha256 });
       keepAlive();
     } else {
       store.close();

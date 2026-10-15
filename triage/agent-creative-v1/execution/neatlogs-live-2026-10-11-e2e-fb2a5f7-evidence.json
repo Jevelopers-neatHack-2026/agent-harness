@@ -1,0 +1,160 @@
+{
+  "schema": "agent-harness.neatlogs.live-verification.v1",
+  "generatedAt": "2026-10-11T23:23:58.285Z",
+  "mode": "send-and-readback",
+  "evidenceClass": "live-synthetic",
+  "syntheticData": true,
+  "componentRevisions": {
+    "agentHarness": "fb2a5f7c6d7ad2a67178f76e22c2d284185a55fe",
+    "neatlogsSdk": "1.1.28"
+  },
+  "config": {
+    "region": "us",
+    "ingestOrigin": "https://ingest.neatlogs.com",
+    "appOrigin": "https://app.neatlogs.com",
+    "projectId": "af976d9b-d310-4cce-a9e9-1908a6aed1e2",
+    "ingestKeyConfigured": true,
+    "readbackTokenConfigured": true,
+    "ingestReady": true,
+    "readbackReady": true
+  },
+  "plan": {
+    "schema": "agent-harness.neatlogs.export-plan.v1",
+    "workflowName": "agent-harness.workflow-events",
+    "tags": [
+      "agent-harness@fb2a5f7c6d7ad2a67178f76e22c2d284185a55fe",
+      "evidence:synthetic"
+    ],
+    "traces": [
+      {
+        "traceId": "cda66d2fc33a4c86c23a46a0acda992b",
+        "rootSpanId": "67a8e6d275c24c16",
+        "markerSpanId": "5a5f4b6c90adbd07",
+        "generation": 0,
+        "priorTraceIds": [],
+        "sessionId": "tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af",
+        "eventToken": "tok1_9a4fd7061214c57cecf93d8c0fb52a610131934e6c0b40acd3da33a4f4797a1f",
+        "sequence": 1,
+        "revision": 0,
+        "eventType": "workflow_created",
+        "fence": 0,
+        "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":1,\"eventId\":\"tok1_9a4fd7061214c57cecf93d8c0fb52a610131934e6c0b40acd3da33a4f4797a1f\",\"workflowId\":\"tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af\",\"revision\":0,\"eventType\":\"workflow_created\",\"fromState\":null,\"toState\":\"queued\",\"fence\":0,\"occurredAtMs\":1791761038289}"
+      },
+      {
+        "traceId": "a8d9cae86438d921ceb49c34479fe89a",
+        "rootSpanId": "983f63834d441884",
+        "markerSpanId": "7f51e13e141d7a7f",
+        "generation": 0,
+        "priorTraceIds": [],
+        "sessionId": "tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af",
+        "eventToken": "tok1_816ecef62ec11cc6d3f86ab630e6c2e86c9b165e17908e1673f610cffdb870b2",
+        "sequence": 2,
+        "revision": 0,
+        "eventType": "lease_acquired",
+        "fence": 1,
+        "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":2,\"eventId\":\"tok1_816ecef62ec11cc6d3f86ab630e6c2e86c9b165e17908e1673f610cffdb870b2\",\"workflowId\":\"tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af\",\"revision\":0,\"eventType\":\"lease_acquired\",\"fromState\":\"queued\",\"toState\":\"queued\",\"fence\":1,\"occurredAtMs\":1791761038289}"
+      },
+      {
+        "traceId": "6e66d49c702538d9f9bdab730a055cac",
+        "rootSpanId": "bc79f5e482eb95a4",
+        "markerSpanId": "a4a6cabb8fe03257",
+        "generation": 0,
+        "priorTraceIds": [],
+        "sessionId": "tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af",
+        "eventToken": "tok1_d2678c1f05a4fa35b90fadb76da3d7f1f8a022cb4849d257e957da0137761af8",
+        "sequence": 3,
+        "revision": 1,
+        "eventType": "state_transition",
+        "fence": 1,
+        "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":3,\"eventId\":\"tok1_d2678c1f05a4fa35b90fadb76da3d7f1f8a022cb4849d257e957da0137761af8\",\"workflowId\":\"tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af\",\"revision\":1,\"eventType\":\"state_transition\",\"fromState\":\"queued\",\"toState\":\"running\",\"fence\":1,\"occurredAtMs\":1791761038290}"
+      }
+    ]
+  },
+  "redaction": {
+    "rawCanariesSeeded": 6,
+    "exportBodyFindings": [],
+    "passed": true
+  },
+  "send": {
+    "status": "receiver_accepted",
+    "deliveryConfirmed": false,
+    "reasonCode": null,
+    "attempts": 1,
+    "expectedSpans": 6,
+    "httpStatus": 200,
+    "rejectedSpans": 0,
+    "receiverMessagePresent": false
+  },
+  "readback": {
+    "status": "verified",
+    "reasonCode": null,
+    "duplicateEventDeliveries": 0,
+    "project": {
+      "id": "af976d9b-d310-4cce-a9e9-1908a6aed1e2"
+    },
+    "traces": [
+      {
+        "traceId": "cda66d2fc33a4c86c23a46a0acda992b",
+        "rootSpanId": "67a8e6d275c24c16",
+        "sessionId": "tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af",
+        "sequence": 1,
+        "eventType": "workflow_created",
+        "revision": 0,
+        "fence": 0,
+        "generation": 0,
+        "status": "verified",
+        "problems": [],
+        "priorGenerationTraceIds": [],
+        "priorGenerationFinalizedTraceIds": [],
+        "priorGenerationConflict": false,
+        "priorGenerationIdentityMismatch": false,
+        "duplicateTraceIds": [],
+        "finalizationStatus": "finalized",
+        "markerStored": false,
+        "spansCount": 1
+      },
+      {
+        "traceId": "a8d9cae86438d921ceb49c34479fe89a",
+        "rootSpanId": "983f63834d441884",
+        "sessionId": "tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af",
+        "sequence": 2,
+        "eventType": "lease_acquired",
+        "revision": 0,
+        "fence": 1,
+        "generation": 0,
+        "status": "verified",
+        "problems": [],
+        "priorGenerationTraceIds": [],
+        "priorGenerationFinalizedTraceIds": [],
+        "priorGenerationConflict": false,
+        "priorGenerationIdentityMismatch": false,
+        "duplicateTraceIds": [],
+        "finalizationStatus": "finalized",
+        "markerStored": false,
+        "spansCount": 1
+      },
+      {
+        "traceId": "6e66d49c702538d9f9bdab730a055cac",
+        "rootSpanId": "bc79f5e482eb95a4",
+        "sessionId": "tok1_1dab3e30dca358bb7d7818dfbf974becffad0b50072c3d1d8809dc1985a135af",
+        "sequence": 3,
+        "eventType": "state_transition",
+        "revision": 1,
+        "fence": 1,
+        "generation": 0,
+        "status": "verified",
+        "problems": [],
+        "priorGenerationTraceIds": [],
+        "priorGenerationFinalizedTraceIds": [],
+        "priorGenerationConflict": false,
+        "priorGenerationIdentityMismatch": false,
+        "duplicateTraceIds": [],
+        "finalizationStatus": "finalized",
+        "markerStored": false,
+        "spansCount": 1
+      }
+    ]
+  },
+  "deliveryConfirmed": true,
+  "recovery": null
+}

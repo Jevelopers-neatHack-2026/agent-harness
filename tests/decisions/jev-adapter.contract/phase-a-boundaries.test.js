@@ -116,7 +116,7 @@ test('gates: package exports contain no provider executor and live mode remains 
   assert.equal(Object.hasOwn(runtime, 'sendJevOnce'), false);
   assert.equal(Object.hasOwn(runtime, 'createJevDecisionPort'), false);
   assert.equal(Object.hasOwn(runtime, 'DecisionPort'), false);
-  assert.equal(runtime.INTERNAL_SCHEMA_VERSION, 5);
+  assert.equal(runtime.INTERNAL_SCHEMA_VERSION, 6);
   assert.throws(() => runtime.assertExecutionModeAvailable({ mode: 'live' }), error => {
     assert.equal(error.code, 'LIVE_EXECUTION_UNAVAILABLE');
     assert.match(error.message, /canonical ports and external authorities/u);

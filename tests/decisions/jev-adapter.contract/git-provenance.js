@@ -46,9 +46,15 @@ function checkedRef(root, ref) {
 
 function checkedBranch(root, value) {
   if (typeof value !== 'string' || value.length < 1 || value.length > 240
+      || value.startsWith('-')
       || /[\u0000-\u0020\u007f]/u.test(value)) fail();
   if (git(root, ['check-ref-format', '--branch', value]) !== value) fail();
   return value;
+}
+
+function assertAncestor(root, ancestor, descendant) {
+  // Inputs are already verified immutable commit IDs, never revision options.
+  if (git(root, ['merge-base', '--', ancestor, descendant]) !== ancestor) fail();
 }
 
 function localHeadBranch(root) {
@@ -93,14 +99,21 @@ function resolveGithubProvenance(root, env, candidateCommit) {
         || !isPlainRecord(pull.base) || !isPlainRecord(pull.head)) fail();
     const baseBranch = checkedBranch(root, pull.base.ref);
     const sourceBranch = checkedBranch(root, pull.head.ref);
-    const baseCommit = checkedCommit(root, pull.base.sha);
+    const webhookBaseCommit = checkedCommit(root, pull.base.sha);
     const sourceCommit = checkedCommit(root, pull.head.sha);
     const candidateRef = `refs/pull/${pull.number}/merge`;
     if (env.GITHUB_REF !== candidateRef) fail();
 
     const row = git(root, ['rev-list', '--parents', '-n', '1', candidateCommit]).split(/\s+/u);
     if (row[0] !== candidateCommit || row.length !== 3
-        || row[1] !== baseCommit || row[2] !== sourceCommit) fail();
+        || row[1] === row[2] || row[2] !== sourceCommit) fail();
+    const baseCommit = checkedCommit(root, row[1]);
+    const fetchedBase = checkedRef(root, `refs/remotes/origin/${baseBranch}`);
+    // A webhook can name an earlier base than the evaluated merge candidate.
+    // Accept that drift only on the same fetched base-branch history. A made-up
+    // descendant of the webhook base that was never on that branch must fail.
+    assertAncestor(root, webhookBaseCommit, baseCommit);
+    assertAncestor(root, baseCommit, fetchedBase.commit);
 
     return {
       eventName: 'pull_request',
@@ -109,6 +122,12 @@ function resolveGithubProvenance(root, env, candidateCommit) {
       sourceCommit,
       baseRef: `refs/heads/${baseBranch}`,
       baseCommit,
+      webhookBaseRef: `refs/heads/${baseBranch}`,
+      webhookBaseCommit,
+      fetchedBaseRef: fetchedBase.ref,
+      fetchedBaseCommit: fetchedBase.commit,
+      candidateParentCommits: Object.freeze([baseCommit, sourceCommit]),
+      baseAncestryPolicy: 'webhook_base_to_candidate_base_to_fetched_base',
       candidateRef,
       candidateCommit,
       baseSelectionPolicy: 'verified_merge_candidate_first_parent'

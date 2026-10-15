@@ -149,7 +149,7 @@ def make_live_observation(profile, capability_id, *, api_family, endpoint, model
         billing_mode="api_metered",
         api_family=api_family,
         endpoint=endpoint,
-        credential_env={"typesafe": "TYPESAFE_API_KEY", "openai": "OPENAI_API_KEY", "neatlogs": "NEATLOGS_API_KEY"}.get(cell["provider"]),
+        credential_env={"typesafe": "TYPESAFE_API_KEY", "openai": "OPENAI_API_KEY", "neatlogs": "NEATLOGS_INGEST_KEY"}.get(cell["provider"]),
         account_ref=account_ref,
         project_ref=project_ref,
         quota_status="recorded",
@@ -235,11 +235,14 @@ def add_jev_model_list_record(cell, *, valid_until="2026-10-20"):
 class MembershipOnlyEnvironment:
     """Proves the checker asks whether a secret name exists, never reads it."""
 
+    def __init__(self, names=("TYPESAFE_API_KEY",)):
+        self.names = tuple(names)
+
     def keys(self):
-        return ("TYPESAFE_API_KEY",)
+        return self.names
 
     def __contains__(self, key):
-        return key == "TYPESAFE_API_KEY"
+        return key in self.names
 
     def __getitem__(self, key):
         raise AssertionError("credential values must never be read")
@@ -314,6 +317,50 @@ class ProviderReadinessTests(unittest.TestCase):
         self.assertIn("CREDENTIAL_REFERENCE_MISSING", {item["code"] for item in jev["blockers"]})
         self.assertIsNone(jev["credential_reference"])
         self.assertEqual(jev["eligibility"]["status"], "pending")
+
+    def test_neatlogs_legacy_and_current_credential_names_are_explicit_name_only_references(self):
+        aliases = ("NEATLOGS_INGEST_KEY", "NEATLOGS_API_KEY")
+        for recorded_name, other_name in (aliases, aliases[::-1]):
+            for present_names, expected_present in (
+                ((recorded_name,), True),
+                ((other_name,), False),
+            ):
+                with self.subTest(recorded_name=recorded_name, present_names=present_names):
+                    profile = load_fixture()
+                    cell_for(profile, "neatlogs")["configuration"]["credential_env"] = recorded_name
+                    errors, validated = self.validate(profile)
+                    self.assertEqual(errors, [])
+                    report = readiness.assess_profile(
+                        validated,
+                        mode="offline",
+                        as_of=AS_OF,
+                        environ=MembershipOnlyEnvironment(present_names),
+                    )
+                    neatlogs = next(item for item in report["capabilities"] if item["id"] == "neatlogs")
+                    self.assertEqual(neatlogs["credential_reference"], recorded_name)
+                    self.assertIs(neatlogs["credential_reference_present"], expected_present)
+                    self.assertEqual(neatlogs["eligibility"]["status"], "pending")
+                    self.assertEqual(neatlogs["live_capability"], "pending")
+                    if expected_present:
+                        self.assertNotIn("CREDENTIAL_ENV_ABSENT", {item["code"] for item in neatlogs["blockers"]})
+                    else:
+                        self.assertIn("CREDENTIAL_ENV_ABSENT", {item["code"] for item in neatlogs["blockers"]})
+
+    def test_neatlogs_credential_alias_does_not_expand_other_provider_or_reference_grammar(self):
+        for invalid_neatlogs_reference in (
+            "NEATLOGS_TOKEN",
+            "NEATLOGS_INGEST_KEY_EXTRA",
+            "not-an-environment-name",
+        ):
+            with self.subTest(reference=invalid_neatlogs_reference):
+                profile = load_fixture()
+                cell_for(profile, "neatlogs")["configuration"]["credential_env"] = invalid_neatlogs_reference
+                issue = self.first_issue(profile)
+                self.assertEqual(issue["code"], "CREDENTIAL_REFERENCE_INVALID")
+
+        wrong_provider = load_fixture()
+        cell_for(wrong_provider, "jev")["configuration"]["credential_env"] = "NEATLOGS_API_KEY"
+        self.assertEqual(self.first_issue(wrong_provider)["code"], "CREDENTIAL_REFERENCE_INVALID")
 
     def test_empty_credential_reference_is_rejected(self):
         profile = load_fixture()

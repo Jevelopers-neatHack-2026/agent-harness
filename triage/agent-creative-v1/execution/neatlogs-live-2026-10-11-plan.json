@@ -1,0 +1,46 @@
+{
+  "schema": "agent-harness.neatlogs.export-plan.v1",
+  "workflowName": "agent-harness.workflow-events",
+  "tags": [
+    "agent-harness@52db7edcc2fb7a69c24b56c5362eb2fec5b28778",
+    "evidence:synthetic"
+  ],
+  "traces": [
+    {
+      "traceId": "42d52c183ddf75c568a56010c884b82f",
+      "rootSpanId": "86ed48c856cbe3a0",
+      "markerSpanId": "c811b16c68ee4873",
+      "sessionId": "tok1_52648f980da09160b53f7549866bdd28f6ed0aed22c290678a63695a884e3b60",
+      "eventToken": "tok1_2e8be1af542b78b82bccf63252e19a28195c05707b667097c1685c6986e796e1",
+      "sequence": 1,
+      "revision": 0,
+      "eventType": "workflow_created",
+      "fence": 0,
+      "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":1,\"eventId\":\"tok1_2e8be1af542b78b82bccf63252e19a28195c05707b667097c1685c6986e796e1\",\"workflowId\":\"tok1_52648f980da09160b53f7549866bdd28f6ed0aed22c290678a63695a884e3b60\",\"revision\":0,\"eventType\":\"workflow_created\",\"fromState\":null,\"toState\":\"queued\",\"fence\":0,\"occurredAtMs\":1791741513088}"
+    },
+    {
+      "traceId": "8b5edad544e2d08b14a20aa478ee3d09",
+      "rootSpanId": "fcc7c695c5482799",
+      "markerSpanId": "3ad487bc07afa468",
+      "sessionId": "tok1_52648f980da09160b53f7549866bdd28f6ed0aed22c290678a63695a884e3b60",
+      "eventToken": "tok1_72db67aa5ded6ad58991cb97712de5beecd192146bf2715b0710d5ea03c0d303",
+      "sequence": 2,
+      "revision": 0,
+      "eventType": "lease_acquired",
+      "fence": 1,
+      "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":2,\"eventId\":\"tok1_72db67aa5ded6ad58991cb97712de5beecd192146bf2715b0710d5ea03c0d303\",\"workflowId\":\"tok1_52648f980da09160b53f7549866bdd28f6ed0aed22c290678a63695a884e3b60\",\"revision\":0,\"eventType\":\"lease_acquired\",\"fromState\":\"queued\",\"toState\":\"queued\",\"fence\":1,\"occurredAtMs\":1791741513088}"
+    },
+    {
+      "traceId": "31fedb2dafb257d9f1c965d8973db03d",
+      "rootSpanId": "50699a51de3c6978",
+      "markerSpanId": "709be41724751971",
+      "sessionId": "tok1_52648f980da09160b53f7549866bdd28f6ed0aed22c290678a63695a884e3b60",
+      "eventToken": "tok1_9fa60993a68f70b6f96b19f5e0fd9de3f1c09713da9fb9a73918eef71d563c55",
+      "sequence": 3,
+      "revision": 1,
+      "eventType": "state_transition",
+      "fence": 1,
+      "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":3,\"eventId\":\"tok1_9fa60993a68f70b6f96b19f5e0fd9de3f1c09713da9fb9a73918eef71d563c55\",\"workflowId\":\"tok1_52648f980da09160b53f7549866bdd28f6ed0aed22c290678a63695a884e3b60\",\"revision\":1,\"eventType\":\"state_transition\",\"fromState\":\"queued\",\"toState\":\"running\",\"fence\":1,\"occurredAtMs\":1791741513088}"
+    }
+  ]
+}

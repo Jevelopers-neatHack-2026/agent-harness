@@ -28,9 +28,10 @@ function packageGraph() {
       // Optional packages that do not install on a host remain recorded from the lock.
     }
     const license = entry.license ?? manifest?.license ?? null;
+    const privateDevelopmentPackage = entry.dev === true && manifest?.private === true;
     if (typeof entry.version !== 'string'
         || typeof entry.integrity !== 'string'
-        || typeof license !== 'string') {
+        || (typeof license !== 'string' && !(license === null && privateDevelopmentPackage))) {
       throw new Error('The locked dependency record is incomplete.');
     }
     entries.push(Object.freeze({
@@ -39,6 +40,8 @@ function packageGraph() {
       version: entry.version,
       integrity: entry.integrity,
       license,
+      licenseStatus: license === null ? 'unknown_private_development' : 'declared',
+      privatePackage: manifest?.private === true,
       optional: entry.optional === true,
       developmentOnly: entry.dev === true,
       dependencies: entry.dependencies ?? Object.freeze({}),

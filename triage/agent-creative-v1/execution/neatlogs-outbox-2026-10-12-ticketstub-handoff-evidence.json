@@ -1,0 +1,110 @@
+{
+  "generatedAt": "2026-10-12T00:34:16.156Z",
+  "evidenceClass": "live-synthetic",
+  "run": "43b42ad4fa6f",
+  "accepted": {
+    "accepted": 4,
+    "duplicates": 0,
+    "refused": 0,
+    "invalid": 0
+  },
+  "send": {
+    "leased": true,
+    "sent": 4,
+    "sendRequests": 1,
+    "retried": 0,
+    "failed": 0,
+    "verified": 0,
+    "regenerated": 0,
+    "waiting": 0,
+    "readbackStatus": null,
+    "sendStatus": "receiver_accepted",
+    "pruned": 0
+  },
+  "readback": {
+    "leased": true,
+    "sent": 0,
+    "sendRequests": 0,
+    "retried": 0,
+    "failed": 0,
+    "verified": 4,
+    "regenerated": 0,
+    "waiting": 0,
+    "readbackStatus": "verified",
+    "sendStatus": null,
+    "pruned": 0
+  },
+  "status": {
+    "counters": {
+      "accepted": 4,
+      "duplicates": 0,
+      "refused": 0,
+      "invalid": 0,
+      "drains": 2,
+      "drainErrors": 0
+    },
+    "outbox": {
+      "counts": {
+        "queued": 0,
+        "sent": 0,
+        "verified": 4,
+        "failed": 0
+      },
+      "latest": [
+        {
+          "traceId": "f850e5750acb00c4f472c7e2d16ed4cc",
+          "workflowName": "agent-harness.ticketstub-events",
+          "eventType": "art_ready",
+          "state": "verified",
+          "generation": 0,
+          "lastStatus": "readback_verified",
+          "lastReason": null,
+          "duplicateTraceIds": []
+        },
+        {
+          "traceId": "064fda27491a1a3369df148b0f68868f",
+          "workflowName": "agent-harness.ticketstub-events",
+          "eventType": "art_requested",
+          "state": "verified",
+          "generation": 0,
+          "lastStatus": "readback_verified",
+          "lastReason": null,
+          "duplicateTraceIds": []
+        },
+        {
+          "traceId": "92f575db837e139efae180fac8678a43",
+          "workflowName": "agent-harness.ticketstub-events",
+          "eventType": "research_started",
+          "state": "verified",
+          "generation": 0,
+          "lastStatus": "readback_verified",
+          "lastReason": null,
+          "duplicateTraceIds": []
+        },
+        {
+          "traceId": "69e373bea77761b44818aa210336d554",
+          "workflowName": "agent-harness.ticketstub-events",
+          "eventType": "intake_submitted",
+          "state": "verified",
+          "generation": 0,
+          "lastStatus": "readback_verified",
+          "lastReason": null,
+          "duplicateTraceIds": []
+        }
+      ]
+    },
+    "lastDrain": {
+      "leased": true,
+      "sent": 0,
+      "sendRequests": 0,
+      "retried": 0,
+      "failed": 0,
+      "verified": 4,
+      "regenerated": 0,
+      "waiting": 0,
+      "readbackStatus": "verified",
+      "sendStatus": null,
+      "pruned": 0
+    }
+  }
+}

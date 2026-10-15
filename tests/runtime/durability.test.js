@@ -1146,7 +1146,7 @@ test('v1 checkpoint migration preserves data and identifiers', t => {
     'SELECT created_at_ms, updated_at_ms FROM workflows WHERE workflow_id = ?'
   ).get('legacy-workflow-7');
   assert.deepEqual({ ...timestamps }, { created_at_ms: 111, updated_at_ms: 222 });
-  assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, 5);
+  assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, 6);
   migrated.close();
 });
 
@@ -1239,6 +1239,17 @@ test('v2 receipts without checkpoint integrity evidence migrate but cannot recon
 
   const oldFormat = new DatabaseSync(temporary.databasePath);
   oldFormat.exec(`
+    PRAGMA foreign_keys = OFF;
+    DROP TRIGGER operations_event_reservation;
+    DROP TRIGGER operations_work_payload_immutable;
+    DROP INDEX operations_attempts_workflow_state_idx;
+    DROP INDEX operations_attempts_state_workflow_idx;
+    DROP INDEX operations_work_scope_page_idx;
+    DROP INDEX operations_work_lease_idx;
+    DROP TABLE operations_work;
+    DROP TABLE operations_projects;
+    DROP TABLE operations_tenants;
+    DROP TABLE operations_meta;
     ALTER TABLE response_receipts DROP COLUMN next_checkpoint_sha256;
     DROP TABLE jev_local_observation_outbox;
     DROP TABLE jev_provider_observations;
@@ -1251,7 +1262,7 @@ test('v2 receipts without checkpoint integrity evidence migrate but cannot recon
   const migrated = openStore(temporary.databasePath, () => 1000);
   t.after(() => migrated.close());
   const raw = new DatabaseSync(temporary.databasePath, { readOnly: true });
-  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 5);
+  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 6);
   const migratedReceipt = raw.prepare('SELECT next_checkpoint_json, next_checkpoint_sha256 FROM response_receipts WHERE receipt_id = ?').get('legacy-receipt-id');
   assert.equal(migratedReceipt.next_checkpoint_json, '{"schemaVersion":2,"data":{"step":"old-format-pending"}}');
   assert.equal(migratedReceipt.next_checkpoint_sha256, null);

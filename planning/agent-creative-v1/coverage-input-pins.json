@@ -1,0 +1,54 @@
+{
+  "format": "acv1.coverage-source-reference/v1",
+  "snapshot_id": "coverage-map-current-2026-10-11",
+  "captured_on_utc_day": "2026-10-11",
+  "coverage_map": {
+    "adapter": "agent-harness.coverage-map-current/v1",
+    "source_path": "triage/agent-creative-v1/execution/coverage-map-current.json",
+    "bytes": 3936962,
+    "sha256": "0a8106e16691a728f7ec5cf82b3947e168cb8b85449baa4b5a2381268f264757",
+    "complete": false,
+    "observed_dimensions": {
+      "required_leaf_records": 59,
+      "agent_harness_leaf_records": 21,
+      "specialist_leaf_records": 38,
+      "source_contribution_rows": 555,
+      "unique_mapped_requirement_ids": 91,
+      "local_scoped_requirement_ids": 60,
+      "global_ids_with_scoped_contributions": 31,
+      "global_criteria_total": 47,
+      "global_ids_outside_scoped_contribution": 16,
+      "contribution_rows_to_global_ids": 391,
+      "contribution_rows_to_local_ids": 164
+    }
+  },
+  "upstream_git_objects": [
+    {
+      "role": "global-canonical-checklist",
+      "adapter": "integration-evals.acceptance-checklist/v1",
+      "repository": "Jevelopers-neatHack-2026/integration-evals",
+      "issue_pinned_revision": "ff1f6d2df816ebbff34742f51be728fcb5c28cb5",
+      "captured_main_revision": "95b0812d6b433a27698930ea5d4cb45af0b82b9d",
+      "source_path": "planning/acceptance-checklist.json",
+      "git_blob_sha1": "d4d3f65b2cbc5529798b88bcc4319f99ebaeaf6c",
+      "bytes": 44703
+    },
+    {
+      "role": "supporting-contract-catalog-metadata",
+      "repository": "Jevelopers-neatHack-2026/shared-contracts",
+      "issue_pinned_revision": "c4caaccc2ea63b273eeac17ed89af8ac64f6bbde",
+      "captured_main_revision": "686ead140e12b86ce4279b1beea881164025ba6a",
+      "source_path": "docs/contract-catalog.md",
+      "git_blob_sha1": "e210b82d23f58ea218ecd79f10339bd8e7205722",
+      "bytes": 7043,
+      "consumed_as_canonical_checklist": false
+    }
+  ],
+  "interpretation": {
+    "counts_are_snapshot_observations_not_limits": true,
+    "map_is_a_caller_supplied_candidate_not_external_canonical_truth": true,
+    "upstream_pins_are_dated_and_must_be_refreshed_before_current_source_claims": true,
+    "no_external_source_artifact_is_vendored_by_this_reference": true,
+    "fresh_issue_readback_pin_is_not_present": true
+  }
+}

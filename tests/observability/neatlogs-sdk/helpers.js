@@ -1,13 +1,14 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
 import {
   DurableWorkflowStore,
   createHmacTokenizer,
   projectTelemetryEvent
 } from '@jevelopers/agent-harness-runtime';
+export { writeJsonAtomically } from './atomic-json-publisher.js';
 
 export const SYNTHETIC_CANARIES = Object.freeze([
   'SYNTHETIC_RAW_ID_CANARY_41a',

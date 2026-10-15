@@ -1,0 +1,75 @@
+{
+  "schema": "agent-harness.legacy-ops-schema6-fixtures.v1",
+  "sourceRevision": "af8ddbcd3543d8576c23bc43a6af5d1d4ae40544",
+  "sourceTree": "e9f697d1c46b46b42920da2138421ee1e97f19b9",
+  "sourceFiles": [
+    {
+      "path": "src/internal/durable-store.js",
+      "bytes": 191470,
+      "sha256": "ee231508165fcd5038adce6c806797062edd0c46610094d09d641a7cefece611"
+    },
+    {
+      "path": "src/orchestrator/internal/controller.js",
+      "bytes": 29703,
+      "sha256": "c094162ab276c92532d9f7a7a294c47d03da3475a93f65c89e790253847e9c55"
+    },
+    {
+      "path": "src/worker/private/config.js",
+      "bytes": 7572,
+      "sha256": "aaec3c53ba02213564cbb543ed0615ece8389993d20ca9aa97157d55559114ae"
+    }
+  ],
+  "fixtureGeneration": "Captured using the unmodified predecessor DurableWorkflowStore, operations config, and bounded local controller APIs from sourceRevision. Databases use SQLite user_version 6 and have no operations_meta.policy_json column. The partial fixture contains one committed local step before the old controller exhausts its one-attempt budget.",
+  "fixtures": [
+    {
+      "path": "tests/operations/fixtures/legacy-v6-populated-32-step.sqlite",
+      "bytes": 204800,
+      "sha256": "a57183af8018dbd0899a7f2c4969619a648c946f43107f705aa7fb01817cb907"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-empty.sqlite",
+      "bytes": 196608,
+      "sha256": "88c0a17aa8706987af6fce1635cafc9d285f847f93950c731fabffc5bc2abd6e"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-multi.sqlite",
+      "bytes": 196608,
+      "sha256": "d39231e86cc1ca98a0ce6671ca545abf2e51499fe77b62a0d220478b9ed36133"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-partial.sqlite",
+      "bytes": 204800,
+      "sha256": "c922bda6ad33045b704ae4ea5262684941fd01a7deb2a68d93a9d2b198dba9af"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-partial-running.sqlite",
+      "bytes": 204800,
+      "sha256": "dece1965ce1ff1347194d7fa4aa022cc239a99ca3924b29a120487bf4a53e963"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-parked.sqlite",
+      "bytes": 196608,
+      "sha256": "b7750bdef4924ce543eb44e9337f9dcd6854e7caa0af0dcd494dad739e2026d3"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-queued.sqlite",
+      "bytes": 196608,
+      "sha256": "c86ad39e8f2dc45528b62b51228f9677e607d2af000106cb4d2d20ed4c39cbe0"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-running.sqlite",
+      "bytes": 196608,
+      "sha256": "83e796908cad9cb1558c61517b0d1bc6a92dee9a52cae2ae773bcf0d94a5b1e9"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-terminal.sqlite",
+      "bytes": 204800,
+      "sha256": "814eaf7d481261ff06f6018acf72510cdbc765bfd13eff9383c6987f4028f093"
+    },
+    {
+      "path": "tests/operations/fixtures/legacy-v6-states/legacy-v6-unknown.sqlite",
+      "bytes": 196608,
+      "sha256": "7b3376b9e63b8d5e8a4077441911bd3fa337ddc86d3ece11fea4951a3764353a"
+    }
+  ]
+}

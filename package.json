@@ -2,6 +2,7 @@
   "name": "@jevelopers/agent-harness-runtime",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Experimental internal durability primitives for agent-harness",
   "engines": {
@@ -11,20 +12,35 @@
     ".": {
       "types": "./src/internal/index.d.ts",
       "import": "./src/internal/index.js"
+    },
+    "./ticketstub": {
+      "types": "./src/integrations/ticketstub/index.d.ts",
+      "import": "./src/integrations/ticketstub/index.js"
+    },
+    "./decisions": {
+      "types": "./src/decisions/index.d.ts",
+      "import": "./src/decisions/index.js"
+    },
+    "./development": {
+      "types": "./src/development/index.d.ts",
+      "import": "./src/development/index.js"
     }
   },
   "scripts": {
-    "build": "node --check src/internal/errors.js && node --check src/internal/config.js && node --check src/internal/durable-store.js && node --check src/internal/telemetry.js && node --check src/internal/index.js && node --check src/adapters/jev/address-policy.js && node --check src/adapters/jev/attempt-recording.js && node --check src/adapters/jev/http-transport.js && node --check src/adapters/jev/request-validation.js && node --check src/adapters/jev/response-validation.js && node --check src/adapters/jev/retry-policy.js && node --check src/adapters/jev/safe-json.js && node --check src/observability/private/neatlogs-sdk-mapper.js && node --check src/observability/private/neatlogs-sdk-mask.js && node --check src/observability/private/neatlogs-sdk-capture.js && node --check src/internal/private-local-store-capability.js && node --check src/orchestrator/internal/limits.js && node --check src/orchestrator/internal/json.js && node --check src/orchestrator/internal/plan.js && node --check src/orchestrator/internal/controller.js && node --check src/tools/internal/registry.js && node --check src/recovery/internal/classify.js && node --check src/recovery/internal/controller.js && node --input-type=module -e \"import('@jevelopers/agent-harness-runtime')\" && env -i PATH=\"$PATH\" TMPDIR=/tmp NODE_NO_WARNINGS=1 node --input-type=module -e \"import('neatlogs').then(({ Client, trace }) => { if (typeof Client !== 'function' || typeof trace !== 'function') process.exit(1); })\" && npm run typecheck",
-    "typecheck": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext tests/runtime/public-api.typecheck.ts tests/observability/public-api.typecheck.ts tests/observability/neatlogs-sdk/public-api.typecheck.ts tests/decisions/jev-adapter.contract/storage.typecheck.ts",
+    "build": "node --check src/decisions/index.js && node --check src/development/index.js && node --check src/internal/errors.js && node --check src/internal/private-ops-diagnostics.js && node --check src/internal/config.js && node --check src/internal/durable-store.js && node --check src/internal/telemetry.js && node --check src/internal/index.js && node --check src/internal/private-local-store-capability.js && node --check src/internal/private-ops-store-capability.js && node --check src/worker/private/config.js && node --check src/worker/private/worker.js && node --check src/worker/private/runner.js && node --check src/health/private/health.js && node --check src/adapters/jev/address-policy.js && node --check src/adapters/jev/attempt-recording.js && node --check src/adapters/jev/http-transport.js && node --check src/adapters/jev/request-validation.js && node --check src/adapters/jev/response-validation.js && node --check src/adapters/jev/retry-policy.js && node --check src/adapters/jev/safe-json.js && node --check src/observability/private/neatlogs-sdk-mapper.js && node --check src/observability/private/neatlogs-sdk-mask.js && node --check src/observability/private/neatlogs-sdk-capture.js && node --check src/observability/private/neatlogs-config.js && node --check src/observability/private/neatlogs-otlp.js && node --check src/observability/private/neatlogs-live.js && node --check tools/neatlogs-live-verify.mjs && node --check src/observability/private/neatlogs-outbox.js && node --check src/observability/private/neatlogs-outbox-intent.js && node --check tools/neatlogs-runtime-trace.mjs && node --check src/observability/private/neatlogs-delivery-queue.js && node --check src/integrations/ticketstub/index.js && node --check src/orchestrator/internal/limits.js && node --check src/orchestrator/internal/json.js && node --check src/orchestrator/internal/plan.js && node --check src/orchestrator/internal/controller.js && node --check src/tools/internal/registry.js && node --check src/recovery/internal/classify.js && node --check src/recovery/internal/controller.js && node --input-type=module -e \"import('@jevelopers/agent-harness-runtime')\" && node --input-type=module -e \"import('@jevelopers/agent-harness-runtime/ticketstub')\" && env -i PATH=\"$PATH\" TMPDIR=/tmp NODE_NO_WARNINGS=1 node --input-type=module -e \"import('neatlogs').then(({ Client, trace }) => { if (typeof Client !== 'function' || typeof trace !== 'function') process.exit(1); })\" && npm run typecheck",
+    "typecheck": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext tests/runtime/public-api.typecheck.ts tests/observability/public-api.typecheck.ts tests/observability/neatlogs-sdk/public-api.typecheck.ts tests/decisions/jev-adapter.contract/storage.typecheck.ts tests/integrations/ticketstub/public-api.typecheck.ts tests/decisions/public-api.typecheck.ts",
     "check": "npm run build",
-    "test": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/planning/*.test.js tests/recovery/*.test.js tests/observability/*.test.js tests/observability/neatlogs-sdk/*.test.js tests/decisions/jev-adapter.contract/*.test.js",
-    "test:internal": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/planning/*.test.js tests/recovery/*.test.js tests/observability/*.test.js tests/observability/neatlogs-sdk/*.test.js tests/decisions/jev-adapter.contract/*.test.js",
-    "test:neatlogs-sdk": "node --test --test-concurrency=1 tests/observability/neatlogs-sdk/*.test.js"
+    "test": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/planning/*.test.js tests/recovery/*.test.js tests/observability/*.test.js tests/observability/neatlogs-sdk/*.test.js tests/observability/neatlogs-live/*.test.js tests/observability/neatlogs-delivery-queue/*.test.js tests/integrations/ticketstub/*.test.js tests/decisions/jev-adapter.contract/*.test.js tests/operations/*.test.js tests/decisions/public-port/*.test.js",
+    "test:internal": "node --test --test-concurrency=1 tests/runtime/*.test.js tests/planning/*.test.js tests/recovery/*.test.js tests/observability/*.test.js tests/observability/neatlogs-sdk/*.test.js tests/observability/neatlogs-live/*.test.js tests/observability/neatlogs-delivery-queue/*.test.js tests/integrations/ticketstub/*.test.js tests/decisions/jev-adapter.contract/*.test.js tests/operations/*.test.js tests/decisions/public-port/*.test.js",
+    "test:neatlogs-sdk": "node --test --test-concurrency=1 tests/observability/neatlogs-sdk/*.test.js",
+    "test:neatlogs-live": "node --test --test-concurrency=1 tests/observability/neatlogs-live/*.test.js tests/observability/neatlogs-delivery-queue/*.test.js tests/integrations/ticketstub/*.test.js",
+    "test:decisions": "node --test --test-concurrency=1 tests/decisions/public-port/*.test.js"
   },
   "dependencies": {
     "neatlogs": "1.1.28"
   },
   "devDependencies": {
+    "creative-engine": "https://codeload.github.com/Jevelopers-neatHack-2026/creative-engine/tar.gz/e4fa66488f31577f516b27238e945a1fb3c2143f",
     "typescript": "5.9.3"
   }
 }

@@ -154,7 +154,7 @@ test('AH-10 bounded SQLite pages preserve strict sequence order and SQL record l
     return true;
   });
   assert.equal(store.getTelemetryCursor(), 0);
-  assert.equal(INTERNAL_SCHEMA_VERSION, 5);
+  assert.equal(INTERNAL_SCHEMA_VERSION, 6);
 });
 
 test('allowlisted projection tokenizes opaque identities and rejects nested, accessor, proxy, cycle, and size inputs without executing them', () => {
@@ -625,7 +625,7 @@ test('process restart replays stable identity after acceptance-before-cursor and
   store.close();
 });
 
-test('schema v3 upgrade adds the v4 cursor and v5 JEV evidence tables; v2 migration remains atomic', t => {
+test('schema v3 upgrade adds the v4 cursor, v5 JEV evidence, and v6 worker operations tables; v2 migration remains atomic', t => {
   const temporary = temporaryDatabase('ah10-v3-migration-');
   t.after(() => temporary.cleanup());
   const store = openStore(temporary.databasePath);
@@ -634,6 +634,17 @@ test('schema v3 upgrade adds the v4 cursor and v5 JEV evidence tables; v2 migrat
   store.close();
   const oldV3 = new DatabaseSync(temporary.databasePath);
   oldV3.exec(`
+    PRAGMA foreign_keys = OFF;
+    DROP TRIGGER operations_event_reservation;
+    DROP TRIGGER operations_work_payload_immutable;
+    DROP INDEX operations_attempts_workflow_state_idx;
+    DROP INDEX operations_attempts_state_workflow_idx;
+    DROP INDEX operations_work_scope_page_idx;
+    DROP INDEX operations_work_lease_idx;
+    DROP TABLE operations_work;
+    DROP TABLE operations_projects;
+    DROP TABLE operations_tenants;
+    DROP TABLE operations_meta;
     DROP TABLE jev_local_observation_outbox;
     DROP TABLE jev_provider_observations;
     DROP TABLE jev_dispatch_markers;
@@ -642,9 +653,9 @@ test('schema v3 upgrade adds the v4 cursor and v5 JEV evidence tables; v2 migrat
   `);
   oldV3.close();
   const migrated = openStore(temporary.databasePath);
-  assert.equal(INTERNAL_SCHEMA_VERSION, 5);
+  assert.equal(INTERNAL_SCHEMA_VERSION, 6);
   const raw = new DatabaseSync(temporary.databasePath, { readOnly: true });
-  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 5);
+  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 6);
   assert.equal(raw.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='telemetry_cursors'").get().count, 1);
   assert.equal(raw.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name IN ('jev_dispatch_markers','jev_provider_observations','jev_local_observation_outbox')").get().count, 3);
   raw.close();

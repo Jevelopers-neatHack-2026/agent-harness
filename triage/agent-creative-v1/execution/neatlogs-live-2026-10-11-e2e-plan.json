@@ -1,0 +1,52 @@
+{
+  "schema": "agent-harness.neatlogs.export-plan.v1",
+  "workflowName": "agent-harness.workflow-events",
+  "tags": [
+    "agent-harness@0301e9ba6c79ece15da7e7428fab9b17d83bde2e",
+    "evidence:synthetic"
+  ],
+  "traces": [
+    {
+      "traceId": "f48747c292adf9df547f9f56ee1780bd",
+      "rootSpanId": "7eddeb34af224ae0",
+      "markerSpanId": "4888fc62150dcf81",
+      "generation": 0,
+      "priorTraceIds": [],
+      "sessionId": "tok1_5b7b93f0474faabb3b057f31b739b964dab2c413db78ffe0c2e0ea6f3b52e585",
+      "eventToken": "tok1_1a61c65ba7e6f63f6d2de79cf326021d1c4e87a797ca3d5e41cab7d614197159",
+      "sequence": 1,
+      "revision": 0,
+      "eventType": "workflow_created",
+      "fence": 0,
+      "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":1,\"eventId\":\"tok1_1a61c65ba7e6f63f6d2de79cf326021d1c4e87a797ca3d5e41cab7d614197159\",\"workflowId\":\"tok1_5b7b93f0474faabb3b057f31b739b964dab2c413db78ffe0c2e0ea6f3b52e585\",\"revision\":0,\"eventType\":\"workflow_created\",\"fromState\":null,\"toState\":\"queued\",\"fence\":0,\"occurredAtMs\":1791760859632}"
+    },
+    {
+      "traceId": "9647800179b6d18f79586bb42f83fa2c",
+      "rootSpanId": "4ea37ecccfac6ac7",
+      "markerSpanId": "e6bc7dc17629459a",
+      "generation": 0,
+      "priorTraceIds": [],
+      "sessionId": "tok1_5b7b93f0474faabb3b057f31b739b964dab2c413db78ffe0c2e0ea6f3b52e585",
+      "eventToken": "tok1_38419b1270f4b9fe5eefd0bd25eb43d31c539d29cdd7e5ac70f53248b1f1f78e",
+      "sequence": 2,
+      "revision": 0,
+      "eventType": "lease_acquired",
+      "fence": 1,
+      "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":2,\"eventId\":\"tok1_38419b1270f4b9fe5eefd0bd25eb43d31c539d29cdd7e5ac70f53248b1f1f78e\",\"workflowId\":\"tok1_5b7b93f0474faabb3b057f31b739b964dab2c413db78ffe0c2e0ea6f3b52e585\",\"revision\":0,\"eventType\":\"lease_acquired\",\"fromState\":\"queued\",\"toState\":\"queued\",\"fence\":1,\"occurredAtMs\":1791760859632}"
+    },
+    {
+      "traceId": "143e4416ea1ca402608cdc77e87acb91",
+      "rootSpanId": "7fc067d029a44b0a",
+      "markerSpanId": "fa91fd4979a3e39a",
+      "generation": 0,
+      "priorTraceIds": [],
+      "sessionId": "tok1_5b7b93f0474faabb3b057f31b739b964dab2c413db78ffe0c2e0ea6f3b52e585",
+      "eventToken": "tok1_4381d2163fd5232c81075b895fa8fb88c010dd3c0ac1b0d96cf9cae9121dc3fc",
+      "sequence": 3,
+      "revision": 1,
+      "eventType": "state_transition",
+      "fence": 1,
+      "input": "{\"schema\":\"agent-harness.telemetry.v1\",\"sequence\":3,\"eventId\":\"tok1_4381d2163fd5232c81075b895fa8fb88c010dd3c0ac1b0d96cf9cae9121dc3fc\",\"workflowId\":\"tok1_5b7b93f0474faabb3b057f31b739b964dab2c413db78ffe0c2e0ea6f3b52e585\",\"revision\":1,\"eventType\":\"state_transition\",\"fromState\":\"queued\",\"toState\":\"running\",\"fence\":1,\"occurredAtMs\":1791760859633}"
+    }
+  ]
+}

@@ -96,10 +96,10 @@ EVIDENCE_NEEDED = {
     ],
 }
 EXPECTED_AUTH_OWNER = "Agent and research with provider/account administrator"
-EXPECTED_CREDENTIAL_ENV = {
-    "typesafe": "TYPESAFE_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "neatlogs": "NEATLOGS_API_KEY",
+ALLOWED_CREDENTIAL_ENVS = {
+    "typesafe": frozenset({"TYPESAFE_API_KEY"}),
+    "openai": frozenset({"OPENAI_API_KEY"}),
+    "neatlogs": frozenset({"NEATLOGS_INGEST_KEY", "NEATLOGS_API_KEY"}),
 }
 MODEL_REQUIRED = frozenset(
     {"jev", "gpt_image", "planner_reasoning", "generative_baseline"}
@@ -843,7 +843,7 @@ def validate_profile(profile: Any, *, as_of: date) -> tuple[list[dict[str, str]]
                     not ENV_NAME_RE.fullmatch(credential_env)
                     or has_placeholder
                     or actual_provider is None
-                    or EXPECTED_CREDENTIAL_ENV.get(actual_provider) != credential_env
+                    or credential_env not in ALLOWED_CREDENTIAL_ENVS.get(actual_provider, frozenset())
                 ):
                     _fail("CREDENTIAL_REFERENCE_INVALID", f"{config_path}.credential_env", "Credential references must be environment variable names, not values or placeholders.")
             if cell_id in SECRET_ENV_REQUIRED and credential_env is None:

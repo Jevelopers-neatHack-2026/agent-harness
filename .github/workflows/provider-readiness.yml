@@ -46,6 +46,7 @@ jobs:
           assert report["development_execution"]["engine_api_integration"] == "pending"
           assert report["development_execution"]["provider_metering"] == "not_established"
           PY
+          python3 -B tools/verify_provider_report_identity.py "$RUNNER_TEMP/provider-readiness.json"
 
       - name: Upload sanitized readiness report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

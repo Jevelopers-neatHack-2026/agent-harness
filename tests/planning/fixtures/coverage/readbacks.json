@@ -1,0 +1,33 @@
+{
+  "format": "agent-harness.issue-readbacks/v1",
+  "capture_id": "synthetic-capture-01",
+  "captured_at": "2026-10-11T12:00:00Z",
+  "observed_revision": "3333333333333333333333333333333333333333",
+  "pages_complete": true,
+  "issues": [
+    {
+      "repository": "agent-harness",
+      "number": 101,
+      "url": "https://github.com/Example-Co/agent-harness/issues/101",
+      "title": "Synthetic harness leaf",
+      "state": "open",
+      "body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "repository": "event-intelligence",
+      "number": 202,
+      "url": "https://github.com/Example-Co/event-intelligence/issues/202",
+      "title": "Synthetic research leaf",
+      "state": "open",
+      "body_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "repository": "creative-engine",
+      "number": 303,
+      "url": "https://github.com/Example-Co/creative-engine/issues/303",
+      "title": "Synthetic creative leaf",
+      "state": "open",
+      "body_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ]
+}

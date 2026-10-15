@@ -1,5 +1,9 @@
 # AH-10 internal telemetry evidence
 
+## Historical snapshot: 2026-10-10
+
+This page preserves the internal telemetry increment and its schema-4 compatibility description from that snapshot. The schema-4 migration paragraph below describes that earlier increment; the current private local runtime and OPS mechanics are documented in [runtime foundation](decisions/runtime-foundation.md) and the [local runtime runbook](local-runtime-runbook.md). The separate local Neatlogs SDK conformance evidence is recorded in the [PR31 local SDK handoff](../triage/agent-creative-v1/execution/neatlogs-sdk-local-full-handoff.md). The earlier statement that a Neatlogs adapter would require future work refers to this internal exporter boundary; the later local SDK work remains disconnected from service ingestion and does not establish Finance, sponsor, or global AH-10 acceptance.
+
 ## Scope and provenance
 
 This increment adds an internal, redacted, bounded telemetry pipeline over the existing SQLite `workflow_events` table. It does not wire the Neatlogs SDK, send telemetry to a service, enable Entire, or claim public canonical telemetry agreement. The sink is always supplied explicitly by the caller; there is no production no-op or mock fallback.
@@ -16,7 +20,9 @@ The result is local internal evidence only. Full AH-10, SPN-01, SPN-02, Neatlogs
 
 ## Runtime contract
 
-`DurableWorkflowStore.readEventPage()` reads explicit event columns with SQL `ORDER BY sequence LIMIT ?`, returning no more than the requested page. Its maximum returned page is 500 rows. `getTelemetryCursor()` and `advanceTelemetryCursor()` use a separate schema-v4 table. Cursor writes use `BEGIN IMMEDIATE`, compare-and-swap the expected value, advance exactly one sequence at a time, and verify that event exists. No telemetry code reads, acknowledges, or changes the financial outbox, attempt, observation, hold, workflow, receipt, or artifact rows.
+`DurableWorkflowStore.readEventPage()` reads explicit event columns with SQL `ORDER BY sequence LIMIT ?`, returning no more than the requested page. Its maximum returned page is 500 rows. Telemetry cursors were introduced in schema 4 and remain in current schema 6. Cursor writes use `BEGIN IMMEDIATE`, compare-and-swap the expected value, advance exactly one sequence at a time, and verify that event exists. No telemetry code reads, acknowledges, or changes the financial outbox, attempt, observation, hold, workflow, receipt, or artifact rows.
+
+Current AH-11 OPS evidence is local and synthetic only. Schema 6 adds durable tenant/project queue accounting, quotas, and persistent fairness cursors; the checkpoint envelope remains version 2. The two `AH-11-OPS` mock targets execute all 13 local operations groups, and the clean-start target runs an executable empty-database start, bounded work, safe-health, SIGTERM, reopen, and idempotent-recovery transcript. Both report zero provider calls. Node DNS/HTTPS guards cover only the controlled JEV boundary child, not OS-wide egress. Application authorization, external provider dispatch, Finance holds and settlement, Neatlogs service ingestion, owner retention policy, and deployment-host resource limits remain outside this evidence.
 
 The exporter projects only this allowlist: event sequence, tokenized event and workflow identity, revision, event type, state transition, fence, and event time. Event types and state values are fixed allowlists. Event and workflow IDs are treated as sensitive and tokenized using domain-separated HMAC-SHA-256. Callers should keep the same local tokenization key across restarts if replay identity must remain stable, and destroy the tokenizer when its key is no longer needed. Tokenization errors fail closed and leave the durable cursor pending. There is no raw-ID fallback.
 

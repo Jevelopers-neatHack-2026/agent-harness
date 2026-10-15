@@ -13,25 +13,159 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          # Test the immutable event candidate, even if the PR merge ref moves.
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: .node-version
       - name: Verify pinned toolchain and locked package
+        id: install
         run: |
           node --version
           npm --version
           npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run offline ACV1 coverage validator and projector tests
+        run: python3 -B -m unittest discover -s tests/planning -p 'test_coverage*.py'
+      - name: Run private command guard fake controls
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        run: node --test --test-concurrency=1 tests/authorization/private-command-guard.test.js
+      - name: Check offline ownership-control fakes
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        run: node tests/operations/opsactual-ownership-controls.mjs
       - name: Build and import internal entrypoint
         run: make check
       - name: Run offline runtime tests
-        run: |
-          mkdir -p .runtime-artifacts
-          npm test > .runtime-artifacts/runtime-foundation.tap
+        run: python3 .github/scripts/run_ops_owned_command.py --route runtime-foundation
       - name: Run isolated Neatlogs SDK local-capture conformance
+        if: ${{ always() && steps.install.outcome == 'success' }}
         run: npm run test:neatlogs-sdk > .runtime-artifacts/neatlogs-sdk-local.tap
       - name: Produce revision-bound JEV offline evidence
+        if: ${{ always() && steps.install.outcome == 'success' }}
         run: make verify CASE=ACV1-AH05 MODE=mock FIXTURE=jev-phase-b-offline
+      - name: Verify worker operations quota and shutdown fixture
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        run: python3 .github/scripts/run_ops_owned_command.py --route ops-quota-shutdown-restart
+      - name: Verify worker operations clean-start runbook
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        run: python3 .github/scripts/run_ops_owned_command.py --route ops-runbook-clean-start
+      - name: Require the complete sanitized evidence set
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        run: |
+          missing=0
+          for path in \
+            .runtime-artifacts/runtime-foundation.tap \
+            .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.tap \
+            .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.json \
+            .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.json.sha256 \
+            .runtime-artifacts/neatlogs-sdk-local.tap \
+            .runtime-artifacts/neatlogs-sdk-local-capture.json \
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.tap \
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.json \
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.json.sha256 \
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.diagnostics.json \
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.diagnostics.json.sha256 \
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.tap \
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.json \
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.json.sha256 \
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.diagnostics.json \
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.diagnostics.json.sha256 \
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.jsonl \
+            .runtime-artifacts/AH-11-OPS-runbook-recovery.jsonl \
+            .runtime-artifacts/ops-ci1-runtime-foundation.json \
+            .runtime-artifacts/ops-ci1-quota-shutdown-restart.json \
+            .runtime-artifacts/ops-ci1-runbook-clean-start.json; do
+            if [ ! -f "$path" ]; then
+              printf 'Required evidence file is missing: %s\n' "$path"
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+          python3 -B - <<'PY'
+          import json
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          receipts = (
+              ("ops-ci1-runtime-foundation.json", "runtime-foundation", "npm_test"),
+              ("ops-ci1-quota-shutdown-restart.json", "ops-quota-shutdown-restart", "make_ops_fixture"),
+              ("ops-ci1-runbook-clean-start.json", "ops-runbook-clean-start", "make_ops_fixture"),
+          )
+          required = {
+              "schema", "route", "argvClass", "commandExitCode", "wrapperExitCode",
+              "timeoutStage", "escalationStage", "commandDirectReaped", "commandGroupAbsent",
+              "watchdogReaped", "watchdogGroupAbsent", "outerRegistryEmpty", "localRegistryEmpty",
+              "sidecarsReconciled", "outputOverflow", "captureReadFailed", "elapsedMs",
+              "elapsedCapped", "groupsObserved", "sidecarsObserved", "sidecarsReconciledCount",
+              "pendingLaunchesRemaining", "stdout", "stderr",
+          }
+          booleans = (
+              "commandDirectReaped", "commandGroupAbsent", "watchdogReaped", "watchdogGroupAbsent",
+              "outerRegistryEmpty", "localRegistryEmpty", "sidecarsReconciled",
+          )
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate key")
+                  result[key] = value
+              return result
+
+          valid = True
+          for filename, route, argv_class in receipts:
+              path = Path(".runtime-artifacts") / filename
+              try:
+                  info = path.lstat()
+                  if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_size > 8192:
+                      raise ValueError("file")
+                  with path.open("rb") as stream:
+                      data = stream.read(8193)
+                  if len(data) > 8192 or len(data) != info.st_size:
+                      raise ValueError("size")
+                  value = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+                  if not isinstance(value, dict) or set(value) != required:
+                      raise ValueError("shape")
+                  if (value.get("schema") != "ops-ci1-owned-command-receipt.v1"
+                          or value.get("route") != route or value.get("argvClass") != argv_class):
+                      raise ValueError("identity")
+                  if (value.get("commandExitCode") != 0 or isinstance(value.get("commandExitCode"), bool)
+                          or value.get("wrapperExitCode") != 0 or isinstance(value.get("wrapperExitCode"), bool)
+                          or value.get("timeoutStage") != "none"
+                          or value.get("escalationStage") not in ("none", "term", "kill")):
+                      raise ValueError("status")
+                  if any(value.get(key) is not True for key in booleans):
+                      raise ValueError("custody")
+                  if (value.get("outputOverflow") is not False or value.get("captureReadFailed") is not False
+                          or value.get("elapsedCapped") is not False
+                          or not isinstance(value.get("pendingLaunchesRemaining"), int)
+                          or isinstance(value.get("pendingLaunchesRemaining"), bool)
+                          or value.get("pendingLaunchesRemaining") != 0):
+                      raise ValueError("incomplete")
+                  for key, maximum in (("elapsedMs", 600000), ("groupsObserved", 16),
+                                       ("sidecarsObserved", 6), ("sidecarsReconciledCount", 6)):
+                      item = value.get(key)
+                      if not isinstance(item, int) or isinstance(item, bool) or not 0 <= item <= maximum:
+                          raise ValueError("count")
+                  if value["sidecarsReconciledCount"] != value["sidecarsObserved"]:
+                      raise ValueError("sidecars")
+                  for stream in ("stdout", "stderr"):
+                      item = value.get(stream)
+                      if (not isinstance(item, dict) or set(item) != {"bytes", "sha256"}
+                              or not isinstance(item.get("bytes"), int) or isinstance(item.get("bytes"), bool)
+                              or not 0 <= item["bytes"] <= 4194304
+                              or not isinstance(item.get("sha256"), str)
+                              or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
+                          raise ValueError("stream")
+                  if value["stdout"]["bytes"] + value["stderr"]["bytes"] > 8388608:
+                      raise ValueError("combined output")
+              except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                  print(f"Owner receipt is missing, malformed, or incomplete: {filename}", file=sys.stderr)
+                  valid = False
+          if not valid:
+              raise SystemExit(1)
+          PY
       - name: Upload sanitized test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -44,4 +178,20 @@ jobs:
             .runtime-artifacts/ACV1-AH05-jev-phase-b-offline.json.sha256
             .runtime-artifacts/neatlogs-sdk-local.tap
             .runtime-artifacts/neatlogs-sdk-local-capture.json
-          if-no-files-found: warn
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.tap
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.json
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.json.sha256
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.diagnostics.json
+            .runtime-artifacts/AH-11-OPS-quota-shutdown-restart.diagnostics.json.sha256
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.tap
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.json
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.json.sha256
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.diagnostics.json
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.diagnostics.json.sha256
+            .runtime-artifacts/AH-11-OPS-runbook-clean-start.jsonl
+            .runtime-artifacts/AH-11-OPS-runbook-recovery.jsonl
+            .runtime-artifacts/ops-ci1-runtime-foundation.json
+            .runtime-artifacts/ops-ci1-quota-shutdown-restart.json
+            .runtime-artifacts/ops-ci1-runbook-clean-start.json
+          if-no-files-found: error
+          include-hidden-files: true

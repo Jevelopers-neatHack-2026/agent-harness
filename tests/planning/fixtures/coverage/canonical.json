@@ -1,0 +1,13 @@
+{
+  "format_version": "synthetic-v1",
+  "criteria": [
+    {
+      "id": "GLOBAL-A",
+      "title": "Synthetic global criterion",
+      "priority": "P1",
+      "owner_role": "Product and frontend",
+      "verification": "Verify the synthetic cross-repository result.",
+      "evidence_required": "A synthetic exact-revision test record."
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import { runtimeError } from './errors.js';
+import { types as utilTypes } from 'node:util';
 
 const REQUIRED = [
   ['HARNESS_MODE', 'mode'],
@@ -40,17 +41,27 @@ function integerSetting(env, key, minimum, maximum) {
 }
 
 export function parseRuntimeConfig(env) {
-  if (env === null || typeof env !== 'object') {
+  if (env === null || typeof env !== 'object' || utilTypes.isProxy(env) || Array.isArray(env)) {
     invalid('parseRuntimeConfig', 'CONFIG_INVALID', 'Runtime settings must be supplied explicitly.');
   }
 
-  for (const [key] of REQUIRED) required(env, key);
-  const mode = env.HARNESS_MODE.trim();
+  // Inspect only required own data properties. Never execute host getters or
+  // read a setting twice while validating a single configuration snapshot.
+  const settings = Object.create(null);
+  for (const [key] of REQUIRED) {
+    const descriptor = Object.getOwnPropertyDescriptor(env, key);
+    if (descriptor && !Object.hasOwn(descriptor, 'value')) {
+      invalid('parseRuntimeConfig', 'CONFIG_INVALID', 'Runtime settings must be data properties.');
+    }
+    settings[key] = descriptor?.value;
+    required(settings, key);
+  }
+  const mode = settings.HARNESS_MODE.trim();
   if (!['mock', 'recorded', 'sandbox', 'live'].includes(mode)) {
     invalid('parseRuntimeConfig', 'CONFIG_INVALID', 'HARNESS_MODE must name an explicit dependency mode.');
   }
 
-  const modelId = required(env, 'HARNESS_MODEL_ID');
+  const modelId = required(settings, 'HARNESS_MODEL_ID');
   if (
     modelId.length > 128
     || !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(modelId)
@@ -62,10 +73,10 @@ export function parseRuntimeConfig(env) {
   return Object.freeze({
     mode,
     modelId,
-    deadlineMs: integerSetting(env, 'HARNESS_DEADLINE_MS', 1, 86_400_000),
-    maxAttempts: integerSetting(env, 'HARNESS_MAX_ATTEMPTS', 1, 100),
-    maxElapsedMs: integerSetting(env, 'HARNESS_MAX_ELAPSED_MS', 1, 604_800_000),
-    maxCostMinorUnits: integerSetting(env, 'HARNESS_MAX_COST_MINOR_UNITS', 0, Number.MAX_SAFE_INTEGER)
+    deadlineMs: integerSetting(settings, 'HARNESS_DEADLINE_MS', 1, 86_400_000),
+    maxAttempts: integerSetting(settings, 'HARNESS_MAX_ATTEMPTS', 1, 100),
+    maxElapsedMs: integerSetting(settings, 'HARNESS_MAX_ELAPSED_MS', 1, 604_800_000),
+    maxCostMinorUnits: integerSetting(settings, 'HARNESS_MAX_COST_MINOR_UNITS', 0, Number.MAX_SAFE_INTEGER)
   });
 }
 

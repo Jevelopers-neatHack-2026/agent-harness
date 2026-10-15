@@ -1,0 +1,195 @@
+{
+  "schema": "agent-harness.neatlogs.runtime-trace.v1",
+  "generatedAt": "2026-10-12T00:17:08.617Z",
+  "mode": "drain",
+  "evidenceClass": "live-runtime-application",
+  "syntheticBuilder": false,
+  "componentRevisions": {
+    "agentHarness": "c1deb8e891f3a5cff7ba0079062d893291c7d610",
+    "neatlogsSdk": "1.1.28",
+    "node": "22.23.3"
+  },
+  "workflow": {
+    "entryPoint": "createOperationsWorker().submitSyntheticWork() -> src/worker/private/runner.js -> runBoundedLocalPlan",
+    "harnessMode": "mock",
+    "modelMode": "none (mock dependency mode; local-pure registry operations number.add and text.concat; provider, network and shell operations are unavailable in the registry)",
+    "providerCalls": 0,
+    "plan": {
+      "kind": "agent-harness.private-synthetic-plan",
+      "version": 1,
+      "steps": [
+        {
+          "id": "sum",
+          "operation": "number.add",
+          "dependsOn": [],
+          "args": {
+            "left": 20,
+            "right": 22
+          }
+        },
+        {
+          "id": "label",
+          "operation": "text.concat",
+          "dependsOn": [],
+          "args": {
+            "parts": [
+              "agent-harness ",
+              "runtime trace"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "config": {
+    "region": "us",
+    "ingestOrigin": "https://ingest.neatlogs.com",
+    "appOrigin": "https://app.neatlogs.com",
+    "readbackReady": true
+  },
+  "tags": [
+    "agent-harness@c1deb8e891f3a5cff7ba0079062d893291c7d610",
+    "evidence:runtime",
+    "harness-mode:mock"
+  ],
+  "run": null,
+  "batches": [
+    {
+      "state": "verified",
+      "firstSequence": 1,
+      "lastSequence": 3,
+      "records": 3,
+      "workflowName": "agent-harness.workflow-events",
+      "tags": [
+        "agent-harness@157048a32b793fd7af7af1931ff9e9e76a7810a1",
+        "evidence:runtime",
+        "harness-mode:mock"
+      ],
+      "send": {
+        "status": "receiver_accepted",
+        "reasonCode": null,
+        "httpStatus": 200,
+        "attempts": 1,
+        "expectedSpans": 6,
+        "rejectedSpans": 0
+      },
+      "recovery": null,
+      "readback": {
+        "status": "verified",
+        "reasonCode": null,
+        "duplicateEventDeliveries": 0
+      },
+      "traces": [
+        {
+          "traceId": "02e7eebf500996d1602bb89daa7781d1",
+          "rootSpanId": "1c72829345d25c75",
+          "generation": 0,
+          "sequence": 1,
+          "eventType": "workflow_created",
+          "sessionId": "tok1_bb4496f3d62c8dc8752afcea1f37764123ec0a3c66d91ae623d69ac140c008ac",
+          "readback": {
+            "status": "verified",
+            "finalizationStatus": "finalized",
+            "spansCount": 1,
+            "markerStored": false,
+            "duplicateTraceIds": [],
+            "problems": []
+          }
+        },
+        {
+          "traceId": "c84307f324dd5edd32dc47853706de18",
+          "rootSpanId": "3435cc4fd3382b77",
+          "generation": 0,
+          "sequence": 2,
+          "eventType": "operations_work_admitted",
+          "sessionId": "tok1_bb4496f3d62c8dc8752afcea1f37764123ec0a3c66d91ae623d69ac140c008ac",
+          "readback": {
+            "status": "verified",
+            "finalizationStatus": "finalized",
+            "spansCount": 1,
+            "markerStored": false,
+            "duplicateTraceIds": [],
+            "problems": []
+          }
+        },
+        {
+          "traceId": "e76909df83e0aad526532bd2032dc6c5",
+          "rootSpanId": "ccd4051c966f04d4",
+          "generation": 0,
+          "sequence": 3,
+          "eventType": "operations_work_claimed",
+          "sessionId": "tok1_bb4496f3d62c8dc8752afcea1f37764123ec0a3c66d91ae623d69ac140c008ac",
+          "readback": {
+            "status": "verified",
+            "finalizationStatus": "finalized",
+            "spansCount": 1,
+            "markerStored": false,
+            "duplicateTraceIds": [],
+            "problems": []
+          }
+        }
+      ]
+    },
+    {
+      "state": "verified",
+      "firstSequence": 8,
+      "lastSequence": 8,
+      "records": 1,
+      "workflowName": "agent-harness.workflow-events",
+      "tags": [
+        "agent-harness@157048a32b793fd7af7af1931ff9e9e76a7810a1",
+        "evidence:runtime",
+        "harness-mode:mock"
+      ],
+      "send": {
+        "status": "receiver_accepted",
+        "reasonCode": null,
+        "httpStatus": 200,
+        "attempts": 1,
+        "expectedSpans": 2,
+        "rejectedSpans": 0
+      },
+      "recovery": {
+        "regeneratedFrom": [
+          "a67605147354a759e0194d1c351a646a"
+        ],
+        "regeneratedTo": [
+          "0a3fc7a4bbccd9b982a51c9d46943cbc"
+        ],
+        "basis": "NOT_OBSERVED_WITHIN_BOUNDED_POLL_WINDOW",
+        "duplicateDeliveryRisk": "PRIOR_GENERATION_MAY_APPEAR_LATER",
+        "send": {
+          "status": "receiver_accepted",
+          "httpStatus": 200,
+          "attempts": 1,
+          "expectedSpans": 2,
+          "rejectedSpans": 0
+        }
+      },
+      "readback": {
+        "status": "verified",
+        "reasonCode": null,
+        "duplicateEventDeliveries": 0
+      },
+      "traces": [
+        {
+          "traceId": "0a3fc7a4bbccd9b982a51c9d46943cbc",
+          "rootSpanId": "e5fd7621d4b2d4d5",
+          "generation": 1,
+          "sequence": 8,
+          "eventType": "operations_work_completed",
+          "sessionId": "tok1_bb4496f3d62c8dc8752afcea1f37764123ec0a3c66d91ae623d69ac140c008ac",
+          "readback": {
+            "status": "verified",
+            "finalizationStatus": "finalized",
+            "spansCount": 1,
+            "markerStored": false,
+            "duplicateTraceIds": [],
+            "problems": []
+          }
+        }
+      ]
+    }
+  ],
+  "deliveryConfirmed": true
+}

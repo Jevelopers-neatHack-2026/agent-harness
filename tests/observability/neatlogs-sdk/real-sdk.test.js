@@ -105,12 +105,22 @@ test('real Neatlogs 1.1.28 maps frozen synthetic durable events into a sanitized
   assert.equal(serialized.includes('neatlogs.verification.marker'), false);
 
   const packageGraph = artifact.lockedDependencyGraph;
-  assert.equal(packageGraph.length, 57);
+  const lock = JSON.parse(readFileSync(new URL('../../../package-lock.json', import.meta.url), 'utf8'));
+  const lockedPaths = Object.keys(lock.packages).filter(path => path.startsWith('node_modules/')).sort();
+  assert.deepEqual(packageGraph.map(dependency => dependency.path).sort(), lockedPaths);
   for (const dependency of packageGraph) {
     assert.equal(typeof dependency.name, 'string');
     assert.equal(typeof dependency.version, 'string');
     assert.match(dependency.integrity, /^sha512-/);
-    assert.equal(typeof dependency.license, 'string');
+    if (dependency.license === null) {
+      assert.equal(dependency.name, 'creative-engine');
+      assert.equal(dependency.developmentOnly, true);
+      assert.equal(dependency.privatePackage, true);
+      assert.equal(dependency.licenseStatus, 'unknown_private_development');
+    } else {
+      assert.equal(typeof dependency.license, 'string');
+      assert.equal(dependency.licenseStatus, 'declared');
+    }
   }
   assert.equal(packageGraph.find(entry => entry.name === 'neatlogs').version, '1.1.28');
   assert.equal(packageGraph.find(entry => entry.name === 'neatlogs').license, 'MIT');

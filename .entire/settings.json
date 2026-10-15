@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "strategy_options": {
+    "checkpoint_remote": {
+      "provider": "github",
+      "repo": "Jevelopers-neatHack-2026/entire-checkpoints"
+    },
+    "push_sessions": true
+  },
+  "telemetry": false,
+  "checkpoints": {
+    "primary": {
+      "type": "git-refs"
+    }
+  }
+}

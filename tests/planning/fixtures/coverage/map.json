@@ -1,0 +1,152 @@
+{
+  "format": "agent-harness.coverage-map-current/v1",
+  "release": "synthetic fixture only",
+  "complete": true,
+  "coordination_status": "pending",
+  "entries": [
+    {
+      "key": "AH-LEAF",
+      "record_type": "implementation_leaf",
+      "repository": "agent-harness",
+      "issue_url": "https://github.com/Example-Co/agent-harness/issues/101",
+      "issue_title": "Synthetic harness leaf",
+      "owner_role": "Agent and research",
+      "required_for_v1": true,
+      "priority": "P1",
+      "requirement_ids": ["LOCAL-A"],
+      "body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "state": "in_progress",
+      "required_tests": ["test-ah"],
+      "required_evidence": ["ev-ah"],
+      "required_release_stage": "runnable",
+      "blockers": []
+    },
+    {
+      "key": "EI-LEAF",
+      "record_type": "implementation_leaf",
+      "repository": "event-intelligence",
+      "issue_url": "https://github.com/Example-Co/event-intelligence/issues/202",
+      "issue_title": "Synthetic research leaf",
+      "owner_role": "Agent and research",
+      "required_for_v1": true,
+      "priority": "P1",
+      "requirement_ids": ["GLOBAL-A"],
+      "body_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "state": "planned",
+      "required_tests": ["test-ei"],
+      "required_evidence": ["ev-ei"],
+      "required_release_stage": "runnable",
+      "blockers": []
+    },
+    {
+      "key": "CE-LEAF",
+      "record_type": "implementation_leaf",
+      "repository": "creative-engine",
+      "issue_url": "https://github.com/Example-Co/creative-engine/issues/303",
+      "issue_title": "Synthetic creative leaf",
+      "owner_role": "Creative and fulfillment",
+      "required_for_v1": true,
+      "priority": "P1",
+      "requirement_ids": ["GLOBAL-A"],
+      "body_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "state": "in_progress",
+      "required_tests": ["test-ce"],
+      "required_evidence": ["ev-ce"],
+      "required_owner_receipts": ["receipt-ce"],
+      "required_mode": "mock",
+      "required_model_revision": "model-v1",
+      "required_policy_revision": "policy-v1",
+      "required_release_stage": "runnable",
+      "blockers": []
+    },
+    {
+      "key": "RELEASE-GATE",
+      "record_type": "release_gate",
+      "repository": "agent-harness",
+      "issue_url": null,
+      "required_for_v1": false,
+      "requirement_ids": [],
+      "state": "planned",
+      "blockers": []
+    }
+  ],
+  "ownership_rows": [
+    {
+      "requirement_id": "LOCAL-A",
+      "scope": "local",
+      "accountable_delivery_leaf": "AH-LEAF",
+      "acceptance_owner_leaf": "AH-LEAF",
+      "required_contributors": ["AH-LEAF"],
+      "required_for_v1": true,
+      "state": "planned"
+    },
+    {
+      "requirement_id": "GLOBAL-A",
+      "scope": "scoped_contribution",
+      "accountable_delivery_leaf": "EI-LEAF",
+      "acceptance_owner_leaf": "EI-LEAF",
+      "required_contributors": ["EI-LEAF", "CE-LEAF"],
+      "required_for_v1": true,
+      "state": "planned"
+    }
+  ],
+  "source_contribution_rows": [
+    {"row_id": "ROW-1", "requirement_id": "LOCAL-A", "owning_leaf_key": "AH-LEAF", "scope": "local"},
+    {
+      "row_id": "ROW-2",
+      "requirement_id": "GLOBAL-A",
+      "owning_leaf_key": "EI-LEAF",
+      "scope": "scoped_contribution",
+      "authoritative_acceptance": {
+        "id": "GLOBAL-A",
+        "title": "Synthetic global criterion",
+        "priority": "P1",
+        "owner_role": "Product and frontend",
+        "verification": "Verify the synthetic cross-repository result.",
+        "evidence_required": "A synthetic exact-revision test record."
+      }
+    },
+    {
+      "row_id": "ROW-3",
+      "requirement_id": "GLOBAL-A",
+      "owning_leaf_key": "CE-LEAF",
+      "scope": "scoped_contribution",
+      "authoritative_acceptance": {
+        "id": "GLOBAL-A",
+        "title": "Synthetic global criterion",
+        "priority": "P1",
+        "owner_role": "Product and frontend",
+        "verification": "Verify the synthetic cross-repository result.",
+        "evidence_required": "A synthetic exact-revision test record."
+      }
+    }
+  ],
+  "dag": {
+    "edges": {
+      "AH-LEAF": [],
+      "EI-LEAF": ["AH-LEAF"],
+      "CE-LEAF": ["EI-LEAF"]
+    },
+    "required_gate_fan_in": {
+      "RELEASE-GATE": ["AH-LEAF", "EI-LEAF", "CE-LEAF"]
+    },
+    "gate_fan_in": {
+      "RELEASE-GATE": ["AH-LEAF", "EI-LEAF", "CE-LEAF"]
+    }
+  },
+  "staged_edges": [
+    {
+      "edge_type": "evidence_stage",
+      "edge_id": "EDGE-FINAL-CE",
+      "consumer_key": "RELEASE-GATE",
+      "prerequisite_key": "CE-LEAF",
+      "consumer_stage": "final_acceptance",
+      "prerequisite_stage": "runnable",
+      "status": "pending",
+      "required_for_v1": false,
+      "requirement_ids": [],
+      "required_evidence_ids": [],
+      "required_owner_receipt_ids": []
+    }
+  ]
+}
