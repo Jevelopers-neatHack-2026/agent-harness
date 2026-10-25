@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { addAbortListener } from 'node:events';
 import { sendJevOnce, JevTransportError } from '../adapters/jev/http-transport.js';
 import { JEV_MODEL_ID } from '../adapters/jev/request-validation.js';
 import { isPlainDataRecord, isProxy, snapshotJsonValue } from '../adapters/jev/safe-json.js';
@@ -6,6 +7,10 @@ import { isPlainDataRecord, isProxy, snapshotJsonValue } from '../adapters/jev/s
 const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 const ENVIRONMENTS = ['development', 'test', 'production'];
 const MAX_DEADLINE_MS = 8_000;
+const ABORT_SIGNAL_PROTOTYPE = AbortSignal.prototype;
+const ABORTED = Object.getOwnPropertyDescriptor(ABORT_SIGNAL_PROTOTYPE, 'aborted').get;
+const REMOVE_EVENT_LISTENER = EventTarget.prototype.removeEventListener;
+const SIGNAL_PROPERTIES = ['aborted', 'addEventListener', 'removeEventListener'];
 const MESSAGES = Object.freeze({
   CONFIG_MISSING: 'The TypeSafe server credential and explicit host configuration are required.',
   CONFIG_INVALID: 'The TypeSafe host configuration is invalid.',
@@ -77,10 +82,17 @@ function signal(value) {
   if (value === undefined) return true;
   if (value === null || typeof value !== 'object' || isProxy(value)) return false;
   try {
-    if (Object.getPrototypeOf(value) !== AbortSignal.prototype) return false;
-    Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get.call(value);
+    if (Object.getPrototypeOf(value) !== ABORT_SIGNAL_PROTOTYPE) return false;
+    // Native abort registration reads these properties. Never evaluate shadows.
+    if (SIGNAL_PROPERTIES.some(property => Object.hasOwn(value, property))) return false;
+    ABORTED.call(value);
     return true;
   } catch { return false; }
+}
+
+function isAborted(value) {
+  // Read native state; own properties must not hide cancellation or run getters.
+  return value !== undefined && ABORTED.call(value);
 }
 
 function eligibilityRecord(value, environment) {
@@ -216,13 +228,16 @@ export function createJevDecisionPort(options) {
       const remaining = deadline - checkEligibility();
       const ownerOptions = { trustedScope };
       if (!Number.isFinite(remaining)) fail('INVALID_REQUEST');
-      if (remaining <= 0 || binding.signal?.aborted) {
+      const alreadyAborted = isAborted(binding.signal);
+      if (remaining <= 0 || alreadyAborted) {
         return freeze(contracts.validateDecisionResult(request, unavailable(request, clock,
-          binding.signal?.aborted ? 'cancelled' : 'timeout', binding.signal?.aborted ? 'cancelled' : 'deadline_exceeded', usage()), ownerOptions));
+          alreadyAborted ? 'cancelled' : 'timeout', alreadyAborted ? 'cancelled' : 'deadline_exceeded', usage()), ownerOptions));
       }
       const controller = new AbortController();
       const onAbort = () => controller.abort();
-      binding.signal?.addEventListener('abort', onAbort, { once: true });
+      // The native listener resists stopImmediatePropagation on the same signal.
+      if (!signal(binding.signal)) fail('DISPATCH_BINDING_INVALID');
+      if (binding.signal !== undefined) addAbortListener(binding.signal, onAbort);
       const timer = setTimeout(onAbort, Math.min(remaining, MAX_DEADLINE_MS));
       let response;
       let checked;
@@ -232,17 +247,17 @@ export function createJevDecisionPort(options) {
             type: question.type, instructions: question.instructions, criteria: question.criteria,
           }])) }, apiKey: config.apiKey, signal: controller.signal,
           async beforeWrite() {
-            if (controller.signal.aborted || checkEligibility() >= deadline) fail('DISPATCH_AUTHORIZATION_REJECTED');
+            if (controller.signal.aborted || isAborted(binding.signal) || checkEligibility() >= deadline) fail('DISPATCH_AUTHORIZATION_REJECTED');
             const permit = await binding.revalidateDispatch(Object.freeze({ reservation_ref: binding.reservation_ref,
               billable_attempt_id: request.billable_attempt_id, transport_attempt_id: binding.transport_attempt_id,
               dispatch_intent_ref: binding.dispatch_intent_ref, target_binding_sha256: targetBinding, signal: binding.signal }));
-            if (permit !== binding.dispatch_intent_ref || controller.signal.aborted || checkEligibility() >= deadline) fail('DISPATCH_AUTHORIZATION_REJECTED');
+            if (permit !== binding.dispatch_intent_ref || controller.signal.aborted || isAborted(binding.signal) || checkEligibility() >= deadline) fail('DISPATCH_AUTHORIZATION_REJECTED');
             const recorded = await binding.recordTransportAttempt(binding.transport_attempt_id);
-            if (recorded !== binding.dispatch_intent_ref || controller.signal.aborted || checkEligibility() >= deadline) fail('DISPATCH_AUTHORIZATION_REJECTED');
+            if (recorded !== binding.dispatch_intent_ref || controller.signal.aborted || isAborted(binding.signal) || checkEligibility() >= deadline) fail('DISPATCH_AUTHORIZATION_REJECTED');
             return () => {
-              if (controller.signal.aborted || checkEligibility() >= deadline ||
+              if (controller.signal.aborted || isAborted(binding.signal) || checkEligibility() >= deadline ||
                   binding.assertDispatchCurrent() !== binding.dispatch_intent_ref) fail('DISPATCH_AUTHORIZATION_REJECTED');
-              if (controller.signal.aborted || checkEligibility() >= deadline) fail('DISPATCH_AUTHORIZATION_REJECTED');
+              if (controller.signal.aborted || isAborted(binding.signal) || checkEligibility() >= deadline) fail('DISPATCH_AUTHORIZATION_REJECTED');
             };
           } });
         checked = decisionResult(request, response, clock);
@@ -250,14 +265,16 @@ export function createJevDecisionPort(options) {
           createHash('sha256').update(response.providerRequestId).digest('hex');
       } catch (error) {
         if (!(error instanceof JevTransportError)) throw new JevDecisionError('DISPATCH_AUTHORIZATION_REJECTED');
-        const cancelled = binding.signal?.aborted === true;
+        const cancelled = isAborted(binding.signal);
         const timeout = !cancelled && (controller.signal.aborted || clock() >= deadline || error.code.startsWith('DEADLINE'));
         if (error.code === 'DISPATCH_AUTHORIZATION_REJECTED' && !cancelled && !timeout) throw new JevDecisionError('DISPATCH_AUTHORIZATION_REJECTED');
         checked = unavailable(request, clock, cancelled ? 'cancelled' : timeout ? 'timeout' : 'unavailable',
           cancelled ? 'cancelled' : timeout ? 'timeout' : 'provider_unavailable', usage());
       } finally {
         clearTimeout(timer);
-        binding.signal?.removeEventListener('abort', onAbort);
+        // Remove the registered callback intrinsically; a caller may have
+        // shadowed removeEventListener while an owner callback was pending.
+        if (binding.signal !== undefined) REMOVE_EVENT_LISTENER.call(binding.signal, 'abort', onAbort);
       }
       try { return freeze(contracts.validateDecisionResult(request, checked, ownerOptions)); }
       catch {
