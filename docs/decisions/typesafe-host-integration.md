@@ -69,6 +69,12 @@ silently send additional billable batches. The request, attempt, scope, model,
 environment, billing mode, reservation, and target must agree. The transport
 remains bounded by the earlier of the consumer deadline and eight seconds.
 
+The optional cancellation signal must be a genuine native `AbortSignal` with no
+own `aborted`, `addEventListener`, or `removeEventListener` properties; unsupported
+signals fail before transport. Cancellation uses native state and a listener
+that resists earlier `stopImmediatePropagation` calls. A cancellation after a
+write retains unknown usage, and the port removes its listener on completion.
+
 After DNS and authenticated TLS, immediately before the HTTP write, the port
 awaits the uncached owner `revalidateDispatch` and `recordTransportAttempt` fences.
 Both must return the current exact dispatch intent reference. Cancellation,
